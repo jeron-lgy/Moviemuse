@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+trash/
+sample-media/
+.git/
+frontend/node_modules/
+frontend/.npm-cache/
+frontend/.vite/

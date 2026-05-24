@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+trash/
+sample-media/
+*.sqlite3
+
+# Python / local runtime
+*.pyo
+*.pyd
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Frontend dependencies and cache. Keep frontend/dist tracked because the
+# current Unraid Docker image copies it directly.
+frontend/node_modules/
+frontend/.npm-cache/
+frontend/.vite/
+
+# Generated packages / temporary work dirs
+/dist/
+/media-toolbox-move-*/
+
+# Local OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

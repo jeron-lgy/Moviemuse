@@ -1,0 +1,480 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>瀛楀箷浠诲姟 - Media Toolbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
+</head>
+<body>
+  <div class="console-shell subtitle-console">
+    <aside class="console-sidebar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <h1>Media Toolbox</h1>
+          <p>瀛楀箷绠楀姏鎺у埗鍙?/p>
+        </div>
+      </div>
+
+      <nav class="console-nav" aria-label="Media Toolbox navigation">
+        <a href="/">閲嶅瑙嗛</a>
+        <a class="active" href="/subtitles">瀛楀箷浠诲姟</a>
+        <a href="/api/scan">鎵弿 API</a>
+      </nav>
+    </aside>
+
+    <main class="console-main">
+      <header class="console-top compact-top">
+        <div>
+          <h2>瀛楀箷浠诲姟</h2>
+          <p>鍏堢‘璁ゆ壂鎻忛〉閫佹潵鐨勬壒娆″拰妯″瀷閫夐」锛屽啀鎵ц瀛楀箷鐢熸垚涓庣炕璇戙€?/p>
+        </div>
+        <div class="top-actions">
+          <a class="button ghost" href="/docs">API 鏂囨。</a>
+        </div>
+      </header>
+
+      {% set cs = compute_settings %}
+      <details class="quick-submit compact-submit backend-settings-panel" open>
+        <summary>
+          <span>绠楀姏绔缃?/span>
+          <small>Unraid 鎺у埗鍙扮粺涓€绠＄悊 Windows Worker</small>
+        </summary>
+        {% set chosen_backend = cs.default_translate_backend or "google" %}
+        <div class="config-section">
+          <div class="section-title">绠楀姏绔?/div>
+          <div class="section-desc">鍙湁榛樿绠楀姏绔墠浼氳瀛楀箷浠诲姟浣跨敤銆?/div>
+          <div class="service-card-grid">
+            <button class="service-card compute-card large-card {% if backend_status.online %}enabled{% endif %}" type="button" data-open-dialog="computeDialog">
+              <span class="card-status"><b class="status-dot"></b><span id="backendStateText">{{ "鍦ㄧ嚎" if backend_status.online else "绂荤嚎" }}</span></span>
+              <strong>Windows 绠楀姏绔?/strong>
+              <small id="backendUrlText">{{ backend_status.backend_url or console_backend_url or "鏈厤缃湴鍧€" }}</small>
+              <em id="backendWhisperText">{{ backend_status.settings.default_model if backend_status.settings else settings.default_model }} / {{ cs.whisper_device or cs.device or "cuda" }} / {{ cs.whisper_compute_type or cs.compute_type or "float16" }}</em>
+              <i class="brand-logo compute">GPU</i>
+              <span class="card-switch" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div class="section-actions">
+            <button type="submit" form="connectionForm" class="button purple-save">淇濆瓨</button>
+            <button type="button" class="button add-button" data-open-dialog="computeDialog">+</button>
+          </div>
+        </div>
+
+        <div class="config-section">
+          <div class="section-title">缈昏瘧鍚庣</div>
+          <div class="section-desc">閫夋嫨榛樿缈昏瘧鏈嶅姟锛屾敮鎸佸厤璐规帴鍙ｃ€丄PI 鏈嶅姟鍜屾湰鍦版ā鍨嬨€?/div>
+          <div class="service-card-grid provider-grid">
+            {% for option in translation_backends if option.id != "none" %}
+              <button class="service-card provider-card {% if option.id == chosen_backend %}active enabled{% endif %}" type="button" data-open-dialog="translateDialog" data-provider="{{ option.id }}">
+                <span><b class="status-dot"></b>{{ "鍚敤" if option.id == chosen_backend else "鍋滅敤" }}</span>
+                <strong>{{ option.name }}</strong>
+                <small>{{ option.note }}</small>
+                <em>{{ "宸插惎鐢? if option.id == chosen_backend else "鐐瑰嚮閰嶇疆" }}</em>
+                <i class="brand-logo {{ option.id }}">{{ option.id[:2]|upper }}</i>
+                <span class="card-switch" aria-hidden="true"></span>
+              </button>
+            {% endfor %}
+          </div>
+          <div class="section-actions">
+            <button type="submit" form="computeSettingsForm" class="button purple-save">淇濆瓨</button>
+            <button type="button" class="button add-button" data-open-dialog="translateDialog">+</button>
+          </div>
+        </div>
+
+        <form method="post" action="/subtitles/connection" id="connectionForm">
+          <dialog class="config-dialog" id="computeDialog">
+            <div class="dialog-head">
+              <div>
+                <span>閰嶇疆</span>
+                <h3>绠楀姏缁堢</h3>
+              </div>
+              <button type="button" class="icon-button" data-close-dialog="computeDialog">脳</button>
+            </div>
+            <div class="dialog-body">
+              <label class="toggle-line">
+                <input type="checkbox" checked disabled>
+                鍚敤 Windows 绠楀姏绔?
+              </label>
+              <div class="dialog-grid">
+                <label>
+                  鍦板潃
+                  <input id="subtitleBackendUrl" name="subtitle_backend_url" value="{{ console_backend_url or '' }}" placeholder="http://WINDOWS-IP:18181">
+                  <small>鏍煎紡锛歨ttp://ip:port锛屼緥濡?http://WINDOWS-IP:18181</small>
+                </label>
+                <label>
+                  API Token
+                  <input id="subtitleBackendToken" name="subtitle_backend_token" value="{{ console_backend_token or '' }}" placeholder="鍐呯綉鍙暀绌?>
+                  <small>鍙湁 Windows Worker 璁剧疆浜?Token 鏃舵墠闇€瑕佸～鍐欍€?/small>
+                </label>
+              </div>
+              <div class="dialog-grid">
+                <label>
+                  Whisper 妯″瀷
+                  <input form="computeSettingsForm" name="whisper_model" value="{{ cs.whisper_model or cs.default_model or settings.default_model }}" list="whisperModelList">
+                  <datalist id="whisperModelList">
+                    {% for model in model_options %}
+                      <option value="{{ model.id }}">{{ model.note }}</option>
+                    {% endfor %}
+                  </datalist>
+                </label>
+                <label>
+                  妯″瀷鐩綍
+                  <input form="computeSettingsForm" name="whisper_model_dir" value="{{ cs.whisper_model_dir or cs.model_dir or '' }}" placeholder="Windows 鏈満妯″瀷鐩綍">
+                  <small>鍙暀绌恒€傜暀绌烘椂 Windows Worker 榛樿浣跨敤 data\local-backend\whisper-models銆?/small>
+                </label>
+                <label>
+                  璁惧
+                  <select form="computeSettingsForm" name="whisper_device">
+                    {% set device_value = cs.whisper_device or cs.device or "cuda" %}
+                    <option value="cuda" {% if device_value == "cuda" %}selected{% endif %}>cuda</option>
+                    <option value="cpu" {% if device_value == "cpu" %}selected{% endif %}>cpu</option>
+                  </select>
+                </label>
+                <label>
+                  璁＄畻绫诲瀷
+                  {% set compute_value = cs.whisper_compute_type or cs.compute_type or "float16" %}
+                  <select form="computeSettingsForm" name="whisper_compute_type">
+                    {% for item in ["float16", "int8_float16", "int8", "float32"] %}
+                      <option value="{{ item }}" {% if compute_value == item %}selected{% endif %}>{{ item }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>
+                  骞跺彂鏁?
+                  <input form="computeSettingsForm" name="subtitle_max_workers" type="number" min="1" max="4" value="{{ cs.subtitle_max_workers or cs.max_workers or 1 }}">
+                </label>
+                <label>
+                  榛樿杈撳嚭鐩綍
+                  <input form="computeSettingsForm" name="subtitle_output_dir" value="{{ cs.subtitle_output_dir or cs.default_output_dir or '' }}" placeholder="鐣欑┖鍐欏埌瑙嗛鍚岀洰褰?>
+                </label>
+              </div>
+              <label>
+                缁堢 API Token
+                <input form="computeSettingsForm" name="subtitle_api_token" value="{{ cs.subtitle_api_token or cs.api_token or '' }}" placeholder="鍐呯綉鍙暀绌?>
+              </label>
+              <label>
+                缁堢鍏滃簳璺緞鏄犲皠
+                <textarea form="computeSettingsForm" name="subtitle_path_map" rows="3" placeholder="/media=\\192.168.2.9\media">{{ cs.subtitle_path_map or '' }}</textarea>
+                <small>扫描页提交的是容器路径，例如 /media/study3/a.mp4；这里要映射成 Windows 可打开的共享路径。</small>
+                <small>涓昏璺緞鏄犲皠鐢辨帶鍒跺彴璐熻矗锛岃繖閲屽彧浣滀负 Windows Worker 鍏滃簳銆?/small>
+              </label>
+              <dl class="terminal-mini-list compact">
+                <div><dt>CPU</dt><dd id="backendCpuText">{{ backend_status.hardware.cpu if backend_status.hardware else "鏈繛鎺? }}</dd></div>
+                <div><dt>鍐呭瓨</dt><dd id="backendMemoryText">{% if backend_status.hardware %}{{ backend_status.hardware.memory.label }} 路 {{ backend_status.hardware.memory.used_percent }}%{% else %}鏈繛鎺% endif %}</dd></div>
+                <div><dt>鏄惧崱</dt><dd id="backendGpuText">{% if backend_status.hardware and backend_status.hardware.gpus %}{{ backend_status.hardware.gpus[0].label }}{% else %}鏈娴媨% endif %}</dd></div>
+              </dl>
+              <p class="connection-result" id="backendConnectionResult">{% if not backend_status.online and backend_status.error %}{{ backend_status.error }}{% endif %}</p>
+            </div>
+            <div class="dialog-actions">
+              <button type="button" class="button" id="testBackendConnection">娴嬭瘯鑱旈€?/button>
+              <button type="submit" class="button primary">淇濆瓨鍦板潃</button>
+            </div>
+          </dialog>
+        </form>
+
+        <form method="post" action="/subtitles/backend/settings" id="computeSettingsForm">
+          <dialog class="config-dialog" id="translateDialog">
+            <div class="dialog-head">
+              <div>
+                <span>閰嶇疆</span>
+                <h3>缈昏瘧鍚庣</h3>
+              </div>
+              <button type="button" class="icon-button" data-close-dialog="translateDialog">脳</button>
+            </div>
+            <div class="dialog-body">
+              <div class="translate-choice dialog-choice">
+                <span>榛樿缈昏瘧鍚庣</span>
+                <div>
+                  {% for option in translation_backends if option.id != "none" %}
+                    <label class="{% if option.available %}available{% endif %}">
+                      <input type="radio" name="default_translate_backend" value="{{ option.id }}" {% if chosen_backend == option.id %}checked{% endif %}>
+                      <strong>{{ option.name }}</strong>
+                      <small>{{ option.note }}</small>
+                    </label>
+                  {% endfor %}
+                </div>
+              </div>
+              <div class="dialog-grid">
+                <label>
+                  Google 鍏嶈垂鎺ュ彛
+                  <input name="google_translate_url" value="{{ cs.google_translate_url or 'https://translate.google.com/translate_a/single' }}">
+                  <small>榛樿鍙敤锛屼笉闇€瑕?Key銆?/small>
+                </label>
+                <label>
+                  DeepL API Key
+                  <input name="deepl_api_key" value="{{ cs.deepl_api_key or '' }}" placeholder="DeepL auth key">
+                </label>
+                <label>
+                  DeepL API URL
+                  <input name="deepl_api_url" value="{{ cs.deepl_api_url or 'https://api-free.deepl.com/v2/translate' }}">
+                </label>
+                <label>
+                  DeepSeek API Base URL
+                  <input name="openai_base_url" value="{{ cs.openai_base_url or '' }}" placeholder="https://api.deepseek.com/v1">
+                </label>
+                <label>
+                  DeepSeek API Key
+                  <input name="openai_api_key" value="{{ cs.openai_api_key or '' }}" placeholder="sk-...">
+                </label>
+                <label>
+                  DeepSeek 妯″瀷
+                  <input name="openai_model" value="{{ cs.openai_model or 'deepseek-chat' }}">
+                </label>
+                <label>
+                  Ollama URL
+                  <input name="ollama_url" value="{{ cs.ollama_url or '' }}" placeholder="http://127.0.0.1:11434">
+                </label>
+                <label>
+                  Ollama 妯″瀷
+                  <input name="ollama_model" value="{{ cs.ollama_model or 'qwen2.5:7b' }}">
+                </label>
+              </div>
+            </div>
+            <div class="dialog-actions">
+              <button type="button" class="button" data-close-dialog="translateDialog">鍙栨秷</button>
+              <button type="submit" class="button primary">淇濆瓨璁剧疆</button>
+            </div>
+          </dialog>
+
+          <dialog class="config-dialog" id="pathDialog">
+            <div class="dialog-head">
+              <div>
+                <span>閰嶇疆</span>
+                <h3>璺緞鏄犲皠</h3>
+              </div>
+              <button type="button" class="icon-button" data-close-dialog="pathDialog">脳</button>
+            </div>
+            <div class="dialog-body">
+              <label>
+                缁堢 API Token
+                <input name="subtitle_api_token" value="{{ cs.subtitle_api_token or cs.api_token or '' }}" placeholder="鍐呯綉鍙暀绌?>
+              </label>
+              <label>
+                缁堢鍏滃簳璺緞鏄犲皠
+                <textarea name="subtitle_path_map" rows="3" placeholder="/media=\\192.168.2.9\media">{{ cs.subtitle_path_map or '' }}</textarea>
+                <small>扫描页提交的是容器路径，例如 /media/study3/a.mp4；这里要映射成 Windows 可打开的共享路径。</small>
+                <small>涓昏璺緞鏄犲皠鐢辨帶鍒跺彴璐熻矗锛岃繖閲屽彧浣滀负 Windows Worker 鍏滃簳銆?/small>
+              </label>
+              <div class="path-list dialog-path-list" id="pathMapChain">
+                <label>鎺у埗鍙版敹鍒?/label>
+                <code>{{ path_preview.input }}</code>
+                <label>鎺у埗鍙拌浆鍙?/label>
+                <code>{{ path_preview.console_output }}</code>
+                <label>缁堢鏈€缁堣鍙?/label>
+                <code>{{ path_preview.backend_output }}</code>
+                <label>鎺у埗鍙版槧灏?/label>
+                {% if path_preview.console_pairs %}
+                  {% for source, target in path_preview.console_pairs %}<code>{{ source }} => {{ target }}</code>{% endfor %}
+                {% else %}
+                  <code>鏈厤缃?SUBTITLE_PROXY_PATH_MAP</code>
+                {% endif %}
+              </div>
+            </div>
+            <div class="dialog-actions">
+              <button type="button" class="button" data-close-dialog="pathDialog">鍙栨秷</button>
+              <button type="submit" class="button primary">淇濆瓨璁剧疆</button>
+            </div>
+          </dialog>
+        </form>
+      </details>
+
+      {% if submitted_count or failed_count %}
+        <section class="warning">
+          已提交 {{ submitted_count }} 个字幕任务{% if failed_count %}，{{ failed_count }} 个失败。请检查算力端连接、路径映射和任务队列错误信息。{% endif %}
+        </section>
+      {% endif %}
+
+      {% if pending_batch %}
+        <section class="current-jobs-panel priority-panel pending-batch-panel">
+          <div class="section-head">
+            <div>
+              <h2>待确认字幕批次</h2>
+              <p>从扫描页发送过来的 {{ pending_batch.paths|length }} 个文件还没有开始处理。确认模型和翻译后端后再提交。</p>
+            </div>
+            <strong class="soft-pill">{{ pending_batch.paths|length }} 个文件</strong>
+          </div>
+          <form class="subtitle-form compact" method="post" action="/subtitles/batches/{{ pending_batch.id }}/submit">
+            {% for path in pending_batch.paths %}
+              <input type="hidden" name="paths" value="{{ path }}">
+            {% endfor %}
+            <div class="pending-path-list">
+              {% for path in pending_batch.paths %}
+                <code>{{ path }}</code>
+              {% endfor %}
+            </div>
+            <div class="tool-block">
+              <label>
+                输出目录
+                <input name="output_dir" placeholder="留空写到视频同目录">
+              </label>
+              <label>
+                原语言
+                <input name="source_language" placeholder="留空自动识别">
+              </label>
+              <label>
+                目标语言
+                <input name="target_language" value="zh">
+              </label>
+              <label>
+                模型
+                <input name="model" placeholder="{{ cs.whisper_model or cs.default_model or 'large-v3' }}">
+              </label>
+              <label>
+                翻译后端
+                <select name="translate_backend">
+                  {% for option in translation_backends if option.id != "none" %}
+                    <option value="{{ option.id }}" {% if option.id == (cs.default_translate_backend or "google") %}selected{% endif %} {% if not option.available %}disabled{% endif %}>
+                      {{ option.name }}{% if not option.available %}（未配置）{% endif %}
+                    </option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="check-label">
+                <input name="translate" type="checkbox" checked>
+                翻译字幕
+              </label>
+              <button type="submit" class="button primary">确认生成这批字幕</button>
+            </div>
+          </form>
+          {% if failed_count %}
+            <p class="warning small">上次提交有 {{ failed_count }} 个文件没有成功创建任务，请检查算力端连接和路径映射。</p>
+          {% endif %}
+        </section>
+      {% elif submitted_count %}
+        <section class="warning">已创建 {{ submitted_count }} 个字幕任务{% if failed_count %}，{{ failed_count }} 个失败{% endif %}。</section>
+      {% endif %}
+
+      <section class="current-jobs-panel priority-panel">
+        <div class="section-head">
+          <div>
+            <h2>褰撳墠浠诲姟鐘舵€?/h2>
+            <p>杩愯涓拰鎺掗槦涓殑浠诲姟浼氬湪杩欓噷鏄剧ず杩涘害銆?/p>
+          </div>
+          <div class="mini-counters">
+            <span>杩愯 <strong id="activeJobCount">{{ backend_status.jobs.active if backend_status.jobs else 0 }}</strong></span>
+            <span>鎬绘暟 <strong id="totalJobCount">{{ backend_status.jobs.total if backend_status.jobs else jobs|length }}</strong></span>
+          </div>
+        </div>
+        <div class="current-jobs" id="currentBackendJobs">
+          {% set rendered_active = namespace(count=0) %}
+          {% if backend_status.jobs %}
+            {% for job in backend_status.jobs["items"] %}
+              {% if job.status in ["queued", "running"] %}
+                {% set rendered_active.count = rendered_active.count + 1 %}
+                <article class="current-job">
+                  <strong>{{ job.video_path }}</strong>
+                  <span>{{ job.message }}</span>
+                  <progress value="{{ job.progress }}" max="1"></progress>
+                  <small>{{ "%.0f"|format(job.progress * 100) }}% 路 {{ job.status }}</small>
+                </article>
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+          {% if rendered_active.count == 0 %}
+            <div class="empty compact">褰撳墠娌℃湁杩愯涓殑瀛楀箷浠诲姟銆?/div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="jobs-panel">
+        <div class="section-head">
+          <div>
+            <h2>浠诲姟闃熷垪</h2>
+            <p>瀹屾垚銆佸け璐ャ€佽繍琛屼腑鐨勪换鍔＄粺涓€姹囨€诲湪杩欓噷銆?/p>
+          </div>
+          <button type="button" class="button" id="refreshSubtitleJobs">鍒锋柊</button>
+        </div>
+        <div class="subtitle-jobs" id="subtitleJobs">
+          {% for job in jobs %}
+            <article class="subtitle-job" data-job-id="{{ job.id }}">
+              <div class="job-main">
+                <strong>{{ job.video_path }}</strong>
+                <span>{{ job.message }}{% if job.error %}锛歿{ job.error }}{% endif %}</span>
+                <small>{{ job.model }} / {{ job.source_language or "auto" }} => {{ job.target_language }}</small>
+              </div>
+              <div class="job-state">
+                <em class="status-{{ job.status }}">{{ job.status }}</em>
+                <progress value="{{ job.progress }}" max="1"></progress>
+                <span>{{ "%.0f"|format(job.progress * 100) }}%</span>
+              </div>
+              <div class="job-files">
+                {% if job.original_srt %}<a href="/subtitles/jobs/{{ job.id }}/files/original_srt">鍘熸枃 SRT</a>{% endif %}
+                {% if job.translated_srt %}<a href="/subtitles/jobs/{{ job.id }}/files/translated_srt">缈昏瘧 SRT</a>{% endif %}
+                {% if job.bilingual_srt %}<a href="/subtitles/jobs/{{ job.id }}/files/bilingual_srt">鍙岃 SRT</a>{% endif %}
+              </div>
+            </article>
+          {% else %}
+            <div class="empty">杩樻病鏈夊瓧骞曚换鍔°€?/div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <details class="quick-submit compact-submit">
+        <summary>
+          <span>鎵嬪姩琛ュ綍浠诲姟</span>
+          <small>灞曞紑</small>
+        </summary>
+        <form class="subtitle-form compact" method="post" action="/subtitles/jobs">
+          <div class="tool-block">
+            <label>
+              瑙嗛璺緞
+              <input name="video_path" required placeholder="/media/鐢靛奖/xxx.mkv">
+            </label>
+            <label>
+              杈撳嚭鐩綍
+              <input name="output_dir" placeholder="鐣欑┖鍐欏埌瑙嗛鍚岀洰褰?>
+            </label>
+            <label>
+              鍘熻瑷€
+              <input name="source_language" placeholder="鐣欑┖鑷姩璇嗗埆">
+            </label>
+            <label>
+              鐩爣璇█
+              <input name="target_language" value="zh">
+            </label>
+            <label>
+              妯″瀷
+              <input name="model" placeholder="{{ settings.default_model }}">
+            </label>
+            <label>
+              缈昏瘧鍚庣
+              <select name="translate_backend">
+                {% for option in translation_backends if option.id != "none" %}
+                  <option value="{{ option.id }}" {% if option.id == (cs.default_translate_backend or "google") %}selected{% endif %} {% if not option.available %}disabled{% endif %}>
+                    {{ option.name }}{% if not option.available %}锛堟湭閰嶇疆锛墈% endif %}
+                  </option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="check-label">
+              <input name="translate" type="checkbox" checked>
+              缈昏瘧瀛楀箷
+            </label>
+            <button type="submit" class="button primary">鎻愪氦琛ュ綍浠诲姟</button>
+          </div>
+        </form>
+      </details>
+    </main>
+
+    <aside class="console-detail">
+      <div class="detail-sticky">
+        <section class="detail-card dark">
+          <span>缁堢鐘舵€?/span>
+          <strong id="sideBackendStatus">{{ "鍦ㄧ嚎" if backend_status.online else "绂荤嚎" }}</strong>
+          <p id="sideBackendText">{{ backend_status.backend_url or "鏈湴妯″紡" }}</p>
+        </section>
+        <section class="detail-card">
+          <h3>鎵ц閫昏緫</h3>
+          <p>閲嶅瑙嗛椤靛彧鎶婃枃浠堕€佸埌寰呯‘璁ゆ壒娆★紱杩欓噷纭妯″瀷銆佺炕璇戝悗绔拰杈撳嚭鐩綍鍚庯紝鎵嶄細鐪熸寮€濮嬩换鍔°€?/p>
+        </section>
+        <section class="detail-card">
+          <h3>璺緞绛栫暐</h3>
+          <p>鎺ㄨ崘鐢辨帶鍒跺彴瀹屾垚涓昏璺緞鏄犲皠锛屾妸 Unraid 璺緞杞垚 Windows 鍙 UNC 鎴栫洏绗﹁矾寰勶紱绠楀姏缁堢鍙礋璐ｆ帴鏀朵换鍔″拰璺?Whisper銆?/p>
+        </section>
+      </div>
+    </aside>
+  </div>
+  <script src="{{ url_for('static', path='/app.js') }}"></script>
+</body>
+</html>

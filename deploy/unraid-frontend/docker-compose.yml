@@ -1,0 +1,50 @@
+services:
+  media-toolbox:
+    build:
+      context: ../..
+      dockerfile: deploy/unraid-frontend/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: media-toolbox-unraid:latest
+    container_name: media-toolbox
+    user: "99:100"
+
+    ports:
+      # 第一次配置：左边是 Unraid 对外 WebUI 端口，冲突时只改左边。
+      - "18180:18180"
+
+    environment:
+      MEDIA_DIRS: /media
+      TRASH_DIR: /media/trash
+      APP_DATA_DIR: /data
+      WHISPER_MODEL: large-v3
+      PUID: "99"
+      PGID: "100"
+      UMASK: "022"
+      UNRAID_MOUNT_ROOT: /unraid
+      UNRAID_TRASH_RELATIVE: media/trash
+
+      # 第一次配置可留空，建议进 WebUI 的“字幕任务”里填写 Windows 算力端地址。
+      SUBTITLE_BACKEND_URL: ""
+      SUBTITLE_BACKEND_PUBLIC_URL: ""
+      SUBTITLE_BACKEND_TOKEN: ""
+      SUBTITLE_API_TOKEN: ""
+
+      # 第一次配置可留空，建议进 WebUI 里配置路径映射。
+      # 示例：/media=\\192.168.2.9\media
+      SUBTITLE_PROXY_PATH_MAP: ""
+
+    volumes:
+      # 第一次配置必须改：左边换成你的 Unraid 媒体真实目录。
+      - /mnt/user/media:/media
+
+      # 第一次配置建议保留：保存配置、扫描缓存、字幕任务队列。
+      - /mnt/user/appdata/media-toolbox/data:/data
+
+      # 同盘快速移动需要保留；回收站默认在 /mnt/user/media/trash。
+      - /mnt:/unraid
+
+    command: >
+      sh -c "umask $${UMASK:-022} && uvicorn app.main:app --host 0.0.0.0 --port 18180"
+
+    restart: unless-stopped

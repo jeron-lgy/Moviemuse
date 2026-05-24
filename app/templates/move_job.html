@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>移动进度</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
+</head>
+<body>
+  <main class="shell" data-move-job="{{ job.id }}">
+    <header class="topbar">
+      <div>
+        <h1>移动进度</h1>
+        <p>文件正在移动到回收站，完成前请保持页面打开。</p>
+      </div>
+      <a class="button ghost" href="/">返回</a>
+    </header>
+
+    <section class="move-progress-panel">
+      <div class="move-progress-head">
+        <div>
+          <strong id="moveJobStatus">{{ job.status }}</strong>
+          <span id="moveJobMessage">{{ job.message }}</span>
+        </div>
+        <div class="move-progress-count">
+          <b id="moveJobProcessed">{{ job.processed }}</b>
+          <span>/</span>
+          <b id="moveJobTotal">{{ job.total }}</b>
+        </div>
+      </div>
+      <progress id="moveJobProgress" value="{{ job.processed }}" max="{{ job.total or 1 }}"></progress>
+      <p id="moveJobCurrent">{{ job.current_path }}</p>
+    </section>
+
+    <section class="move-summary">
+      <div>
+        <strong id="moveJobMoved">{{ job.moved }}</strong>
+        <span>已移动</span>
+      </div>
+      <div>
+        <strong id="moveJobSkipped">{{ job.skipped }}</strong>
+        <span>已跳过</span>
+      </div>
+      <div>
+        <strong id="moveJobFailed">{{ job.failed }}</strong>
+        <span>失败</span>
+      </div>
+    </section>
+
+    <section class="preview-list" id="moveJobItems">
+      {% for item in job["items"] %}
+        <article class="preview-row move-result {{ item.status }}">
+          <div>
+            <strong>{{ item.source }}</strong>
+            <span>{{ item.target }}</span>
+          </div>
+          <em class="move-mode {{ item.mode }}">{{ item.status }} · {{ item.reason }}</em>
+        </article>
+      {% endfor %}
+    </section>
+  </main>
+  <script>
+    (() => {
+      const root = document.querySelector("[data-move-job]");
+      const jobId = root?.dataset.moveJob;
+      if (!jobId) return;
+
+      const text = (selector, value) => {
+        const node = document.querySelector(selector);
+        if (node) node.textContent = String(value ?? "");
+      };
+
+      const html = (value) => String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+
+      const render = (job) => {
+        const total = job.total || 0;
+        const processed = job.processed || 0;
+        const progress = document.querySelector("#moveJobProgress");
+        if (progress) {
+          progress.max = total || 1;
+          progress.value = processed;
+        }
+        text("#moveJobStatus", job.status || "");
+        text("#moveJobMessage", job.message || "");
+        text("#moveJobProcessed", processed);
+        text("#moveJobTotal", total);
+        text("#moveJobCurrent", job.current_path || "");
+        text("#moveJobMoved", job.moved || 0);
+        text("#moveJobSkipped", job.skipped || 0);
+        text("#moveJobFailed", job.failed || 0);
+
+        const list = document.querySelector("#moveJobItems");
+        if (list && Array.isArray(job.items)) {
+          list.innerHTML = job.items.map((item) => `
+            <article class="preview-row move-result ${html(item.status)}">
+              <div>
+                <strong>${html(item.source)}</strong>
+                <span>${html(item.target)}</span>
+              </div>
+              <em class="move-mode ${html(item.mode)}">${html(item.status)} · ${html(item.reason)}</em>
+            </article>
+          `).join("");
+        }
+        return job.status === "completed" || job.status === "failed";
+      };
+
+      const poll = async () => {
+        try {
+          const response = await fetch(`/api/move/jobs/${jobId}`, { cache: "no-store" });
+          if (!response.ok) return;
+          const done = render(await response.json());
+          if (done) window.clearInterval(timer);
+        } catch (_) {
+          // 下一轮继续尝试，避免临时网络抖动让页面停住。
+        }
+      };
+
+      const timer = window.setInterval(poll, 1000);
+      poll();
+    })();
+  </script>
+  <script src="{{ url_for('static', path='/app.js') }}?v=move-job-2"></script>
+</body>
+</html>
