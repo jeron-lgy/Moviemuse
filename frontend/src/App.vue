@@ -38,30 +38,20 @@
           </div>
         </header>
 
-        <section class="status-grid">
-          <button class="status-card" type="button" @click="translateDialog = true">
-            <span>翻译后端</span>
-            <strong>{{ activeProvider?.name || '未配置' }}</strong>
-            <em :class="{ on: translationReady }">{{ translationReady ? '可用' : '待配置' }}</em>
-          </button>
-
+        <section class="status-grid service-grid">
           <button class="status-card" type="button" @click="computeDialog = true">
             <span>算力端</span>
             <strong>{{ backendOnline ? '在线' : '离线' }}</strong>
             <em :class="{ on: backendOnline }">{{ connection.subtitle_backend_url || '未配置地址' }}</em>
+            <i :class="['service-dot', { online: backendOnline }]" aria-hidden="true"></i>
           </button>
 
-          <div class="status-card">
-            <span>当前队列</span>
-            <strong>{{ queueCount }}</strong>
-            <em>{{ runningCount }} 运行 / {{ waitingCount }} 等待</em>
-          </div>
-
-          <div class="status-card">
-            <span>今日完成</span>
-            <strong>{{ todayCompleted }}</strong>
-            <em>{{ failedCount }} 个失败待处理</em>
-          </div>
+          <button class="status-card" type="button" @click="translateDialog = true">
+            <span>翻译后端</span>
+            <strong>{{ activeProvider?.name || '未配置' }}</strong>
+            <em :class="{ on: translationReady }">{{ translationReady ? '可用' : '待配置' }}</em>
+            <i :class="['service-dot', { online: translationReady }]" aria-hidden="true"></i>
+          </button>
         </section>
 
         <v-alert v-if="submitNotice" class="submit-notice" type="info" variant="tonal">
@@ -72,126 +62,130 @@
           <div class="task-console-head">
             <div>
               <h3>任务管理</h3>
-              <p>底部列表每 4 秒自动刷新；勾选任务后可批量操作。</p>
+              <p>每 4 秒自动刷新；选择状态查看队列，勾选任务后可批量操作。</p>
+              <div class="task-metrics">
+                <div class="task-metric">
+                  <span>当前队列</span>
+                  <strong>{{ queueCount }}</strong>
+                  <em>{{ runningCount }} 运行 / {{ waitingCount }} 等待</em>
+                </div>
+                <div class="task-metric">
+                  <span>今日完成</span>
+                  <strong>{{ todayCompleted }}</strong>
+                  <em>{{ failedCount }} 个失败待处理</em>
+                </div>
+              </div>
             </div>
-            <div class="bulk-actions">
-              <v-btn variant="outlined" prepend-icon="mdi-checkbox-multiple-marked-outline" @click="toggleSelectVisible">
-                {{ allVisibleSelected ? '取消全选' : '全选' }}
-              </v-btn>
-              <v-btn
-                color="primary"
-                variant="flat"
-                prepend-icon="mdi-reload"
-                :disabled="selectedJobs.length === 0"
-                :loading="retryingSelected"
-                @click="retrySelected"
-              >
-                批量重试
-              </v-btn>
-              <v-btn
-                variant="outlined"
-                prepend-icon="mdi-stop-circle-outline"
-                :disabled="selectedJobs.length === 0"
-                @click="unsupportedAction('批量取消')"
-              >
-                批量取消
-              </v-btn>
-              <v-btn
-                color="error"
-                variant="tonal"
-                prepend-icon="mdi-delete-outline"
-                :disabled="selectedJobs.length === 0"
-                @click="unsupportedAction('批量删除')"
-              >
-                批量删除
-              </v-btn>
+          </div>
+          <div class="task-toolbar">
+            <v-tabs v-model="taskTab" class="task-tabs" color="primary" density="comfortable">
+              <v-tab value="current">当前任务</v-tab>
+              <v-tab value="history">历史任务</v-tab>
+            </v-tabs>
+
+            <div class="task-actionbar">
+              <span v-if="selectedJobs.length" class="selection-count">已选择 {{ selectedJobs.length }} 个任务</span>
+              <div class="bulk-actions">
+                <v-btn variant="outlined" prepend-icon="mdi-checkbox-multiple-marked-outline" @click="toggleSelectVisible">
+                  {{ allVisibleSelected ? '取消本页全选' : '全选本页' }}
+                </v-btn>
+                <v-btn
+                  color="primary"
+                  variant="flat"
+                  prepend-icon="mdi-reload"
+                  :disabled="selectedJobs.length === 0"
+                  :loading="retryingSelected"
+                  @click="retrySelected"
+                >
+                  批量重试
+                </v-btn>
+                <v-btn
+                  variant="outlined"
+                  prepend-icon="mdi-stop-circle-outline"
+                  :disabled="selectedJobs.length === 0"
+                  @click="unsupportedAction('批量取消')"
+                >
+                  批量取消
+                </v-btn>
+                <v-btn
+                  color="error"
+                  variant="tonal"
+                  prepend-icon="mdi-delete-outline"
+                  :disabled="selectedJobs.length === 0"
+                  @click="unsupportedAction('批量删除')"
+                >
+                  批量删除
+                </v-btn>
+              </div>
             </div>
           </div>
 
-          <v-tabs v-model="taskTab" class="task-tabs" color="primary" density="comfortable">
-            <v-tab value="current">当前任务</v-tab>
-            <v-tab value="history">历史任务</v-tab>
-          </v-tabs>
-
           <v-window v-model="taskTab">
             <v-window-item value="current">
-              <v-expansion-panels v-model="openCurrentPanels" class="task-groups" multiple>
-                <v-expansion-panel
-                  v-for="group in currentGroups"
-                  :key="group.key"
-                  :value="group.key"
-                  class="task-group"
-                >
-                  <v-expansion-panel-title>
-                    <div class="group-title">
-                      <span :class="['state-dot', group.key]"></span>
-                      <strong>{{ group.label }}</strong>
-                      <em>{{ group.items.length }}</em>
+              <v-tabs v-model="taskStatusTab" class="state-tabs" color="primary" density="comfortable">
+                <v-tab v-for="state in statusTabs" :key="state.key" :value="state.key">
+                  <span :class="['state-dot', state.key]"></span>
+                  {{ state.label }}
+                  <em class="tab-count">{{ state.count }}</em>
+                </v-tab>
+              </v-tabs>
+              <transition-group name="task-list" tag="div" class="task-card-list">
+                <article v-for="job in pagedStatusJobs" :key="job.id" class="task-card">
+                  <v-checkbox
+                    class="task-check"
+                    density="compact"
+                    hide-details
+                    :model-value="selectedIds.has(job.id)"
+                    @update:model-value="toggleJob(job.id)"
+                  />
+                  <div class="task-main">
+                    <div class="task-title-line">
+                      <strong>{{ job.title }}</strong>
+                      <span :class="['status-pill', job.statusKey]">{{ job.statusLabel }}</span>
                     </div>
-                  </v-expansion-panel-title>
-                  <v-expansion-panel-text>
-                    <transition-group name="task-list" tag="div" class="task-card-list">
-                      <article v-for="job in group.items" :key="job.id" class="task-card">
-                        <v-checkbox
-                          class="task-check"
-                          density="compact"
-                          hide-details
-                          :model-value="selectedIds.has(job.id)"
-                          @update:model-value="toggleJob(job.id)"
-                        />
-                        <div class="task-main">
-                          <div class="task-title-line">
-                            <strong>{{ job.title }}</strong>
-                            <span :class="['status-pill', job.statusKey]">{{ job.statusLabel }}</span>
-                          </div>
-                          <p>{{ job.path }}</p>
-                          <div class="task-meta">
-                            <span>{{ job.step }}</span>
-                            <span>{{ job.createdLabel }}</span>
-                            <span>{{ job.modelLabel }}</span>
-                          </div>
-                          <v-progress-linear
-                            class="task-progress"
-                            :model-value="job.percent"
-                            height="6"
-                            rounded
-                            :color="progressColor(job.statusKey)"
-                          />
-                        </div>
-                        <div class="task-actions">
-                          <span>{{ job.percent }}%</span>
-                          <v-btn
-                            v-if="job.canRetry"
-                            size="small"
-                            variant="outlined"
-                            :loading="retryingJob[job.id]"
-                            @click="retryJob(job.id)"
-                          >
-                            重试
-                          </v-btn>
-                          <v-btn
-                            v-if="job.originalSrt"
-                            size="small"
-                            variant="text"
-                            :href="`/subtitles/jobs/${job.id}/files/original_srt`"
-                          >
-                            原文
-                          </v-btn>
-                          <v-btn
-                            v-if="job.resultSrt"
-                            size="small"
-                            variant="text"
-                            :href="`/subtitles/jobs/${job.id}/files/translated_srt`"
-                          >
-                            结果
-                          </v-btn>
-                        </div>
-                      </article>
-                    </transition-group>
-                    <div v-if="group.items.length === 0" class="empty-line">这个分组暂时没有任务。</div>
-                  </v-expansion-panel-text>
-                </v-expansion-panel>
-              </v-expansion-panels>
+                    <p>{{ job.path }}</p>
+                    <div class="task-meta">
+                      <span>{{ job.step }}</span>
+                      <span>{{ job.createdLabel }}</span>
+                      <span>{{ job.modelLabel }}</span>
+                    </div>
+                    <v-progress-linear
+                      class="task-progress"
+                      :model-value="job.percent"
+                      height="6"
+                      rounded
+                      :color="progressColor(job.statusKey)"
+                    />
+                  </div>
+                  <div class="task-actions">
+                    <span>{{ job.percent }}%</span>
+                    <v-btn
+                      v-if="job.canRetry"
+                      size="small"
+                      variant="outlined"
+                      :loading="retryingJob[job.id]"
+                      @click="retryJob(job.id)"
+                    >
+                      重试
+                    </v-btn>
+                    <v-btn v-if="job.originalSrt" size="small" variant="text" :href="`/subtitles/jobs/${job.id}/files/original_srt`">
+                      原文
+                    </v-btn>
+                    <v-btn v-if="job.resultSrt" size="small" variant="text" :href="`/subtitles/jobs/${job.id}/files/translated_srt`">
+                      结果
+                    </v-btn>
+                  </div>
+                </article>
+              </transition-group>
+              <div v-if="activeStatusJobs.length === 0" class="empty-line">这个状态暂时没有任务。</div>
+              <v-pagination
+                v-if="statusPageCount > 1"
+                v-model="statusPage"
+                class="task-pagination"
+                :length="statusPageCount"
+                :total-visible="7"
+                density="comfortable"
+              />
             </v-window-item>
 
             <v-window-item value="history">
@@ -208,7 +202,7 @@
                 </v-btn>
               </div>
               <transition-group name="task-list" tag="div" class="task-card-list">
-                <article v-for="job in historyJobs" :key="job.id" class="task-card compact">
+                <article v-for="job in pagedHistoryJobs" :key="job.id" class="task-card compact">
                   <v-checkbox
                     class="task-check"
                     density="compact"
@@ -249,6 +243,14 @@
                 </article>
               </transition-group>
               <div v-if="historyJobs.length === 0" class="empty-line">还没有历史任务。</div>
+              <v-pagination
+                v-if="historyPageCount > 1"
+                v-model="historyPage"
+                class="task-pagination"
+                :length="historyPageCount"
+                :total-visible="7"
+                density="comfortable"
+              />
             </v-window-item>
           </v-window>
         </v-sheet>
@@ -350,7 +352,7 @@
         </v-card>
       </v-dialog>
 
-      <v-dialog v-model="translateDialog" max-width="860" scrim="rgba(32,31,40,.42)">
+      <v-dialog v-model="translateDialog" max-width="1040" scrim="rgba(32,31,40,.42)">
         <v-card class="config-dialog" elevation="12">
           <div class="dialog-head">
             <div>
@@ -362,22 +364,26 @@
 
           <v-card-text class="pa-6">
             <div class="field-label">默认翻译后端</div>
-            <v-row dense>
-              <v-col v-for="item in providerCards" :key="item.value" cols="12" md="6">
+            <div class="provider-grid">
                 <v-card
+                  v-for="item in providerCards"
+                  :key="item.value"
                   class="provider-card pa-4"
                   :class="{ selected: settings.default_translate_backend === item.value }"
                   elevation="0"
                   @click="settings.default_translate_backend = item.value"
                 >
-                  <v-radio
-                    :model-value="settings.default_translate_backend"
-                    :value="item.value"
-                    color="primary"
-                    density="compact"
-                    hide-details
-                  />
-                  <div>
+                  <div class="provider-select">
+                    <v-radio
+                      class="provider-radio"
+                      :model-value="settings.default_translate_backend"
+                      :value="item.value"
+                      color="primary"
+                      density="compact"
+                      hide-details
+                    />
+                  </div>
+                  <div class="provider-copy">
                     <div class="provider-title">{{ item.name }}</div>
                     <div class="provider-desc">{{ item.desc }}</div>
                     <div
@@ -398,8 +404,7 @@
                     测试
                   </v-btn>
                 </v-card>
-              </v-col>
-            </v-row>
+            </div>
 
             <v-row class="mt-5">
               <v-col v-for="field in activeProviderFields" :key="field.key" cols="12" md="6">
@@ -426,12 +431,15 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 const computeDialog = ref(false)
 const translateDialog = ref(false)
 const taskTab = ref('current')
-const openCurrentPanels = ref(['running', 'waiting', 'failed'])
+const taskStatusTab = ref('running')
+const statusPage = ref(1)
+const historyPage = ref(1)
+const PAGE_SIZE = 20
 const jobs = ref([])
 const backendStatus = ref({})
 const computeEnabled = ref(false)
@@ -528,14 +536,19 @@ const todayCompleted = computed(() => {
   return completedJobs.value.filter((job) => Number(job.finishedAt || job.updatedAt || 0) * 1000 >= start.getTime()).length
 })
 
-const currentGroups = computed(() => [
-  { key: 'running', label: '运行中', items: runningJobs.value },
-  { key: 'waiting', label: '等待中', items: waitingJobs.value },
-  { key: 'failed', label: '失败', items: failedJobs.value },
-  { key: 'completed', label: '已完成', items: completedJobs.value }
+const statusTabs = computed(() => [
+  { key: 'running', label: '运行中', count: runningCount.value, items: runningJobs.value },
+  { key: 'waiting', label: '等待中', count: waitingCount.value, items: waitingJobs.value },
+  { key: 'failed', label: '失败', count: failedCount.value, items: failedJobs.value },
+  { key: 'completed', label: '已完成', count: completedJobs.value.length, items: completedJobs.value }
 ])
+const activeStatusJobs = computed(() => statusTabs.value.find((state) => state.key === taskStatusTab.value)?.items || [])
+const statusPageCount = computed(() => Math.max(1, Math.ceil(activeStatusJobs.value.length / PAGE_SIZE)))
+const historyPageCount = computed(() => Math.max(1, Math.ceil(historyJobs.value.length / PAGE_SIZE)))
+const pagedStatusJobs = computed(() => activeStatusJobs.value.slice((statusPage.value - 1) * PAGE_SIZE, statusPage.value * PAGE_SIZE))
+const pagedHistoryJobs = computed(() => historyJobs.value.slice((historyPage.value - 1) * PAGE_SIZE, historyPage.value * PAGE_SIZE))
 
-const visibleJobs = computed(() => (taskTab.value === 'history' ? historyJobs.value : adaptedJobs.value))
+const visibleJobs = computed(() => (taskTab.value === 'history' ? pagedHistoryJobs.value : pagedStatusJobs.value))
 const selectedJobs = computed(() => adaptedJobs.value.filter((job) => selectedIds.has(job.id)))
 const allVisibleSelected = computed(() => visibleJobs.value.length > 0 && visibleJobs.value.every((job) => selectedIds.has(job.id)))
 const whisperSummary = computed(() => `${settings.whisper_model || 'large-v3'} / ${settings.whisper_device || 'cuda'} / ${settings.whisper_compute_type || 'float16'}`)
@@ -795,6 +808,15 @@ function showSnack(message) {
   snackbar.show = true
 }
 
+watch(taskStatusTab, () => {
+  statusPage.value = 1
+})
+
+watch(taskTab, () => {
+  historyPage.value = 1
+  statusPage.value = 1
+})
+
 onMounted(async () => {
   await loadConsole()
   window.setInterval(refreshJobs, 4000)
@@ -944,7 +966,12 @@ body {
   margin: 20px 0 16px;
 }
 
+.service-grid {
+  grid-template-columns: repeat(2, minmax(250px, 320px));
+}
+
 .status-card {
+  position: relative;
   min-width: 0;
   text-align: left;
   border: 1px solid #dbe7f1;
@@ -986,6 +1013,23 @@ button.status-card {
   font-weight: 700;
 }
 
+.service-dot {
+  position: absolute;
+  top: 50%;
+  right: 18px;
+  width: 12px;
+  height: 12px;
+  transform: translateY(-50%);
+  border-radius: 50%;
+  background: #cbd5e1;
+  box-shadow: 0 0 0 6px rgba(203, 213, 225, 0.18);
+}
+
+.service-dot.online {
+  background: #20bc63;
+  box-shadow: 0 0 0 6px rgba(32, 188, 99, 0.13);
+}
+
 .submit-notice {
   margin-bottom: 14px;
 }
@@ -1005,14 +1049,134 @@ button.status-card {
   gap: 16px;
 }
 
+.task-console-head {
+  display: block;
+  padding-bottom: 16px;
+}
+
+.task-metrics {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.task-metric {
+  min-width: 150px;
+  padding: 9px 13px;
+  border: 1px solid #e2eaf2;
+  border-radius: 13px;
+  background: #f8fbfc;
+}
+
+.task-metric span,
+.task-metric em {
+  display: block;
+  color: #6b768f;
+  font-size: 12px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.task-metric strong {
+  display: block;
+  margin: 2px 0;
+  color: #111827;
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.task-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 0;
+  border-top: 1px solid #e5edf4;
+  border-bottom: 1px solid #e5edf4;
+}
+
+.task-actionbar {
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.selection-count {
+  color: #0f766e;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .task-console h3 {
   margin: 0;
   font-size: 24px;
 }
 
 .task-tabs {
-  margin: 12px 0 14px;
-  border-bottom: 1px solid #e5edf4;
+  flex: none;
+  height: 46px;
+  padding: 4px;
+  border: 1px solid #dbe6ef;
+  border-radius: 12px;
+  background: #f5f9fb;
+}
+
+.task-tabs .v-tab {
+  min-width: 112px;
+  min-height: 38px;
+  border-radius: 9px;
+  font-weight: 700;
+  text-transform: none;
+}
+
+.task-tabs .v-tab--selected {
+  color: #087e74;
+  background: #e8fbf4;
+  box-shadow: inset 0 0 0 1px rgba(15, 143, 131, 0.12);
+}
+
+.task-tabs .v-tab__slider {
+  display: none;
+}
+
+.state-tabs {
+  margin: 14px 0;
+  padding: 4px;
+  border: 1px solid #e2eaf2;
+  border-radius: 14px;
+  background: #f7fafc;
+}
+
+.state-tabs .v-tab {
+  min-width: 128px;
+  border-radius: 10px;
+  text-transform: none;
+}
+
+.state-tabs .v-tab--selected {
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(27, 57, 86, 0.06);
+}
+
+.state-tabs .state-dot {
+  margin-right: 8px;
+}
+
+.tab-count {
+  margin-left: 9px;
+  min-width: 28px;
+  height: 23px;
+  padding: 0 7px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #eaf3f4;
+  color: #0f766e;
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .task-groups {
@@ -1185,6 +1349,10 @@ button.status-card {
   color: #64748b;
 }
 
+.task-pagination {
+  margin-top: 16px;
+}
+
 .empty-line {
   padding: 18px;
   border: 1px dashed #cbd9e5;
@@ -1224,16 +1392,24 @@ button.status-card {
   color: #111827;
 }
 
+.provider-grid {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(360px, 1fr));
+  gap: 12px;
+}
+
 .provider-card {
-  min-height: 86px;
+  min-width: 0;
+  min-height: 92px;
   border: 1px solid #dfe7ef;
   border-radius: 12px;
   background: #fbfcff;
   cursor: pointer;
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: start;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
 }
 
 .provider-card.selected {
@@ -1241,9 +1417,24 @@ button.status-card {
   background: #effcf8;
 }
 
+.provider-copy {
+  min-width: 0;
+}
+
+.provider-radio {
+  align-self: center;
+}
+
+.provider-select {
+  display: flex;
+  align-items: center;
+}
+
 .provider-title {
   font-size: 17px;
   font-weight: 800;
+  white-space: normal;
+  overflow-wrap: break-word;
 }
 
 .provider-desc,
@@ -1263,6 +1454,10 @@ button.status-card {
 
 .provider-test-result.bad {
   color: #d81749;
+}
+
+.provider-test-button {
+  align-self: center;
 }
 
 .stat-card {
@@ -1306,6 +1501,14 @@ button.status-card {
   .status-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .service-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .provider-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
@@ -1322,6 +1525,30 @@ button.status-card {
 
   .status-grid {
     grid-template-columns: 1fr;
+  }
+
+  .task-metrics {
+    width: 100%;
+  }
+
+  .task-metric {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .task-actionbar {
+    align-items: flex-start;
+    justify-content: flex-start;
+    flex-direction: column;
+  }
+
+  .task-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .state-tabs .v-slide-group__content {
+    overflow-x: auto;
   }
 
   .task-card {
