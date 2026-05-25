@@ -1,0 +1,45 @@
+services:
+  media-toolbox-ui-test:
+    build:
+      context: ../..
+      dockerfile: deploy/unraid-frontend/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: media-toolbox-unraid-ui-test:latest
+    container_name: media-toolbox-ui-test
+    user: "99:100"
+
+    ports:
+      # 第一次测试：需要换端口时只改左边，避免和正式实例冲突。
+      - "18182:18180"
+
+    environment:
+      MEDIA_DIRS: /media
+      TRASH_DIR: /media/trash
+      APP_DATA_DIR: /data
+      WHISPER_MODEL: large-v3
+      PUID: "99"
+      PGID: "100"
+      UMASK: "022"
+      UNRAID_MOUNT_ROOT: /unraid
+      UNRAID_TRASH_RELATIVE: media/trash
+
+      # 第一次测试：改为 Windows 算力端实际 IP。
+      SUBTITLE_BACKEND_URL: "http://192.168.2.46:18181"
+      SUBTITLE_BACKEND_PUBLIC_URL: "http://192.168.2.46:18181"
+      SUBTITLE_BACKEND_TOKEN: ""
+      SUBTITLE_API_TOKEN: ""
+
+      # 第一次测试：改为 Windows 可以访问的 Unraid 共享路径。
+      SUBTITLE_PROXY_PATH_MAP: '/media=\\192.168.2.9\media'
+
+    volumes:
+      # 第一次字幕联调保持只读；验证移动前去掉 :ro，并且只选测试目录。
+      - /mnt/user/media:/media:ro
+      - /mnt/user/appdata/media-toolbox-ui-test/data:/data
+      - /mnt:/unraid:ro
+
+    command: >
+      sh -c "umask $${UMASK:-022} && uvicorn app.main:app --host 0.0.0.0 --port 18180"
+
+    restart: unless-stopped
