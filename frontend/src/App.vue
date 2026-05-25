@@ -77,46 +77,48 @@
               </div>
             </div>
           </div>
-          <div class="task-actionbar">
-            <span v-if="selectedJobs.length" class="selection-count">已选择 {{ selectedJobs.length }} 个任务</span>
-            <div class="bulk-actions">
-              <v-btn variant="outlined" prepend-icon="mdi-checkbox-multiple-marked-outline" @click="toggleSelectVisible">
-                {{ allVisibleSelected ? '取消本页全选' : '全选本页' }}
-              </v-btn>
-              <v-btn
-                color="primary"
-                variant="flat"
-                prepend-icon="mdi-reload"
-                :disabled="selectedJobs.length === 0"
-                :loading="retryingSelected"
-                @click="retrySelected"
-              >
-                批量重试
-              </v-btn>
-              <v-btn
-                variant="outlined"
-                prepend-icon="mdi-stop-circle-outline"
-                :disabled="selectedJobs.length === 0"
-                @click="unsupportedAction('批量取消')"
-              >
-                批量取消
-              </v-btn>
-              <v-btn
-                color="error"
-                variant="tonal"
-                prepend-icon="mdi-delete-outline"
-                :disabled="selectedJobs.length === 0"
-                @click="unsupportedAction('批量删除')"
-              >
-                批量删除
-              </v-btn>
+          <div class="task-toolbar">
+            <v-tabs v-model="taskTab" class="task-tabs" color="primary" density="comfortable">
+              <v-tab value="current">当前任务</v-tab>
+              <v-tab value="history">历史任务</v-tab>
+            </v-tabs>
+
+            <div class="task-actionbar">
+              <span v-if="selectedJobs.length" class="selection-count">已选择 {{ selectedJobs.length }} 个任务</span>
+              <div class="bulk-actions">
+                <v-btn variant="outlined" prepend-icon="mdi-checkbox-multiple-marked-outline" @click="toggleSelectVisible">
+                  {{ allVisibleSelected ? '取消本页全选' : '全选本页' }}
+                </v-btn>
+                <v-btn
+                  color="primary"
+                  variant="flat"
+                  prepend-icon="mdi-reload"
+                  :disabled="selectedJobs.length === 0"
+                  :loading="retryingSelected"
+                  @click="retrySelected"
+                >
+                  批量重试
+                </v-btn>
+                <v-btn
+                  variant="outlined"
+                  prepend-icon="mdi-stop-circle-outline"
+                  :disabled="selectedJobs.length === 0"
+                  @click="unsupportedAction('批量取消')"
+                >
+                  批量取消
+                </v-btn>
+                <v-btn
+                  color="error"
+                  variant="tonal"
+                  prepend-icon="mdi-delete-outline"
+                  :disabled="selectedJobs.length === 0"
+                  @click="unsupportedAction('批量删除')"
+                >
+                  批量删除
+                </v-btn>
+              </div>
             </div>
           </div>
-
-          <v-tabs v-model="taskTab" class="task-tabs" color="primary" density="comfortable">
-            <v-tab value="current">当前任务</v-tab>
-            <v-tab value="history">历史任务</v-tab>
-          </v-tabs>
 
           <v-window v-model="taskTab">
             <v-window-item value="current">
@@ -1049,8 +1051,7 @@ button.status-card {
 
 .task-console-head {
   display: block;
-  padding-bottom: 14px;
-  border-bottom: 1px solid #e5edf4;
+  padding-bottom: 16px;
 }
 
 .task-metrics {
@@ -1084,13 +1085,22 @@ button.status-card {
   line-height: 1.2;
 }
 
+.task-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 0;
+  border-top: 1px solid #e5edf4;
+  border-bottom: 1px solid #e5edf4;
+}
+
 .task-actionbar {
-  min-height: 54px;
-  padding-top: 12px;
+  min-height: 46px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 14px;
+  gap: 12px;
 }
 
 .selection-count {
@@ -1105,12 +1115,34 @@ button.status-card {
 }
 
 .task-tabs {
-  margin: 2px 0 14px;
-  border-bottom: 1px solid #e5edf4;
+  flex: none;
+  height: 46px;
+  padding: 4px;
+  border: 1px solid #dbe6ef;
+  border-radius: 12px;
+  background: #f5f9fb;
+}
+
+.task-tabs .v-tab {
+  min-width: 112px;
+  min-height: 38px;
+  border-radius: 9px;
+  font-weight: 700;
+  text-transform: none;
+}
+
+.task-tabs .v-tab--selected {
+  color: #087e74;
+  background: #e8fbf4;
+  box-shadow: inset 0 0 0 1px rgba(15, 143, 131, 0.12);
+}
+
+.task-tabs .v-tab__slider {
+  display: none;
 }
 
 .state-tabs {
-  margin-bottom: 14px;
+  margin: 14px 0;
   padding: 4px;
   border: 1px solid #e2eaf2;
   border-radius: 14px;
@@ -1507,6 +1539,11 @@ button.status-card {
   .task-actionbar {
     align-items: flex-start;
     justify-content: flex-start;
+    flex-direction: column;
+  }
+
+  .task-toolbar {
+    align-items: flex-start;
     flex-direction: column;
   }
 
