@@ -15,7 +15,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': 'http://127.0.0.1:18180',
-      '/subtitles': 'http://127.0.0.1:18180'
+      '/subtitles/jobs': 'http://127.0.0.1:18180'
     }
   }
 })

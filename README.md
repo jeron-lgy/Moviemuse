@@ -43,12 +43,6 @@ deploy/unraid-frontend/
 requirements.txt
 ```
 
-在 Unraid 项目目录启动：
-
-```bash
-docker compose -f deploy/unraid-frontend/docker-compose.yml up -d --build
-```
-
 首次使用前检查 [deploy/unraid-frontend/docker-compose.yml](deploy/unraid-frontend/docker-compose.yml) 的媒体目录映射：
 
 ```yaml
@@ -62,6 +56,22 @@ volumes:
 - `/mnt/user/appdata/media-toolbox/data:/data`：保存设置和任务记录。
 - `/mnt:/unraid`：用于识别 Unraid 实际磁盘位置，实现同盘快速移动。
 - 回收站默认位于媒体目录下的 `/mnt/user/media/trash`。
+
+**Unraid 首次安装必须执行：初始化配置目录权限**
+
+控制台容器以 `99:100` 用户运行。以下目录用于保存算力端地址、翻译后端设置和任务数据；如果不可写，会出现“测试联通成功，但保存失败”。
+
+```bash
+mkdir -p /mnt/user/appdata/media-toolbox/data
+chown -R 99:100 /mnt/user/appdata/media-toolbox/data
+chmod -R u+rwX,g+rwX /mnt/user/appdata/media-toolbox/data
+```
+
+完成目录映射与权限初始化后启动：
+
+```bash
+docker compose -f deploy/unraid-frontend/docker-compose.yml up -d --build
+```
 
 访问控制台：
 

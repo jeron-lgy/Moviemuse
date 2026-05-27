@@ -20,8 +20,15 @@ Copy the project root to:
 Then run from the project root:
 
 ```bash
+mkdir -p /mnt/user/appdata/media-toolbox/data
+chown -R 99:100 /mnt/user/appdata/media-toolbox/data
+chmod -R u+rwX,g+rwX /mnt/user/appdata/media-toolbox/data
 docker compose -f deploy/unraid-frontend/docker-compose.yml up -d --build
 ```
+
+The three permission commands are required on the first Unraid installation.
+The console container runs as `99:100` and needs write access to `/data` to
+save the Windows worker address, translation settings, and task state.
 
 The scan/dedupe UI will be available at:
 
