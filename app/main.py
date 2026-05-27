@@ -23,10 +23,13 @@ from .scan_state import scan_cache
 from .storage import MoveRequest, MoveResult, Storage
 from .subtitle_service import (
     SubtitleJob,
+    SubtitleSegment,
     SubtitleService,
     load_compute_config,
     load_subtitle_settings,
+    read_srt,
     save_compute_config,
+    translation_source_text,
 )
 
 
@@ -182,6 +185,12 @@ def remote_settings() -> dict[str, Any]:
         "openai_base_url": "",
         "openai_api_key": "",
         "openai_model": "gpt-4.1-mini",
+        "openai_batch_size": 12,
+        "openai_max_concurrency": 2,
+        "openai_translation_style": "adult_natural",
+        "openai_style_intensity": "medium",
+        "openai_context_lines": 2,
+        "openai_glossary": "",
         "ollama_url": "",
         "ollama_model": "qwen2.5:7b",
         "subtitle_api_token": "",
@@ -318,15 +327,45 @@ def compute_settings_payload(settings_obj: Any, config: dict[str, Any] | None = 
         "openai_base_url": getattr(settings_obj, "openai_base_url", config.get("openai_base_url", "")),
         "openai_api_key": getattr(settings_obj, "openai_api_key", config.get("openai_api_key", "")),
         "openai_model": getattr(settings_obj, "openai_model", config.get("openai_model", "gpt-4.1-mini")),
-        "openai_batch_size": getattr(settings_obj, "openai_batch_size", config.get("openai_batch_size", 40)),
+        "openai_batch_size": getattr(settings_obj, "openai_batch_size", config.get("openai_batch_size", 12)),
         "openai_max_concurrency": getattr(
             settings_obj,
             "openai_max_concurrency",
-            config.get("openai_max_concurrency", 3),
+            config.get("openai_max_concurrency", 2),
         ),
+        "openai_translation_style": getattr(
+            settings_obj,
+            "openai_translation_style",
+            config.get("openai_translation_style", "adult_natural"),
+        ),
+        "openai_style_intensity": getattr(
+            settings_obj,
+            "openai_style_intensity",
+            config.get("openai_style_intensity", "medium"),
+        ),
+        "openai_context_lines": getattr(settings_obj, "openai_context_lines", config.get("openai_context_lines", 2)),
+        "openai_glossary": getattr(settings_obj, "openai_glossary", config.get("openai_glossary", "")),
         "ollama_url": getattr(settings_obj, "ollama_url", config.get("ollama_url", "")),
         "ollama_model": getattr(settings_obj, "ollama_model", config.get("ollama_model", "qwen2.5:7b")),
         "subtitle_api_token": getattr(settings_obj, "api_token", config.get("subtitle_api_token", "")),
+    }
+
+
+def console_settings_payload() -> dict[str, object]:
+    """Return saved console settings without requiring a live worker."""
+    _, _, data_dir = settings()
+    config = load_compute_config(data_dir)
+    saved_settings = load_subtitle_settings(data_dir)
+    return {
+        **compute_settings_payload(saved_settings, config),
+        "default_model": saved_settings.default_model,
+        "model_dir": str(saved_settings.model_dir) if saved_settings.model_dir else "",
+        "device": saved_settings.device,
+        "compute_type": saved_settings.compute_type,
+        "max_workers": saved_settings.max_workers,
+        "default_output_dir": str(saved_settings.default_output_dir) if saved_settings.default_output_dir else "",
+        "translation_backends": translation_backend_options(saved_settings),
+        "local_models": [],
     }
 
 
@@ -879,6 +918,21 @@ def local_node_status() -> dict[str, object]:
     }
 
 
+def offline_backend_status(error: str) -> dict[str, object]:
+    return {
+        "status": "offline",
+        "online": False,
+        "mode": "remote",
+        "backend_url": backend_url(),
+        "error": error,
+        "settings": console_settings_payload(),
+        "hardware": None,
+        "jobs": {"total": 0, "active": 0, "items": []},
+        "path_map": [],
+        "updated_at": time.time(),
+    }
+
+
 def subtitle_backend_status() -> dict[str, object]:
     if not backend_url():
         status = local_node_status()
@@ -898,7 +952,7 @@ def subtitle_backend_status() -> dict[str, object]:
             "mode": "remote",
             "backend_url": backend_url(),
             "error": str(exc.detail),
-            "settings": remote_settings(),
+            "settings": console_settings_payload(),
             "hardware": None,
             "jobs": {"total": 0, "active": 0, "items": []},
             "path_map": [],
@@ -920,6 +974,7 @@ def subtitle_console_payload() -> dict[str, object]:
             backend_error = str(status.get("error") or "后端暂不可用")
     else:
         jobs = [job_payload(job) for job in get_subtitle_service().list_jobs()]
+    visible_settings = status.get("settings") or console_settings_payload()
     return {
         "connection": {
             "subtitle_backend_url": backend_url() or str(console_config.get("subtitle_backend_url", "")),
@@ -928,9 +983,9 @@ def subtitle_console_payload() -> dict[str, object]:
         "backend_status": status,
         "backend_error": backend_error,
         "jobs": jobs,
-        "compute_settings": status.get("settings") or remote_settings(),
+        "compute_settings": visible_settings,
         "path_preview": backend_path_preview(remote_status=status if status.get("online") else None),
-        "translation_backends": (status.get("settings", {}) or {}).get("translation_backends")
+        "translation_backends": (visible_settings or {}).get("translation_backends")
         or translation_backend_options(None),
         "model_options": whisper_model_options(),
     }
@@ -1076,6 +1131,12 @@ def save_terminal_settings(
     openai_base_url: str = Form(default=""),
     openai_api_key: str = Form(default=""),
     openai_model: str = Form(default=""),
+    openai_batch_size: int = Form(default=12),
+    openai_max_concurrency: int = Form(default=2),
+    openai_translation_style: str = Form(default="adult_natural"),
+    openai_style_intensity: str = Form(default="medium"),
+    openai_context_lines: int = Form(default=2),
+    openai_glossary: str = Form(default=""),
     ollama_url: str = Form(default=""),
     ollama_model: str = Form(default=""),
     subtitle_api_token: str = Form(default=""),
@@ -1096,6 +1157,12 @@ def save_terminal_settings(
             "openai_base_url": openai_base_url,
             "openai_api_key": openai_api_key,
             "openai_model": openai_model,
+            "openai_batch_size": openai_batch_size,
+            "openai_max_concurrency": openai_max_concurrency,
+            "openai_translation_style": openai_translation_style,
+            "openai_style_intensity": openai_style_intensity,
+            "openai_context_lines": openai_context_lines,
+            "openai_glossary": openai_glossary,
             "ollama_url": ollama_url,
             "ollama_model": ollama_model,
             "subtitle_api_token": subtitle_api_token,
@@ -1161,6 +1228,16 @@ def subtitles(
     )
 
 
+@app.get("/subtitles/compare", response_class=HTMLResponse)
+def subtitle_compare_page() -> Response:
+    if compute_node_only():
+        return Response("Media Toolbox compute node is running. Use the Unraid console to compare subtitle translations.", media_type="text/plain")
+    frontend_index = FRONTEND_DIST / "index.html"
+    if frontend_index.exists():
+        return FileResponse(frontend_index)
+    raise HTTPException(status_code=404, detail="前端资源不存在")
+
+
 @app.get("/subtitles/assets/{asset_path:path}")
 def subtitle_frontend_asset(asset_path: str) -> FileResponse:
     path = (FRONTEND_DIST / asset_path).resolve()
@@ -1189,6 +1266,12 @@ def save_subtitle_backend_settings(
     openai_base_url: str = Form(default=""),
     openai_api_key: str = Form(default=""),
     openai_model: str = Form(default=""),
+    openai_batch_size: int = Form(default=12),
+    openai_max_concurrency: int = Form(default=2),
+    openai_translation_style: str = Form(default="adult_natural"),
+    openai_style_intensity: str = Form(default="medium"),
+    openai_context_lines: int = Form(default=2),
+    openai_glossary: str = Form(default=""),
     ollama_url: str = Form(default=""),
     ollama_model: str = Form(default=""),
     subtitle_api_token: str = Form(default=""),
@@ -1208,6 +1291,12 @@ def save_subtitle_backend_settings(
         "openai_base_url": openai_base_url,
         "openai_api_key": openai_api_key,
         "openai_model": openai_model,
+        "openai_batch_size": openai_batch_size,
+        "openai_max_concurrency": openai_max_concurrency,
+        "openai_translation_style": openai_translation_style,
+        "openai_style_intensity": openai_style_intensity,
+        "openai_context_lines": openai_context_lines,
+        "openai_glossary": openai_glossary,
         "ollama_url": ollama_url,
         "ollama_model": ollama_model,
         "subtitle_api_token": subtitle_api_token,
@@ -1267,9 +1356,19 @@ async def api_save_subtitle_settings(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="算力端设置格式不正确")
     save_console_compute_config(payload)
     if backend_url():
-        result = remote_post_json("/api/compute/settings", payload)
+        try:
+            result = remote_post_json("/api/compute/settings", payload)
+        except HTTPException as exc:
+            return {
+                "status": "saved",
+                "synced": False,
+                "warning": "\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u5230\u63a7\u5236\u53f0\uff0c\u4f46\u7b97\u529b\u7aef\u6682\u65f6\u65e0\u6cd5\u8fde\u63a5\uff0c\u5f85\u5728\u7ebf\u540e\u518d\u6b21\u4fdd\u5b58\u5373\u53ef\u540c\u6b65\u3002" + str(exc.detail),
+                "settings": console_settings_payload(),
+                "backend_status": offline_backend_status(str(exc.detail)),
+            }
         return {
             "status": "ok",
+            "synced": True,
             "remote": result,
             "settings": result.get("settings", payload),
             "backend_status": subtitle_backend_status(),
@@ -1312,6 +1411,133 @@ async def api_test_translate_backend(request: Request) -> dict[str, object]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"status": "ok", **result}
+
+
+def media_srt_file(raw_path: str) -> Path:
+    media_dirs, trash_dir, _ = settings()
+    try:
+        candidate = Path(raw_path).resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取字幕路径: {exc}") from exc
+    if candidate.suffix.lower() != ".srt":
+        raise HTTPException(status_code=400, detail="仅支持选择 .srt 字幕文件")
+    roots = resolved_roots([path for path in media_dirs if path.exists()])
+    excluded = resolved_roots([trash_dir])
+    if not roots or not any(is_relative_to(candidate, root) for root in roots):
+        raise HTTPException(status_code=400, detail="字幕文件必须位于已挂载媒体目录中")
+    if is_under_any(candidate, excluded):
+        raise HTTPException(status_code=400, detail="不读取回收站内的字幕文件")
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="字幕文件不存在")
+    return candidate
+
+
+@app.post("/api/subtitle/compare/sample")
+async def api_load_compare_sample(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="样本请求格式不正确")
+    path = media_srt_file(str(payload.get("path") or "").strip())
+    try:
+        start = max(0, int(payload.get("start") or 0))
+        requested_count = int(payload.get("count") or 20)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="字幕截取范围不正确") from exc
+    count = 40 if requested_count == 40 else 20
+    text_mode = "full" if str(payload.get("text_mode") or "").strip().lower() == "full" else "auto"
+    source_language = str(payload.get("source_language") or "ja")
+    target_language = str(payload.get("target_language") or "zh")
+    segments = read_srt(path)
+    if not segments:
+        raise HTTPException(status_code=400, detail="字幕文件没有可读取的字幕段")
+    selected = segments[start : start + count]
+    if not selected:
+        raise HTTPException(status_code=400, detail="起始序号超出字幕范围")
+    prepared: list[dict[str, object]] = []
+    extracted_count = 0
+    for index, segment in enumerate(selected):
+        text, extracted = (
+            translation_source_text(segment.text, source_language, target_language)
+            if text_mode == "auto"
+            else (segment.text, False)
+        )
+        extracted_count += int(extracted)
+        prepared.append(
+            {
+                "index": start + index + 1,
+                "start": segment.start,
+                "end": segment.end,
+                "text": text,
+                "display_text": segment.text,
+                "source_extracted": extracted,
+            }
+        )
+    return {
+        "status": "ok",
+        "path": str(path),
+        "total": len(segments),
+        "start": start,
+        "count": len(selected),
+        "text_mode": text_mode,
+        "extracted_count": extracted_count,
+        "segments": prepared,
+    }
+
+
+@app.post("/api/subtitle/translate/compare", dependencies=[Depends(require_subtitle_token)])
+async def api_compare_deepseek_translation(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="翻译对比请求格式不正确")
+    if backend_url():
+        return remote_post_json("/api/subtitle/translate/compare", payload, timeout=300)
+
+    raw_segments = payload.get("segments")
+    raw_variants = payload.get("variants")
+    if not isinstance(raw_segments, list) or not raw_segments or len(raw_segments) > 40:
+        raise HTTPException(status_code=400, detail="请选择 1 至 40 段字幕进行对比")
+    if not isinstance(raw_variants, list) or not 1 <= len(raw_variants) <= 2:
+        raise HTTPException(status_code=400, detail="每次最多比较两个翻译方案")
+    segments: list[SubtitleSegment] = []
+    for item in raw_segments:
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            raise HTTPException(status_code=400, detail="字幕样本格式不正确")
+        segments.append(
+            SubtitleSegment(
+                start=float(item.get("start") or 0),
+                end=float(item.get("end") or 0),
+                text=str(item["text"]),
+            )
+        )
+    source_language = str(payload.get("source_language") or "ja")
+    target_language = str(payload.get("target_language") or "zh")
+    results: list[dict[str, object]] = []
+    for index, variant in enumerate(raw_variants):
+        if not isinstance(variant, dict):
+            raise HTTPException(status_code=400, detail="翻译方案格式不正确")
+        settings_override = variant.get("settings")
+        if settings_override is not None and not isinstance(settings_override, dict):
+            raise HTTPException(status_code=400, detail="翻译方案设置格式不正确")
+        started = time.perf_counter()
+        try:
+            translated = get_subtitle_service().translate_sample(
+                segments=segments,
+                backend="deepseek",
+                source_language=source_language,
+                target_language=target_language,
+                settings_override=settings_override or {},
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"方案 {variant.get('label') or index + 1} 翻译失败: {exc}") from exc
+        results.append(
+            {
+                "id": str(variant.get("id") or index),
+                "label": str(variant.get("label") or f"方案 {index + 1}"),
+                "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                "translations": [segment.translated_text for segment in translated],
+            }
+        )
+    return {"status": "ok", "variants": results}
 
 
 @app.post("/api/subtitle/backend/test")

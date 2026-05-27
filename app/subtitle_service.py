@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -35,6 +36,10 @@ class SubtitleSettings:
     openai_model: str = "gpt-4.1-mini"
     openai_batch_size: int = 12
     openai_max_concurrency: int = 2
+    openai_translation_style: str = "adult_natural"
+    openai_style_intensity: str = "medium"
+    openai_context_lines: int = 2
+    openai_glossary: str = ""
     ollama_url: str = ""
     ollama_model: str = "qwen2.5:7b"
 
@@ -133,12 +138,12 @@ def normalize_openai_base_url(value: Any) -> str:
     return url
 
 
-def config_int(config: dict[str, Any], key: str, env_name: str, default: int) -> int:
+def config_int(config: dict[str, Any], key: str, env_name: str, default: int, minimum: int = 1) -> int:
     raw = config.get(key)
     if raw in (None, ""):
         raw = os.getenv(env_name, str(default))
     try:
-        return max(1, int(raw))
+        return max(minimum, int(raw))
     except (TypeError, ValueError):
         return default
 
@@ -176,6 +181,20 @@ def load_subtitle_settings(data_dir: Path) -> SubtitleSettings:
             "TRANSLATE_OPENAI_MAX_CONCURRENCY",
             2,
         ),
+        openai_translation_style=config_value(
+            config,
+            "openai_translation_style",
+            "TRANSLATE_OPENAI_STYLE",
+            "adult_natural",
+        ),
+        openai_style_intensity=config_value(
+            config,
+            "openai_style_intensity",
+            "TRANSLATE_OPENAI_STYLE_INTENSITY",
+            "medium",
+        ),
+        openai_context_lines=config_int(config, "openai_context_lines", "TRANSLATE_OPENAI_CONTEXT_LINES", 2, minimum=0),
+        openai_glossary=config_value(config, "openai_glossary", "TRANSLATE_OPENAI_GLOSSARY"),
         ollama_url=config_value(config, "ollama_url", "OLLAMA_URL").rstrip("/"),
         ollama_model=config_value(config, "ollama_model", "OLLAMA_TRANSLATE_MODEL", "qwen2.5:7b"),
     )
@@ -279,6 +298,53 @@ def read_srt(path: Path) -> list[SubtitleSegment]:
         except (ValueError, IndexError):
             continue
     return segments
+
+
+def translation_source_text(
+    text: str,
+    source_language: str | None = "auto",
+    target_language: str = "zh",
+) -> tuple[str, bool]:
+    """Extract Japanese source lines when a segment looks like Chinese/Japanese bilingual output."""
+    source = str(source_language or "auto").lower()
+    target = str(target_language or "").lower()
+    if not target.startswith("zh") or source not in {"auto", "ja", "jp", "jpn", "japanese"}:
+        return text, False
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return text, False
+    kana_indexes = [index for index, line in enumerate(lines) if re.search(r"[\u3040-\u30ff]", line)]
+    target_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if index not in kana_indexes and re.search(r"[\u4e00-\u9fff]", line)
+    ]
+    if not kana_indexes or not target_indexes:
+        return text, False
+
+    first_source = min(kana_indexes)
+    last_source = max(kana_indexes)
+    if any(index < first_source for index in target_indexes):
+        extracted = "\n".join(lines[first_source:]).strip()
+    elif any(index > last_source for index in target_indexes):
+        extracted = "\n".join(lines[: last_source + 1]).strip()
+    else:
+        extracted = "\n".join(lines[index] for index in kana_indexes).strip()
+    return (extracted or text), bool(extracted and extracted != str(text).strip())
+
+
+def translation_source_segments(
+    segments: list[SubtitleSegment],
+    source_language: str | None = "auto",
+    target_language: str = "zh",
+) -> tuple[list[SubtitleSegment], int]:
+    prepared: list[SubtitleSegment] = []
+    extracted_count = 0
+    for segment in segments:
+        text, extracted = translation_source_text(segment.text, source_language, target_language)
+        prepared.append(replace(segment, text=text))
+        extracted_count += int(extracted)
+    return prepared, extracted_count
 
 
 def write_srt(path: Path, segments: list[SubtitleSegment], translated: bool = False, bilingual: bool = False) -> None:
@@ -618,6 +684,11 @@ class SubtitleService:
             segments = read_srt(original_srt)
             if not segments:
                 raise RuntimeError(f"原文 SRT 没有可翻译内容: {original_srt}")
+            segments, extracted_count = translation_source_segments(
+                segments,
+                job.detected_language or job.source_language or "auto",
+                job.target_language,
+            )
 
             video_path = Path(job.video_path)
             output_dir = Path(job.output_dir)
@@ -626,7 +697,10 @@ class SubtitleService:
                 job_id,
                 status="translating",
                 progress=0.86,
-                message=f"正在翻译字幕 ({job.translate_backend})",
+                message=(
+                    f"正在翻译字幕 ({job.translate_backend})"
+                    + (f"，已从 {extracted_count} 段双语字幕提取原文" if extracted_count else "")
+                ),
                 original_srt=str(original_srt),
                 original_vtt=str(self._existing_original_vtt(job)) if self._existing_original_vtt(job) else job.original_vtt,
             )
@@ -760,6 +834,20 @@ class SubtitleService:
             "target_language": target_language or "zh",
         }
 
+    def translate_sample(
+        self,
+        segments: list[SubtitleSegment],
+        backend: str,
+        source_language: str = "ja",
+        target_language: str = "zh",
+        settings_override: dict[str, Any] | None = None,
+    ) -> list[SubtitleSegment]:
+        tester = object.__new__(SubtitleService)
+        tester.settings = self._settings_with_override(settings_override or {})
+        translated = [replace(segment) for segment in segments]
+        tester._translate_segments(translated, source_language or "auto", target_language or "zh", backend or "deepseek")
+        return translated
+
     def _settings_with_override(self, payload: dict[str, Any]) -> SubtitleSettings:
         values: dict[str, Any] = {}
         mapping = {
@@ -783,6 +871,11 @@ class SubtitleService:
             elif target in {"max_workers", "openai_batch_size", "openai_max_concurrency"}:
                 try:
                     values[target] = max(1, int(value))
+                except (TypeError, ValueError):
+                    pass
+            elif target == "openai_context_lines":
+                try:
+                    values[target] = max(0, int(value))
                 except (TypeError, ValueError):
                     pass
             elif target in {"api_token", "deepl_api_key", "openai_api_key"}:
@@ -915,13 +1008,24 @@ class SubtitleService:
         endpoint = f"{base_url}/chat/completions"
         batch_size = min(12, max(1, int(self.settings.openai_batch_size or 12)))
         max_concurrency = min(2, max(1, int(self.settings.openai_max_concurrency or 1)))
+        context_lines = min(4, max(0, int(self.settings.openai_context_lines or 0)))
         batches = [(start, segments[start : start + batch_size]) for start in range(0, len(segments), batch_size)]
 
         limits = httpx.Limits(max_connections=max_concurrency, max_keepalive_connections=max_concurrency)
         with httpx.Client(timeout=180, limits=limits) as client:
             if max_concurrency == 1 or len(batches) <= 1:
                 translated_batches = [
-                    self._translate_openai_batch_resilient(client, endpoint, headers, start, batch, source_language, target_language)
+                    self._translate_openai_batch_resilient(
+                        client,
+                        endpoint,
+                        headers,
+                        start,
+                        batch,
+                        source_language,
+                        target_language,
+                        segments[max(0, start - context_lines) : start],
+                        segments[start + len(batch) : start + len(batch) + context_lines],
+                    )
                     for start, batch in batches
                 ]
             else:
@@ -938,6 +1042,8 @@ class SubtitleService:
                             batch,
                             source_language,
                             target_language,
+                            segments[max(0, start - context_lines) : start],
+                            segments[start + len(batch) : start + len(batch) + context_lines],
                         )
                         for start, batch in batches
                     ]
@@ -958,18 +1064,30 @@ class SubtitleService:
         batch: list[SubtitleSegment],
         source_language: str,
         target_language: str,
+        context_before: list[SubtitleSegment] | None = None,
+        context_after: list[SubtitleSegment] | None = None,
     ) -> tuple[int, list[str]]:
         try:
-            return self._translate_openai_batch(client, endpoint, headers, start, batch, source_language, target_language)
+            return self._translate_openai_batch(
+                client,
+                endpoint,
+                headers,
+                start,
+                batch,
+                source_language,
+                target_language,
+                context_before,
+                context_after,
+            )
         except Exception as exc:
             if "authentication failed" in str(exc).lower() or len(batch) <= 1:
                 raise
             midpoint = len(batch) // 2
             _, left = self._translate_openai_batch_resilient(
-                client, endpoint, headers, start, batch[:midpoint], source_language, target_language
+                client, endpoint, headers, start, batch[:midpoint], source_language, target_language, context_before, context_after
             )
             _, right = self._translate_openai_batch_resilient(
-                client, endpoint, headers, start + midpoint, batch[midpoint:], source_language, target_language
+                client, endpoint, headers, start + midpoint, batch[midpoint:], source_language, target_language, context_before, context_after
             )
             return start, left + right
 
@@ -982,26 +1100,29 @@ class SubtitleService:
         batch: list[SubtitleSegment],
         source_language: str,
         target_language: str,
+        context_before: list[SubtitleSegment] | None = None,
+        context_after: list[SubtitleSegment] | None = None,
     ) -> tuple[int, list[str]]:
         items = [{"id": start + index, "text": segment.text} for index, segment in enumerate(batch)]
         expected_ids = [str(item["id"]) for item in items]
+        context = {
+            "before": [segment.text for segment in context_before or []],
+            "after": [segment.text for segment in context_after or []],
+        }
         payload = {
             "model": self.settings.openai_model,
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You translate subtitles. Return valid JSON only. "
-                        "Return one JSON object. Keys must be the exact input ids as strings. "
-                        "Values must be translated subtitle text. Translate every item, including short, repeated, or unclear lines. "
-                        "Do not merge, omit, renumber, add markdown, add notes, or keep source text unless it is already in the target language."
-                    ),
+                    "content": self._openai_translation_instruction(),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"Translate from {source_language} to {target_language}. "
-                        f"Input JSON array:\n{json.dumps(items, ensure_ascii=False)}"
+                        "Context is reference only; return translations only for Target items. "
+                        f"Context JSON:\n{json.dumps(context, ensure_ascii=False)}\n"
+                        f"Target JSON array:\n{json.dumps(items, ensure_ascii=False)}"
                     ),
                 },
             ],
@@ -1044,11 +1165,32 @@ class SubtitleService:
                 cleaned_translations = [str(item).strip() for item in translations]
                 untranslated = [
                     index
-                    for index, (segment, translated) in enumerate(zip(batch, cleaned_translations), start=1)
+                    for index, (segment, translated) in enumerate(zip(batch, cleaned_translations))
                     if self._looks_untranslated_japanese(segment.text, translated, target_language)
                 ]
                 if untranslated:
-                    raise RuntimeError(f"translation still contains Japanese kana at items: {untranslated[:5]}")
+                    repaired = self._repair_openai_untranslated_items(
+                        client,
+                        endpoint,
+                        headers,
+                        start,
+                        batch,
+                        cleaned_translations,
+                        untranslated,
+                        source_language,
+                        target_language,
+                    )
+                    for index, value in repaired.items():
+                        cleaned_translations[index] = value
+                    untranslated = [
+                        index
+                        for index, (segment, translated) in enumerate(zip(batch, cleaned_translations))
+                        if self._looks_untranslated_japanese(segment.text, translated, target_language)
+                    ]
+                if untranslated:
+                    item_ids = [str(start + index) for index in untranslated[:5]]
+                    snippets = " | ".join(batch[index].text.replace("\n", " ")[:36] for index in untranslated[:3])
+                    raise RuntimeError(f"翻译后仍残留日文（字幕段 {', '.join(item_ids)}）：{snippets}")
                 return start, cleaned_translations
             except Exception as exc:
                 last_error = exc
@@ -1056,6 +1198,106 @@ class SubtitleService:
                     time.sleep(1.5 * (attempt + 1))
                     continue
         raise last_error or RuntimeError("DeepSeek/OpenAI 翻译失败")
+
+    def _repair_openai_untranslated_items(
+        self,
+        client: Any,
+        endpoint: str,
+        headers: dict[str, str],
+        start: int,
+        batch: list[SubtitleSegment],
+        translations: list[str],
+        indexes: list[int],
+        source_language: str,
+        target_language: str,
+    ) -> dict[int, str]:
+        items = [
+            {
+                "id": start + index,
+                "source": batch[index].text,
+                "previous_translation": translations[index],
+            }
+            for index in indexes
+        ]
+        expected_ids = [str(item["id"]) for item in items]
+        payload = {
+            "model": self.settings.openai_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        self._openai_translation_instruction()
+                        + " This is a correction pass: the previous result incorrectly retained Japanese kana. "
+                        "Translate every supplied source completely into Simplified Chinese. "
+                        "Do not copy any Japanese kana into the output, including short interjections, slang, or sound words."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Correct translations from {source_language} to {target_language}. "
+                        "Return translations only for these exact ids as one JSON object.\n"
+                        f"Items JSON:\n{json.dumps(items, ensure_ascii=False)}"
+                    ),
+                },
+            ],
+            "temperature": 0.2,
+        }
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = client.post(endpoint, headers=headers, json=payload)
+                if response.status_code in {429, 500, 502, 503, 504} and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                response.raise_for_status()
+                response_payload = response.json()
+                content = response_payload["choices"][0]["message"]["content"]
+                repaired = self._parse_openai_translation_payload(content, expected_ids)
+                return {index: str(value).strip() for index, value in zip(indexes, repaired)}
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(1.0)
+        raise last_error or RuntimeError("DeepSeek/OpenAI 日文残留纠正失败")
+
+    def _openai_translation_instruction(self) -> str:
+        base = (
+            "You translate subtitles. Return valid JSON only. "
+            "Return one JSON object. Keys must be the exact input ids as strings. "
+            "Values must be translated subtitle text. Translate every item, including short, repeated, or unclear lines. "
+            "Do not merge, omit, renumber, add markdown, add notes, or keep source text unless it is already in the target language. "
+            "When translating to Chinese, output Chinese only and do not retain Japanese kana, including interjections or sound words. "
+            "Preserve the original meaning; never invent actions, relationships, or plot details not present in the source. "
+        )
+        style = str(self.settings.openai_translation_style or "adult_natural").strip().lower()
+        intensity = str(self.settings.openai_style_intensity or "medium").strip().lower()
+        if style == "faithful":
+            style_prompt = "Use faithful, concise and natural spoken Chinese without additional embellishment."
+        elif style == "seductive":
+            strength = {
+                "restrained": "Keep the wording suggestive but restrained.",
+                "strong": "When the source supports it, use notably teasing, sensual and emotionally charged spoken Chinese.",
+            }.get(intensity, "When the source supports it, use playful and sensual spoken Chinese with clear emotional tone.")
+            style_prompt = (
+                "The material may contain consensual adult dialogue between adults. "
+                "Render intimate or flirtatious lines as natural adult spoken Chinese. "
+                + strength
+                + " Do not intensify neutral lines or add explicit details absent from the source."
+            )
+        else:
+            style_prompt = (
+                "The material may contain consensual adult dialogue between adults. "
+                "When the source is intimate, flirtatious, commanding, or emotionally expressive, "
+                "use natural adult spoken Chinese that preserves that tone without adding new detail."
+            )
+        glossary = str(self.settings.openai_glossary or "").strip()
+        if glossary:
+            style_prompt += (
+                " Apply the following preferred terminology only when it matches the source meaning; "
+                f"do not force it into unrelated lines:\n{glossary}"
+            )
+        return base + style_prompt
 
     @staticmethod
     def _parse_openai_translation_payload(content: str, expected_ids: list[str] | None = None) -> list[Any]:

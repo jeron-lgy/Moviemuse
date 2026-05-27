@@ -1,6 +1,7 @@
 <template>
   <v-app>
-    <v-main class="app-shell">
+    <CompareView v-if="isCompareView" />
+    <v-main v-else class="app-shell">
       <aside class="side-shell">
         <div class="brand">
           <div class="brand-mark">M</div>
@@ -347,7 +348,7 @@
           <v-divider />
           <v-card-actions class="pa-6 justify-end ga-3">
             <v-btn variant="outlined" class="px-6" @click="testBackend">测试联通</v-btn>
-            <v-btn color="primary" class="px-6" @click="saveComputeAll">保存设置</v-btn>
+            <v-btn color="primary" class="px-6" :loading="savingCompute" @click="saveComputeAll">保存设置</v-btn>
           </v-card-actions>
         </v-card>
       </v-dialog>
@@ -413,17 +414,88 @@
                 <div v-if="field.hint" class="provider-desc mt-2">{{ field.hint }}</div>
               </v-col>
             </v-row>
+
+            <section v-if="settings.default_translate_backend === 'deepseek'" class="deepseek-tuning">
+              <div class="tuning-head">
+                <div>
+                  <h3>字幕语气</h3>
+                  <p>只影响 DeepSeek 翻译；保持逐行对应，不新增原文没有的情节。</p>
+                </div>
+                <div class="tuning-actions">
+                  <span class="tuning-badge">推荐：成人自然</span>
+                  <v-btn size="small" variant="outlined" prepend-icon="mdi-compare" href="/subtitles/compare">
+                    翻译效果对比
+                  </v-btn>
+                </div>
+              </div>
+              <v-row>
+                <v-col cols="12" md="4">
+                  <div class="field-label">翻译风格</div>
+                  <v-select
+                    v-model="settings.openai_translation_style"
+                    :items="deepseekStyleOptions"
+                    item-title="label"
+                    item-value="value"
+                  />
+                </v-col>
+                <v-col cols="12" md="4">
+                  <div class="field-label">语气强度</div>
+                  <v-select
+                    v-model="settings.openai_style_intensity"
+                    :items="deepseekIntensityOptions"
+                    item-title="label"
+                    item-value="value"
+                    :disabled="settings.openai_translation_style === 'faithful'"
+                  />
+                </v-col>
+                <v-col cols="12" md="4">
+                  <div class="field-label">上下文参考</div>
+                  <v-select
+                    v-model="settings.openai_context_lines"
+                    :items="deepseekContextOptions"
+                    item-title="label"
+                    item-value="value"
+                  />
+                </v-col>
+              </v-row>
+              <v-expansion-panels class="tuning-advanced" variant="accordion">
+                <v-expansion-panel title="高级设置：术语偏好与速度">
+                  <v-expansion-panel-text>
+                    <v-row>
+                      <v-col cols="12">
+                        <div class="field-label">术语偏好（可选）</div>
+                        <v-textarea
+                          v-model="settings.openai_glossary"
+                          rows="3"
+                          placeholder="每行填写一项偏好，例如：原词 = 希望采用的中文表达"
+                        />
+                        <div class="provider-desc">仅在原意匹配时使用；空白即可沿用模型判断。</div>
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <div class="field-label">每批字幕条数</div>
+                        <v-text-field v-model.number="settings.openai_batch_size" type="number" min="1" max="12" />
+                      </v-col>
+                      <v-col cols="12" md="6">
+                        <div class="field-label">并发请求数</div>
+                        <v-text-field v-model.number="settings.openai_max_concurrency" type="number" min="1" max="2" />
+                      </v-col>
+                    </v-row>
+                    <p class="tuning-note">上下文越多、风格越强，译文通常更自然，但会略增 Token 和响应时间。</p>
+                  </v-expansion-panel-text>
+                </v-expansion-panel>
+              </v-expansion-panels>
+            </section>
           </v-card-text>
 
           <v-divider />
           <v-card-actions class="pa-6 justify-end ga-3">
             <v-btn variant="outlined" class="px-6" @click="translateDialog = false">取消</v-btn>
-            <v-btn color="primary" class="px-6" @click="saveSettings">保存设置</v-btn>
+            <v-btn color="primary" class="px-6" :loading="savingSettings" @click="saveSettings()">保存设置</v-btn>
           </v-card-actions>
         </v-card>
       </v-dialog>
 
-      <v-snackbar v-model="snackbar.show" color="primary" timeout="3600">
+      <v-snackbar v-model="snackbar.show" :color="snackbar.color" timeout="5000">
         {{ snackbar.message }}
       </v-snackbar>
     </v-main>
@@ -432,7 +504,9 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import CompareView from './components/CompareView.vue'
 
+const isCompareView = window.location.pathname === '/subtitles/compare'
 const computeDialog = ref(false)
 const translateDialog = ref(false)
 const taskTab = ref('current')
@@ -445,11 +519,13 @@ const backendStatus = ref({})
 const computeEnabled = ref(false)
 const retryingFailed = ref(false)
 const retryingSelected = ref(false)
+const savingCompute = ref(false)
+const savingSettings = ref(false)
 const retryingJob = reactive({})
 const translateTests = reactive({})
 const selectedIds = reactive(new Set())
 const connectionMessage = ref('')
-const snackbar = reactive({ show: false, message: '' })
+const snackbar = reactive({ show: false, message: '', color: 'primary' })
 
 const connection = reactive({
   subtitle_backend_url: '',
@@ -472,6 +548,12 @@ const settings = reactive({
   openai_base_url: 'https://api.deepseek.com',
   openai_api_key: '',
   openai_model: 'deepseek-chat',
+  openai_batch_size: 12,
+  openai_max_concurrency: 2,
+  openai_translation_style: 'adult_natural',
+  openai_style_intensity: 'medium',
+  openai_context_lines: 2,
+  openai_glossary: '',
   ollama_url: '',
   ollama_model: 'qwen2.5:7b'
 })
@@ -481,6 +563,22 @@ const providerCards = [
   { name: 'DeepL API', value: 'deepl', desc: 'api-free.deepl.com', logo: 'DL' },
   { name: 'DeepSeek API', value: 'deepseek', desc: 'Base URL · API Key · 模型', logo: 'DS' },
   { name: '本地 Ollama', value: 'ollama', desc: 'OLLAMA_URL · 本地模型', logo: 'OL' }
+]
+
+const deepseekStyleOptions = [
+  { label: '忠实直译', value: 'faithful' },
+  { label: '成人自然', value: 'adult_natural' },
+  { label: '挑逗润色', value: 'seductive' }
+]
+const deepseekIntensityOptions = [
+  { label: '克制', value: 'restrained' },
+  { label: '中等', value: 'medium' },
+  { label: '明显', value: 'strong' }
+]
+const deepseekContextOptions = [
+  { label: '不使用上下文', value: 0 },
+  { label: '前后各 2 行（推荐）', value: 2 },
+  { label: '前后各 4 行', value: 4 }
 ]
 
 const providerFields = {
@@ -676,28 +774,53 @@ async function saveConnection() {
     subtitle_backend_url: computeEnabled.value ? connection.subtitle_backend_url : '',
     subtitle_backend_token: computeEnabled.value ? connection.subtitle_backend_token : ''
   }
-  await api('/api/subtitle/connection', {
+  const result = await api('/api/subtitle/connection', {
     method: 'POST',
     body: JSON.stringify(payload)
   })
-  Object.assign(connection, payload)
+  Object.assign(connection, result.connection || payload)
+  backendStatus.value = result.backend_status || backendStatus.value
+  return result
 }
 
-async function saveSettings() {
-  const payload = await api('/api/subtitle/settings', {
-    method: 'POST',
-    body: JSON.stringify(settings)
-  })
-  Object.assign(settings, payload.settings || {})
-  translateDialog.value = false
-  await refreshBackendStatus()
+async function saveSettings({ closeDialog = true, notify = true } = {}) {
+  savingSettings.value = true
+  try {
+    const payload = await api('/api/subtitle/settings', {
+      method: 'POST',
+      body: JSON.stringify(settings)
+    })
+    Object.assign(settings, payload.settings || {})
+    backendStatus.value = payload.backend_status || backendStatus.value
+    if (closeDialog) translateDialog.value = false
+    if (notify) {
+      showSnack(payload.warning || '\u7ffb\u8bd1\u540e\u7aef\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002', payload.warning ? 'warning' : 'primary')
+    }
+    return payload
+  } catch (error) {
+    if (notify) showSnack(`\u4fdd\u5b58\u5931\u8d25\uff1a${error.message || error}`, 'error')
+    throw error
+  } finally {
+    savingSettings.value = false
+  }
 }
 
 async function saveComputeAll() {
-  await saveConnection()
-  await saveSettings()
-  computeDialog.value = false
-  await loadConsole()
+  savingCompute.value = true
+  try {
+    await saveConnection()
+    const payload = await saveSettings({ closeDialog: false, notify: false })
+    computeDialog.value = false
+    await loadConsole()
+    const message = payload.warning || '\u7b97\u529b\u7aef\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002'
+    connectionMessage.value = message
+    showSnack(message, payload.warning ? 'warning' : 'primary')
+  } catch (error) {
+    connectionMessage.value = `\u4fdd\u5b58\u5931\u8d25\uff1a${error.message || error}`
+    showSnack(connectionMessage.value, 'error')
+  } finally {
+    savingCompute.value = false
+  }
 }
 
 function openTranslate(value) {
@@ -803,8 +926,9 @@ function unsupportedAction(name) {
   showSnack(`${name} 需要后端提供删除/取消接口；当前版本先保留入口，不会误操作任务。`)
 }
 
-function showSnack(message) {
+function showSnack(message, color = 'primary') {
   snackbar.message = message
+  snackbar.color = color
   snackbar.show = true
 }
 
@@ -818,6 +942,7 @@ watch(taskTab, () => {
 })
 
 onMounted(async () => {
+  if (isCompareView) return
   await loadConsole()
   window.setInterval(refreshJobs, 4000)
 })
@@ -1456,6 +1581,60 @@ button.status-card {
   color: #d81749;
 }
 
+.deepseek-tuning {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #e7e9f1;
+}
+
+.tuning-head {
+  margin-bottom: 14px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.tuning-head h3 {
+  margin: 0 0 4px;
+  color: #111827;
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.tuning-head p {
+  margin: 0;
+  color: #737b8f;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.tuning-badge {
+  flex: none;
+  padding: 6px 10px;
+  color: #0f8278;
+  font-size: 12px;
+  font-weight: 800;
+  border-radius: 8px;
+  background: #e9f9f4;
+}
+
+.tuning-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tuning-advanced {
+  margin-top: 2px;
+}
+
+.tuning-note {
+  margin: 8px 0 0;
+  color: #737b8f;
+  font-size: 13px;
+}
+
 .provider-test-button {
   align-self: center;
 }
@@ -1529,6 +1708,21 @@ button.status-card {
 
   .task-metrics {
     width: 100%;
+  }
+
+  .tuning-head {
+    display: block;
+  }
+
+  .tuning-badge {
+    display: inline-block;
+    margin-top: 10px;
+  }
+
+  .tuning-actions {
+    margin-top: 10px;
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .task-metric {
