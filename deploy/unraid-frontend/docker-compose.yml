@@ -5,13 +5,15 @@ services:
       dockerfile: deploy/unraid-frontend/Dockerfile
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
     image: media-toolbox-unraid:latest
     container_name: media-toolbox
     user: "99:100"
 
     ports:
       # 第一次配置：左边是 Unraid 对外 WebUI 端口，冲突时只改左边。
-      - "18180:18180"
+      - "18188:18180"
 
     environment:
       MEDIA_DIRS: /media

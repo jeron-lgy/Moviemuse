@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>日志系统 - Media Toolbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=apple-20260601">
+  <style>
+    .log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .log-list { display: grid; gap: 8px; }
+    .log-row { display: grid; grid-template-columns: 150px 86px 130px minmax(0, 1fr); gap: 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 13px; }
+    .log-row code { white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+    .log-level { font-weight: 800; color: var(--brand); }
+    .log-level.error { color: var(--red); }
+    .log-source { color: var(--muted); font-weight: 700; }
+    .log-stage { display: inline-flex; padding: 2px 8px; border-radius: 999px; background: var(--green-soft); color: var(--brand); font-weight: 800; margin-left: 8px; }
+    .log-kv { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .log-kv span { padding: 2px 7px; border-radius: 999px; background: var(--soft); color: var(--muted); font-size: 12px; font-weight: 700; }
+    .log-empty { padding: 30px; text-align: center; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    @media (max-width: 840px) { .log-row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="console-shell console-two-column">
+    <aside class="console-sidebar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <h1>Media Toolbox</h1>
+          <p>媒体去重控制台</p>
+        </div>
+      </div>
+      {% include "partials/sidebar_nav.html" %}
+    </aside>
+
+    <main class="console-main">
+      <header class="console-top">
+        <div>
+          <h2>日志系统</h2>
+          <p>查看订阅轮询、Jellyfin 查重、MTeam 和 qBittorrent 联动日志。</p>
+        </div>
+        <div class="top-actions">
+          <button class="button ghost" onclick="location.reload()">刷新</button>
+        </div>
+      </header>
+
+      <section class="log-toolbar">
+        <strong>最近 {{ logs|length }} 条</strong>
+      </section>
+
+      {% if logs %}
+        <section class="log-list">
+          {% for item in logs %}
+            <article class="log-row">
+              <span>{{ item.time }}</span>
+              <span class="log-level {{ item.level }}">{{ item.level }}</span>
+              <span class="log-source">{{ item.source }}</span>
+              <div>
+                <strong>{{ item.message }}</strong>
+                {% if item.data and item.data.stage %}<span class="log-stage">{{ item.data.stage }}</span>{% endif %}
+                {% if item.data %}
+                  <div class="log-kv">
+                    {% if item.data.av_id %}<span>番号 {{ item.data.av_id }}</span>{% endif %}
+                    {% if item.data.torrent_id %}<span>种子 {{ item.data.torrent_id }}</span>{% endif %}
+                    {% if item.data.status %}<span>状态 {{ item.data.status }}</span>{% endif %}
+                    {% if item.data.message %}<span>{{ item.data.message }}</span>{% endif %}
+                    {% if item.data.error %}<span>{{ item.data.error }}</span>{% endif %}
+                  </div>
+                  <code>{{ item.data | tojson }}</code>
+                {% endif %}
+              </div>
+            </article>
+          {% endfor %}
+        </section>
+      {% else %}
+        <section class="log-empty">暂无日志</section>
+      {% endif %}
+    </main>
+  </div>
+  <script>
+    setTimeout(() => location.reload(), 5000);
+  </script>
+</body>
+</html>

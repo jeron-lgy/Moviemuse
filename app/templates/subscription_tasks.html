@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>订阅任务 - Media Toolbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=apple-20260601">
+  <style>
+    .task-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .task-toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 800; }
+    .task-toggle input { width: 18px; height: 18px; }
+    .task-list { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    .task-row { display: grid; grid-template-columns: minmax(210px, 1.1fr) minmax(180px, .7fr) minmax(150px, .6fr) minmax(150px, .6fr); gap: 14px; align-items: center; padding: 13px 14px; border-top: 1px solid var(--line); }
+    .task-row:first-child { border-top: 0; }
+    .task-row.header { background: var(--soft); color: var(--muted); font-size: 12px; font-weight: 800; }
+    .task-name strong { display: block; font-size: 14px; }
+    .task-name small, .task-time, .task-state { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .task-cron {
+      width: 100%; min-height: 36px; padding: 7px 10px; border: 1px solid var(--line-strong);
+      border-radius: 8px; background: #fff; font: inherit; font-weight: 700;
+    }
+    .task-actions { display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
+    .task-actions .button { min-height: 32px; padding: 6px 10px; font-size: 12px; }
+    .save-state { color: var(--muted); font-size: 13px; }
+    @media (max-width: 880px) {
+      .task-toolbar { align-items: flex-start; flex-direction: column; }
+      .task-row { grid-template-columns: 1fr; gap: 7px; }
+      .task-row.header { display: none; }
+      .task-actions { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="console-shell console-two-column">
+    <aside class="console-sidebar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <h1>Media Toolbox</h1>
+          <p>媒体去重控制台</p>
+        </div>
+      </div>
+      {% include "partials/sidebar_nav.html" %}
+    </aside>
+
+    <main class="console-main">
+      <header class="console-top">
+        <div>
+          <h2>定时任务</h2>
+          <p>集中管理订阅轮询、订阅下载和厂牌缓存刷新。</p>
+        </div>
+      </header>
+
+      <div class="task-toolbar">
+        <label class="task-toggle">
+          <input id="pollEnabled" type="checkbox" {% if subscription_settings.poll_enabled %}checked{% endif %}>
+          启用自动轮询
+        </label>
+        <div class="task-actions">
+          <span class="save-state" id="saveState"></span>
+          <button class="button primary" onclick="saveTasks(this)">保存任务</button>
+        </div>
+      </div>
+
+      <div class="task-list">
+        <div class="task-row header">
+          <span>任务名称</span>
+          <span>Cron 表达式</span>
+          <span>最近执行</span>
+          <span style="text-align:right;">操作</span>
+        </div>
+        {% for task in tasks %}
+        <div class="task-row" data-task-id="{{ task.id }}">
+          <div class="task-name"><strong>{{ task.name }}</strong><small>{{ task.description }}</small></div>
+          <input class="task-cron" id="cron-{{ task.id }}" value="{{ task.cron }}">
+          <span class="task-time" data-timestamp="{{ task.last_run_at or 0 }}">尚未执行</span>
+          <div class="task-actions">
+            <span class="task-state" id="state-{{ task.id }}"></span>
+            <button class="button ghost" onclick="runTask('{{ task.id }}', this)">立即执行</button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </main>
+  </div>
+  <script>
+    const cronMap = {
+      actress_poll: 'actress_cron',
+      av_download: 'av_cron',
+      maker_refresh: 'maker_cron',
+    };
+
+    document.querySelectorAll('.task-time').forEach(node => {
+      const timestamp = Number(node.dataset.timestamp || 0);
+      if (timestamp) node.textContent = new Date(timestamp * 1000).toLocaleString();
+    });
+
+    async function saveTasks(button) {
+      const state = document.getElementById('saveState');
+      if (button) button.disabled = true;
+      state.textContent = '保存中...';
+      const payload = {
+        poll_enabled: document.getElementById('pollEnabled').checked,
+      };
+      Object.keys(cronMap).forEach(taskId => {
+        const input = document.getElementById('cron-' + taskId);
+        if (input) payload[cronMap[taskId]] = input.value.trim();
+      });
+      try {
+        const response = await fetch('/api/subscriptions/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '保存失败');
+        state.textContent = '已保存';
+        setTimeout(() => { state.textContent = ''; }, 2200);
+      } catch (error) {
+        state.textContent = '保存失败: ' + error.message;
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
+    async function runTask(taskId, button) {
+      const state = document.getElementById('state-' + taskId);
+      await saveTasks();
+      button.disabled = true;
+      state.textContent = '执行中...';
+      try {
+        const response = await fetch('/api/subscriptions/tasks/' + encodeURIComponent(taskId) + '/run', {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '执行失败');
+        state.textContent = '执行完成';
+        setTimeout(() => location.reload(), 900);
+      } catch (error) {
+        state.textContent = '失败: ' + error.message;
+        button.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>

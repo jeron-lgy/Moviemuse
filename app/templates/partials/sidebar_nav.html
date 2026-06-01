@@ -1,0 +1,62 @@
+{% set current_path = request.url.path if request is defined else '' %}
+{% set subscription_paths = ['/subscriptions', '/subscription-search', '/makers', '/subscription-tasks', '/subscription-settings'] %}
+{% set subscription_open = current_path in subscription_paths %}
+<nav class="console-nav" aria-label="Media Toolbox navigation">
+  <a class="nav-item {% if current_path == '/dashboard' %}active{% endif %}" href="/dashboard">
+    <span class="nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M4 13h6V4H4z"/><path d="M14 20h6V4h-6z"/><path d="M4 20h6v-3H4z"/></svg>
+    </span>
+    <span class="nav-label">Dashboard</span>
+  </a>
+  <span class="nav-group {% if subscription_open %}open{% endif %}">
+    <a class="nav-item has-children {% if subscription_open %}active{% endif %}" href="/subscriptions">
+      <span class="nav-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z"/><path d="M9 9h6"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
+      </span>
+      <span class="nav-label">订阅管理</span>
+      <span class="nav-chevron" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></svg>
+      </span>
+    </a>
+    {% if subscription_open %}
+      <span class="nav-children">
+        <a class="nav-child {% if current_path == '/subscription-search' %}active{% endif %}" href="/subscription-search">搜索</a>
+        <a class="nav-child {% if current_path == '/subscriptions' %}active{% endif %}" href="/subscriptions">订阅</a>
+        <a class="nav-child {% if current_path == '/makers' %}active{% endif %}" href="/makers">厂牌发售</a>
+        <a class="nav-child {% if current_path == '/subscription-tasks' %}active{% endif %}" href="/subscription-tasks">任务</a>
+        <a class="nav-child {% if current_path == '/subscription-settings' %}active{% endif %}" href="/subscription-settings">订阅设置</a>
+      </span>
+    {% endif %}
+  </span>
+  <a class="nav-item {% if current_path == '/' %}active{% endif %}" href="/">
+    <span class="nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M7 7h11v11H7z"/><path d="M4 4h11v11"/></svg>
+    </span>
+    <span class="nav-label">重复视频</span>
+  </a>
+  <a class="nav-item {% if current_path.startswith('/subtitles') %}active{% endif %}" href="/subtitles">
+    <span class="nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M8 13h3"/><path d="M13 13h3"/><path d="M8 16h8"/></svg>
+    </span>
+    <span class="nav-label">字幕任务</span>
+  </a>
+  <span class="nav-separator"></span>
+  <a class="nav-item {% if current_path.startswith('/notifications') %}active{% endif %}" href="/notifications">
+    <span class="nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>
+    </span>
+    <span class="nav-label">通知</span>
+  </a>
+  <a class="nav-item {% if current_path.startswith('/logs') %}active{% endif %}" href="/logs">
+    <span class="nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M14 3v4h4"/><path d="M9 12h6"/><path d="M9 16h6"/></svg>
+    </span>
+    <span class="nav-label">日志系统</span>
+  </a>
+  <a class="nav-item {% if current_path == '/api/scan' %}active{% endif %}" href="/api/scan">
+    <span class="nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><path d="M10 5H6a1 1 0 0 0-1 1v4"/><path d="M14 5h4a1 1 0 0 1 1 1v4"/><path d="M10 19H6a1 1 0 0 1-1-1v-4"/><path d="M14 19h4a1 1 0 0 0 1-1v-4"/><path d="M9 12h6"/></svg>
+    </span>
+    <span class="nav-label">扫描 API</span>
+  </a>
+</nav>

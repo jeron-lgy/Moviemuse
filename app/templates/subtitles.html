@@ -4,24 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>瀛楀箷浠诲姟 - Media Toolbox</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=apple-20260601">
 </head>
 <body>
-  <div class="console-shell subtitle-console">
+  <div class="console-shell console-two-column">
     <aside class="console-sidebar">
       <div class="brand">
         <div class="brand-mark">M</div>
         <div>
           <h1>Media Toolbox</h1>
-          <p>瀛楀箷绠楀姏鎺у埗鍙?/p>
+          <p>媒体去重控制台</p>
         </div>
       </div>
 
-      <nav class="console-nav" aria-label="Media Toolbox navigation">
-        <a href="/">閲嶅瑙嗛</a>
-        <a class="active" href="/subtitles">瀛楀箷浠诲姟</a>
-        <a href="/api/scan">鎵弿 API</a>
-      </nav>
+      {% include "partials/sidebar_nav.html" %}
     </aside>
 
     <main class="console-main">
@@ -457,23 +453,6 @@
       </details>
     </main>
 
-    <aside class="console-detail">
-      <div class="detail-sticky">
-        <section class="detail-card dark">
-          <span>缁堢鐘舵€?/span>
-          <strong id="sideBackendStatus">{{ "鍦ㄧ嚎" if backend_status.online else "绂荤嚎" }}</strong>
-          <p id="sideBackendText">{{ backend_status.backend_url or "鏈湴妯″紡" }}</p>
-        </section>
-        <section class="detail-card">
-          <h3>鎵ц閫昏緫</h3>
-          <p>閲嶅瑙嗛椤靛彧鎶婃枃浠堕€佸埌寰呯‘璁ゆ壒娆★紱杩欓噷纭妯″瀷銆佺炕璇戝悗绔拰杈撳嚭鐩綍鍚庯紝鎵嶄細鐪熸寮€濮嬩换鍔°€?/p>
-        </section>
-        <section class="detail-card">
-          <h3>璺緞绛栫暐</h3>
-          <p>鎺ㄨ崘鐢辨帶鍒跺彴瀹屾垚涓昏璺緞鏄犲皠锛屾妸 Unraid 璺緞杞垚 Windows 鍙 UNC 鎴栫洏绗﹁矾寰勶紱绠楀姏缁堢鍙礋璐ｆ帴鏀朵换鍔″拰璺?Whisper銆?/p>
-        </section>
-      </div>
-    </aside>
   </div>
   <script src="{{ url_for('static', path='/app.js') }}"></script>
 </body>

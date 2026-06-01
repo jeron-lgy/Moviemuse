@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Media Toolbox</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=apple-20260601">
 </head>
 <body>
   <div class="console-shell">
@@ -17,11 +17,7 @@
         </div>
       </div>
 
-      <nav class="console-nav" aria-label="Media Toolbox navigation">
-        <a class="active" href="/">重复视频</a>
-        <a href="/subtitles">字幕任务</a>
-        <a href="/api/scan">扫描 API</a>
-      </nav>
+      {% include "partials/sidebar_nav.html" %}
 
       <section class="side-card">
         <div class="side-card-head">

@@ -7,24 +7,60 @@
           <div class="brand-mark">M</div>
           <div>
             <h1>Media Toolbox</h1>
-            <p>字幕算力控制台</p>
+            <p>媒体去重控制台</p>
           </div>
         </div>
 
         <nav class="nav-list">
-          <a href="/">重复视频</a>
-          <a class="active" href="/subtitles">字幕任务</a>
-          <a href="/api/scan">扫描 API</a>
+          <a class="nav-item" href="/dashboard">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 13h6V4H4z"/><path d="M14 20h6V4h-6z"/><path d="M4 20h6v-3H4z"/></svg>
+            </span>
+            <span class="nav-label">Dashboard</span>
+          </a>
+          <span class="nav-group">
+            <a class="nav-item has-children" href="/subscriptions">
+              <span class="nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z"/><path d="M9 9h6"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
+              </span>
+              <span class="nav-label">订阅管理</span>
+              <span class="nav-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></svg>
+              </span>
+            </a>
+          </span>
+          <a class="nav-item" href="/">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M7 7h11v11H7z"/><path d="M4 4h11v11"/></svg>
+            </span>
+            <span class="nav-label">重复视频</span>
+          </a>
+          <a class="nav-item active" href="/subtitles">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M8 13h3"/><path d="M13 13h3"/><path d="M8 16h8"/></svg>
+            </span>
+            <span class="nav-label">字幕任务</span>
+          </a>
+          <span class="nav-separator"></span>
+          <a class="nav-item" href="/notifications">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>
+            </span>
+            <span class="nav-label">通知</span>
+          </a>
+          <a class="nav-item" href="/logs">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M14 3v4h4"/><path d="M9 12h6"/><path d="M9 16h6"/></svg>
+            </span>
+            <span class="nav-label">日志系统</span>
+          </a>
+          <a class="nav-item" href="/api/scan">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M10 5H6a1 1 0 0 0-1 1v4"/><path d="M14 5h4a1 1 0 0 1 1 1v4"/><path d="M10 19H6a1 1 0 0 1-1-1v-4"/><path d="M14 19h4a1 1 0 0 0 1-1v-4"/><path d="M9 12h6"/></svg>
+            </span>
+            <span class="nav-label">扫描 API</span>
+          </a>
         </nav>
-
-        <div class="side-card">
-          <div class="side-card-head">
-            <strong>默认设置</strong>
-            <v-btn size="small" variant="text" @click="computeDialog = true">修改</v-btn>
-          </div>
-          <p>{{ whisperSummary }}</p>
-          <p>{{ activeProvider?.name || 'Google 免费翻译' }}</p>
-        </div>
       </aside>
 
       <section class="main-panel">
@@ -961,9 +997,9 @@ body {
 
 .app-shell {
   min-height: 100vh;
-  padding: 20px;
+  padding: 22px;
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   gap: 20px;
   background:
     radial-gradient(circle at top left, rgba(193, 236, 231, 0.75), transparent 360px),
@@ -975,26 +1011,30 @@ body {
   background: rgba(255, 255, 255, 0.86);
   border: 1px solid rgba(213, 226, 236, 0.85);
   box-shadow: 0 24px 60px rgba(25, 46, 68, 0.08);
+  backdrop-filter: blur(18px);
 }
 
 .side-shell {
   position: sticky;
-  top: 20px;
-  height: calc(100vh - 40px);
-  border-radius: 22px;
-  padding: 24px;
+  top: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-height: calc(100vh - 44px);
+  border-radius: 18px;
+  padding: 20px;
 }
 
 .brand {
   display: flex;
-  gap: 14px;
   align-items: center;
+  gap: 12px;
 }
 
 .brand-mark {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+  width: 42px;
+  height: 42px;
+  border-radius: 15px;
   display: grid;
   place-items: center;
   background: linear-gradient(135deg, #0f8f83, #17b7a7);
@@ -1005,7 +1045,7 @@ body {
 
 .brand h1 {
   margin: 0;
-  font-size: 22px;
+  font-size: 20px;
   line-height: 1.1;
 }
 
@@ -1019,37 +1059,114 @@ body {
 
 .nav-list {
   display: grid;
-  gap: 10px;
-  margin-top: 42px;
+  gap: 8px;
 }
 
 .nav-list a {
+  box-sizing: border-box;
+  width: 100%;
   color: #334155;
   text-decoration: none;
   font-weight: 750;
-  padding: 15px 16px;
-  border-radius: 14px;
-  transition: 0.18s ease;
 }
 
-.nav-list a:hover,
-.nav-list a.active {
+.nav-item {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 12px 13px;
+  border: 1px solid rgba(226, 232, 240, 0.72);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.03);
+  line-height: 24px;
+  transition: background-color 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.nav-item.has-children {
+  grid-template-columns: 26px minmax(0, 1fr) 18px;
+}
+
+.nav-list .nav-item:hover,
+.nav-list .nav-item.active {
   color: #087e74;
   background: #e8fbf4;
+  border-color: rgba(8, 126, 116, 0.18);
+  box-shadow: 0 14px 30px rgba(8, 126, 116, 0.08);
 }
 
-.side-card {
-  margin-top: 36px;
-  border: 1px solid #e1eaf2;
-  border-radius: 18px;
-  padding: 16px;
-  background: #fbfdff;
+.nav-item:active {
+  transform: translateY(1px) scale(0.992);
 }
 
-.side-card-head {
-  display: flex;
-  justify-content: space-between;
+.nav-icon,
+.nav-chevron {
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
+  color: currentColor;
+}
+
+.nav-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.04);
+}
+
+.nav-icon svg,
+.nav-chevron svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.nav-list .nav-item:hover .nav-icon,
+.nav-list .nav-item.active .nav-icon {
+  background: rgba(8, 126, 116, 0.1);
+}
+
+.nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-chevron {
+  opacity: 0.7;
+  transition: transform 0.2s ease;
+}
+
+.nav-group {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-child {
+  min-height: 34px !important;
+  margin-left: 18px;
+  padding: 6px 12px !important;
+  border-radius: 10px !important;
+  color: #667085 !important;
+  font-size: 14px;
+  line-height: 22px !important;
+}
+
+.nav-child:hover {
+  color: #087e74 !important;
+}
+
+.nav-separator {
+  display: block;
+  height: 1px;
+  margin: 5px 0;
+  background: #e5e7eb;
 }
 
 .side-card p {
