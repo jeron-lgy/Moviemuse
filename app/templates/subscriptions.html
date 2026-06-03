@@ -3,8 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>订阅管理 - Media Toolbox</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=apple-20260601">
+  <link rel="icon" href="{{ url_for('static', path='/icons/favicon.ico') }}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', path='/icons/favicon-32x32.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='/icons/apple-touch-icon.png') }}">
+  <link rel="manifest" href="{{ url_for('static', path='/icons/site.webmanifest') }}">
+  <meta name="theme-color" content="#FF385C">  <title>订阅管理 - MovieMuse</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=moviemuse-20260602">
   <style>
     /* ---- 搜索 ---- */
     .sub-search-box { display: flex; gap: 10px; margin-bottom: 20px; }
@@ -207,10 +211,10 @@
   <div class="console-shell console-two-column">
     <aside class="console-sidebar">
       <div class="brand">
-        <div class="brand-mark">M</div>
+        <div class="brand-mark"><img class="brand-logo-image" src="/static/icons/android-chrome-192x192.png" alt="MovieMuse"></div>
         <div>
-          <h1>Media Toolbox</h1>
-          <p>媒体去重控制台</p>
+          <h1>MovieMuse</h1>
+          <p>AI-Powered Media Library</p>
         </div>
       </div>
       {% include "partials/sidebar_nav.html" %}

@@ -1,10 +1,15 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>绠楀姏缁堢 - Media Toolbox</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=apple-20260601">
+  <link rel="icon" href="{{ url_for('static', path='/icons/favicon.ico') }}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', path='/icons/favicon-32x32.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='/icons/apple-touch-icon.png') }}">
+  <link rel="manifest" href="{{ url_for('static', path='/icons/site.webmanifest') }}">
+  <meta name="theme-color" content="#FF385C">
+  <title>算力终端 - MovieMuse</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v=moviemuse-20260602">
 </head>
 <body>
   <div class="console-shell terminal-console terminal-simple">
@@ -17,7 +22,7 @@
         </div>
       </div>
 
-      <nav class="console-nav" aria-label="Media Toolbox navigation">
+      <nav class="console-nav" aria-label="MovieMuse navigation">
         <a class="active" href="/terminal">绠楀姏绔缃?/a>
       </nav>
 

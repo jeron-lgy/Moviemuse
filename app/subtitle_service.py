@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -606,7 +606,7 @@ class SubtitleService:
                 jobs = list(self.jobs.values())
             active = sum(1 for job in jobs if job.status in {"queued", "running", "translating"})
             print(
-                f"[Media Toolbox] status active={active} total={len(jobs)} "
+                f"[MovieMuse] status active={active} total={len(jobs)} "
                 f"model={self.settings.default_model} device={self.settings.device}/{self.settings.compute_type}",
                 flush=True,
             )
@@ -615,7 +615,7 @@ class SubtitleService:
         job = self.get_job(job_id)
         if not job:
             return
-        print(f"[Media Toolbox] job started id={job.id} file={job.video_path}", flush=True)
+        print(f"[MovieMuse] job started id={job.id} file={job.video_path}", flush=True)
         self._update(job_id, status="running", progress=0.02, message="加载 Whisper 模型", started_at=time.time())
         try:
             video_path = Path(job.video_path)
@@ -657,7 +657,7 @@ class SubtitleService:
             if job.translate:
                 self._update(job_id, status="translating", progress=0.84, message=f"等待翻译字幕 ({job.translate_backend})")
                 self.translation_queue.put(job_id)
-                print(f"[Media Toolbox] transcription completed id={job.id} output={original_srt}", flush=True)
+                print(f"[MovieMuse] transcription completed id={job.id} output={original_srt}", flush=True)
                 return
 
             self._update(
@@ -667,11 +667,11 @@ class SubtitleService:
                 message="字幕任务完成",
                 finished_at=time.time(),
             )
-            print(f"[Media Toolbox] job completed id={job.id} output={original_srt}", flush=True)
+            print(f"[MovieMuse] job completed id={job.id} output={original_srt}", flush=True)
         except Exception as exc:
             self._fail_job(job_id, job, exc)
             message = self.get_job(job_id).error if self.get_job(job_id) else str(exc)
-            print(f"[Media Toolbox] job failed id={job.id} error={message}", flush=True)
+            print(f"[MovieMuse] job failed id={job.id} error={message}", flush=True)
 
     def _run_translation_job(self, job_id: str) -> None:
         job = self.get_job(job_id)
@@ -727,11 +727,11 @@ class SubtitleService:
                 bilingual_srt=str(bilingual_srt),
                 error=None,
             )
-            print(f"[Media Toolbox] translation completed id={job.id} output={translated_srt}", flush=True)
+            print(f"[MovieMuse] translation completed id={job.id} output={translated_srt}", flush=True)
         except Exception as exc:
             self._fail_job(job_id, job, exc, message="翻译失败")
             current = self.get_job(job_id)
-            print(f"[Media Toolbox] translation failed id={job.id} error={current.error if current else exc}", flush=True)
+            print(f"[MovieMuse] translation failed id={job.id} error={current.error if current else exc}", flush=True)
 
     def _fail_job(self, job_id: str, job: SubtitleJob, exc: Exception, message: str = "任务失败") -> None:
         error = str(exc)

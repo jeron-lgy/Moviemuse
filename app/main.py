@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import platform
@@ -385,9 +385,9 @@ def save_local_compute_settings(payload: dict[str, Any]) -> dict[str, object]:
     save_compute_config(data_dir, config)
     restarted = reset_subtitle_service_if_idle()
     if not restarted:
-        print("[Media Toolbox] settings saved; restart required after active jobs finish", flush=True)
+        print("[MovieMuse] settings saved; restart required after active jobs finish", flush=True)
     else:
-        print("[Media Toolbox] settings saved and reloaded", flush=True)
+        print("[MovieMuse] settings saved and reloaded", flush=True)
     return {"status": "ok", "restart_required": not restarted}
 
 
@@ -716,11 +716,11 @@ def submit_subtitle_jobs_bulk_background(payloads: list[dict[str, object]]) -> N
     try:
         result = submit_subtitle_jobs_bulk(payloads)
         print(
-            f"[Media Toolbox] bulk subtitle submission accepted submitted={result.get('submitted', 0)}",
+            f"[MovieMuse] bulk subtitle submission accepted submitted={result.get('submitted', 0)}",
             flush=True,
         )
     except Exception as exc:
-        print(f"[Media Toolbox] bulk subtitle submission failed: {exc}", flush=True)
+        print(f"[MovieMuse] bulk subtitle submission failed: {exc}", flush=True)
 
 
 def subtitle_batch_dir(data_dir: Path) -> Path:
@@ -1128,7 +1128,7 @@ def dashboard_payload() -> dict[str, Any]:
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page(request: Request) -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
+        return Response("MovieMuse compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -1139,7 +1139,7 @@ def dashboard_page(request: Request) -> Response:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, view: str = "duplicates") -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
+        return Response("MovieMuse compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
     media_dirs, trash_dir, data_dir = settings()
     scan_cache.configure(data_dir)
     scan_dirs = selectable_scan_dirs(media_dirs, [trash_dir])
@@ -1231,7 +1231,7 @@ def create_subtitle_jobs_from_scan(paths: list[str] = Form(default=[])) -> Redir
         submitted = int(result.get("submitted") or 0)
         failed = max(0, len(payloads) - submitted)
     except Exception as exc:
-        print(f"[Media Toolbox] failed to submit subtitle jobs: {exc}", flush=True)
+        print(f"[MovieMuse] failed to submit subtitle jobs: {exc}", flush=True)
         submitted = 0
         failed = len(payloads)
     return RedirectResponse(f"/subtitles?submitted={submitted}&failed={failed}", status_code=303)
@@ -1330,7 +1330,7 @@ def subtitles(
     failed: int = 0,
 ) -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running. Use the Unraid console to manage subtitle jobs.", media_type="text/plain")
+        return Response("MovieMuse compute node is running. Use the Unraid console to manage subtitle jobs.", media_type="text/plain")
     frontend_index = FRONTEND_DIST / "index.html"
     if frontend_index.exists():
         return FileResponse(frontend_index)
@@ -1380,7 +1380,7 @@ def subtitles(
 @app.get("/subtitles/compare", response_class=HTMLResponse)
 def subtitle_compare_page() -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running. Use the Unraid console to compare subtitle translations.", media_type="text/plain")
+        return Response("MovieMuse compute node is running. Use the Unraid console to compare subtitle translations.", media_type="text/plain")
     frontend_index = FRONTEND_DIST / "index.html"
     if frontend_index.exists():
         return FileResponse(frontend_index)
@@ -2862,7 +2862,7 @@ def stop_subscription_polling() -> None:
 def subscriptions_page(request: Request) -> Response:
     """订阅管理页面"""
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     service = get_subscription_service()
     refresh_library_status_for_subscriptions()
     return templates.TemplateResponse(
@@ -2880,7 +2880,7 @@ def subscriptions_page(request: Request) -> Response:
 @app.get("/subscription-search", response_class=HTMLResponse)
 def subscription_search_page(request: Request) -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     service = get_subscription_service()
     return templates.TemplateResponse(
         request=request,
@@ -2903,7 +2903,7 @@ def legacy_settings_page() -> RedirectResponse:
 def settings_page(request: Request) -> Response:
     """订阅设置页面"""
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
@@ -2917,7 +2917,7 @@ def settings_page(request: Request) -> Response:
 @app.get("/makers", response_class=HTMLResponse)
 def makers_page(request: Request) -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     return templates.TemplateResponse(
         request=request,
         name="makers.html",
@@ -2928,7 +2928,7 @@ def makers_page(request: Request) -> Response:
 @app.get("/subscription-tasks", response_class=HTMLResponse)
 def subscription_tasks_page(request: Request) -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     return templates.TemplateResponse(
         request=request,
         name="subscription_tasks.html",
@@ -2943,7 +2943,7 @@ def subscription_tasks_page(request: Request) -> Response:
 def logs_page(request: Request) -> Response:
     """日志系统页面"""
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     return templates.TemplateResponse(
         request=request,
         name="logs.html",
@@ -2967,7 +2967,7 @@ NOTIFICATION_EVENTS: tuple[dict[str, str], ...] = (
 @app.get("/notifications", response_class=HTMLResponse)
 def notifications_page(request: Request) -> Response:
     if compute_node_only():
-        return Response("Media Toolbox compute node is running.", media_type="text/plain")
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
     return templates.TemplateResponse(
         request=request,
         name="notifications.html",
@@ -3344,7 +3344,7 @@ def send_test_notification(channel: str, config: dict[str, Any]) -> dict[str, ob
 
 
 def send_test_notification_channel(channel_config: dict[str, Any]) -> dict[str, object]:
-    title = "Media Toolbox 通知测试"
+    title = "MovieMuse 通知测试"
     message = "这是一条测试通知，用于确认通知通道可以正常发送。"
     channel_type = str(channel_config.get("type") or "").strip().lower()
     config = channel_config.get("config") if isinstance(channel_config.get("config"), dict) else channel_config

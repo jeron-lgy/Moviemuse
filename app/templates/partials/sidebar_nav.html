@@ -1,7 +1,7 @@
 {% set current_path = request.url.path if request is defined else '' %}
 {% set subscription_paths = ['/subscriptions', '/subscription-search', '/makers', '/subscription-tasks', '/subscription-settings'] %}
 {% set subscription_open = current_path in subscription_paths %}
-<nav class="console-nav" aria-label="Media Toolbox navigation">
+<nav class="console-nav" aria-label="MovieMuse navigation">
   <a class="nav-item {% if current_path == '/dashboard' %}active{% endif %}" href="/dashboard">
     <span class="nav-icon" aria-hidden="true">
       <svg viewBox="0 0 24 24"><path d="M4 13h6V4H4z"/><path d="M14 20h6V4h-6z"/><path d="M4 20h6v-3H4z"/></svg>

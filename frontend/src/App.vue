@@ -1,13 +1,13 @@
-<template>
+﻿<template>
   <v-app>
     <CompareView v-if="isCompareView" />
     <v-main v-else class="app-shell">
       <aside class="side-shell">
         <div class="brand">
-          <div class="brand-mark">M</div>
+          <div class="brand-mark"><img class="brand-logo-image" :src="'/static/icons/android-chrome-192x192.png'" alt="MovieMuse"></div>
           <div>
-            <h1>Media Toolbox</h1>
-            <p>媒体去重控制台</p>
+            <h1>MovieMuse</h1>
+            <p>AI-Powered Media Library</p>
           </div>
         </div>
 
@@ -735,9 +735,9 @@ function statusLabel(status) {
 }
 
 function progressColor(status) {
-  if (status === 'failed') return 'error'
-  if (status === 'completed') return 'success'
-  if (status === 'translating') return 'secondary'
+  if (status === 'failed') return 'primary'
+  if (status === 'completed') return 'secondary'
+  if (status === 'queued') return '#b0b0b0'
   return 'primary'
 }
 
@@ -1871,5 +1871,240 @@ button.status-card {
     justify-content: flex-start;
     flex-wrap: wrap;
   }
+}
+
+/* MovieMuse visual polish. Functional structure is unchanged. */
+:root {
+  --mm-primary: #ff385c;
+  --mm-primary-hover: #e00b41;
+  --mm-text: #222222;
+  --mm-muted: #6a6a6a;
+  --mm-border: #dddddd;
+  --mm-surface: #f7f7f7;
+  --mm-bg: #ffffff;
+}
+
+body {
+  font-family: "Airbnb Cereal VF", Inter, "HarmonyOS Sans SC", MiSans, system-ui, sans-serif;
+  color: var(--mm-text);
+  background: var(--mm-bg);
+}
+
+.app-shell {
+  background: var(--mm-bg);
+}
+
+.sidebar {
+  border-right: 1px solid var(--mm-border);
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.brand h1,
+.page-header h1,
+.section-title {
+  color: var(--mm-text);
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+
+.brand p,
+.page-header p,
+.text-muted,
+.muted {
+  color: var(--mm-muted);
+}
+
+.brand-mark {
+  background: #ffffff !important;
+  color: #ffffff !important;
+  border-radius: 14px !important;
+  overflow: hidden !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+}
+
+.brand-logo-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.nav-link,
+.child-nav-link {
+  border-radius: 14px;
+  color: var(--mm-text);
+  transition: background-color .18s ease, color .18s ease, transform .18s ease;
+}
+
+.nav-link:hover,
+.child-nav-link:hover {
+  background: #f7f7f7;
+  color: var(--mm-primary);
+}
+
+.nav-link.active,
+.child-nav-link.active {
+  background: #fff1f3;
+  color: var(--mm-primary);
+}
+
+.panel,
+.card,
+.status-card,
+.task-panel,
+.notice-card,
+.settings-card,
+.v-card {
+  border: 1px solid var(--mm-border) !important;
+  border-radius: 22px !important;
+  background: #ffffff !important;
+  box-shadow: none !important;
+}
+
+button,
+.btn,
+.v-btn {
+  border-radius: 16px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+}
+
+.btn-primary,
+.v-btn--variant-elevated.bg-primary {
+  background: var(--mm-primary) !important;
+  color: #ffffff !important;
+}
+
+.btn-primary:hover,
+.v-btn--variant-elevated.bg-primary:hover {
+  background: var(--mm-primary-hover) !important;
+}
+
+input,
+select,
+textarea,
+.v-field {
+  border-radius: 16px !important;
+}
+
+.v-field--focused .v-field__outline {
+  color: var(--mm-primary) !important;
+}
+
+/* Keep the subtitle task console inside the MovieMuse palette. */
+.service-grid .status-card,
+.task-console,
+.task-metric,
+.task-tabs,
+.state-tabs,
+.task-card,
+.empty-line {
+  border-color: var(--mm-border) !important;
+  background: #ffffff !important;
+}
+
+.task-console {
+  padding: 22px !important;
+}
+
+.status-card {
+  background: #ffffff !important;
+}
+
+.status-card:hover,
+.task-card:hover {
+  border-color: #c9c9c9 !important;
+  box-shadow: 0 12px 28px rgba(34, 34, 34, 0.06) !important;
+}
+
+.status-card span,
+.status-card em,
+.task-console-head p,
+.task-metric span,
+.task-metric em,
+.task-main p,
+.task-meta,
+.history-toolbar,
+.empty-line {
+  color: var(--mm-muted) !important;
+}
+
+.status-card em.on,
+.selection-count {
+  color: var(--mm-primary) !important;
+}
+
+.service-dot.online {
+  background: var(--mm-primary) !important;
+  box-shadow: 0 0 0 6px rgba(255, 56, 92, 0.12) !important;
+}
+
+.task-toolbar {
+  border-color: var(--mm-border) !important;
+}
+
+.task-tabs,
+.state-tabs {
+  background: var(--mm-surface) !important;
+}
+
+.task-tabs .v-tab,
+.state-tabs .v-tab {
+  color: var(--mm-muted) !important;
+  font-weight: 500 !important;
+}
+
+.task-tabs .v-tab--selected,
+.state-tabs .v-tab--selected {
+  background: #ffffff !important;
+  color: var(--mm-primary) !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 56, 92, 0.18) !important;
+}
+
+.tab-count,
+.group-title em {
+  background: #fff1f3 !important;
+  color: var(--mm-primary) !important;
+}
+
+.state-dot.running,
+.state-dot.translating,
+.state-dot.failed {
+  background: var(--mm-primary) !important;
+}
+
+.state-dot.waiting,
+.state-dot.completed {
+  background: #b0b0b0 !important;
+}
+
+.status-pill,
+.status-pill.queued,
+.status-pill.completed {
+  background: var(--mm-surface) !important;
+  color: var(--mm-muted) !important;
+}
+
+.status-pill.running,
+.status-pill.translating,
+.status-pill.failed {
+  background: #fff1f3 !important;
+  color: var(--mm-primary) !important;
+}
+
+.task-actionbar .v-btn.bg-error,
+.task-actionbar .v-btn.text-error,
+.task-actionbar .v-btn--variant-tonal.text-error {
+  color: var(--mm-primary) !important;
+}
+
+.task-actionbar .v-btn--variant-tonal.text-error {
+  background: #fff1f3 !important;
+}
+
+.v-progress-linear__determinate {
+  background: currentColor !important;
 }
 </style>

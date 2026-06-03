@@ -18,9 +18,13 @@ const vuetify = createVuetify({
       mediaToolbox: {
         dark: false,
         colors: {
-          primary: '#0f8f83',
-          secondary: '#8b4dff',
-          background: '#f6f7fc',
+          primary: '#FF385C',
+          error: '#FF385C',
+          success: '#222222',
+          warning: '#E00B41',
+          info: '#6A6A6A',
+          secondary: '#222222',
+          background: '#FFFFFF',
           surface: '#ffffff'
         }
       }
@@ -28,8 +32,8 @@ const vuetify = createVuetify({
   },
   defaults: {
     VBtn: {
-      rounded: 'lg',
-      height: 46
+      rounded: 'sm',
+      height: 42
     },
     VTextField: {
       variant: 'outlined',
