@@ -423,6 +423,50 @@ p {
   color: var(--brand) !important;
 }
 
+.quick-submit,
+.current-jobs-panel,
+.jobs-panel,
+.backend-settings-panel {
+  border-color: rgba(210, 210, 215, 0.78) !important;
+  border-radius: 18px !important;
+  background: rgba(255, 255, 255, 0.9) !important;
+  box-shadow: none !important;
+}
+
+.quick-submit summary span,
+.current-jobs-panel h2,
+.jobs-panel h2,
+.subtitle-job strong,
+.current-job strong,
+.service-card strong {
+  color: var(--ink) !important;
+  font-weight: 600 !important;
+}
+
+.subtitle-job span,
+.subtitle-job small,
+.current-job span,
+.current-job small,
+.service-card small,
+.service-card em {
+  color: var(--muted) !important;
+  font-weight: 400 !important;
+}
+
+.subtitle-job,
+.current-job {
+  border-color: var(--line) !important;
+  border-radius: 16px !important;
+  background: #ffffff !important;
+  box-shadow: none !important;
+}
+
+.job-state em,
+.mini-counters span {
+  border-radius: 999px !important;
+  font-weight: 500 !important;
+}
+
 .actress-tag,
 .detail-tag {
   border-radius: 999px !important;

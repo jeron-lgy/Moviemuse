@@ -5,51 +5,38 @@
         <span>{{ eyebrow }}</span>
         <h3>{{ title }}</h3>
       </div>
-      <v-chip v-if="accent" size="small" color="primary" variant="tonal">试验配置</v-chip>
+      <em v-if="accent">试验配置</em>
     </header>
 
-    <v-row dense>
-      <v-col cols="12">
-        <div class="field-label">翻译风格</div>
-        <v-select
-          :model-value="modelValue.openai_translation_style"
-          :items="styleOptions"
-          item-title="label"
-          item-value="value"
-          @update:model-value="update('openai_translation_style', $event)"
-        />
-      </v-col>
-      <v-col cols="6">
-        <div class="field-label">语气强度</div>
-        <v-select
-          :model-value="modelValue.openai_style_intensity"
-          :items="intensityOptions"
-          item-title="label"
-          item-value="value"
+    <div class="form-grid">
+      <FormField label="翻译风格" wide>
+          <select :value="modelValue.openai_translation_style" @change="update('openai_translation_style', $event.target.value)">
+          <option v-for="item in styleOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+        </select>
+        </FormField>
+      <FormField label="语气强度">
+          <select
+          :value="modelValue.openai_style_intensity"
           :disabled="modelValue.openai_translation_style === 'faithful'"
-          @update:model-value="update('openai_style_intensity', $event)"
-        />
-      </v-col>
-      <v-col cols="6">
-        <div class="field-label">上下文</div>
-        <v-select
-          :model-value="modelValue.openai_context_lines"
-          :items="contextOptions"
-          item-title="label"
-          item-value="value"
-          @update:model-value="update('openai_context_lines', $event)"
-        />
-      </v-col>
-      <v-col cols="12">
-        <div class="field-label">术语偏好（可选）</div>
-        <v-textarea
-          :model-value="modelValue.openai_glossary"
-          rows="2"
+          @change="update('openai_style_intensity', $event.target.value)"
+        >
+          <option v-for="item in intensityOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+        </select>
+        </FormField>
+      <FormField label="上下文">
+          <select :value="modelValue.openai_context_lines" @change="update('openai_context_lines', Number($event.target.value))">
+          <option v-for="item in contextOptions" :key="item.value" :value="item.value">{{ item.label }}</option>
+        </select>
+        </FormField>
+      <FormField label="术语偏好（可选）" wide>
+          <textarea
+          :value="modelValue.openai_glossary"
+          rows="3"
           placeholder="原词 = 希望采用的中文表达"
-          @update:model-value="update('openai_glossary', $event)"
-        />
-      </v-col>
-    </v-row>
+          @input="update('openai_glossary', $event.target.value)"
+        ></textarea>
+        </FormField>
+    </div>
   </section>
 </template>
 
@@ -88,40 +75,65 @@ function update(key, value) {
 .variant-panel {
   height: 100%;
   padding: 18px;
-  border: 1px solid #dce7ef;
-  border-radius: 8px;
+  border: 1px solid var(--mm-border);
+  border-radius: 14px;
   background: #fff;
 }
 
 .variant-panel.accent {
-  border-color: #9adbd2;
-  background: #fcfffe;
+  border-color: var(--mm-primary);
+  background: #fff5f7;
 }
 
 header {
-  margin-bottom: 14px;
   display: flex;
+  align-items: flex-start;
   justify-content: space-between;
-  align-items: start;
   gap: 12px;
+  margin-bottom: 16px;
 }
 
 header span {
-  color: #718096;
+  color: var(--mm-muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
 }
 
 header h3 {
-  margin: 3px 0 0;
-  color: #111827;
+  margin: 4px 0 0;
+  color: var(--mm-text);
   font-size: 18px;
+  font-weight: 650;
 }
 
-.field-label {
-  margin-bottom: 7px;
-  color: #667085;
-  font-size: 13px;
-  font-weight: 750;
+header em {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--mm-primary);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 600;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+select,
+textarea {
+  min-height: 44px;
+  width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--mm-text);
+}
+
+textarea {
+  padding-top: 10px;
 }
 </style>

@@ -6,15 +6,30 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote_plus
 
 DEFAULT_ACTRESS_CRON = "0 21 * * *"
 DEFAULT_AV_CRON = "0 22 * * *"
+DEFAULT_WASH_CRON = "0 22 * * *"
+DEFAULT_POSTPROCESS_CRON = "*/5 * * * *"
 DEFAULT_MAKER_CRON = "0 */6 * * *"
 DEFAULT_MAX_COACTORS = 2
+DEFAULT_WASH_EXPIRE_DAYS = 90
+DEFAULT_WASH_SETTINGS = {
+    "enabled": True,
+    "expire_days": DEFAULT_WASH_EXPIRE_DAYS,
+    "auto_cancel_expired": True,
+    "check_chinese": True,
+    "check_4k": True,
+    "prefer_chinese": True,
+    "prefer_4k": True,
+    "min_seeders": 1,
+    "max_size_gb": 80,
+}
 DEFAULT_PINNED_MAKERS = [
     {"name": "S1 NO.1 STYLE", "url": "https://javdb.com/makers/7R?f=download"},
     {"name": "PRESTIGE", "url": "https://javdb.com/makers/6M?f=download"},
@@ -40,10 +55,15 @@ class SubscriptionService:
     def _ensure_dir(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -117,6 +137,8 @@ class SubscriptionService:
         data.setdefault("settings", {})
         data["settings"].setdefault("actress_cron", DEFAULT_ACTRESS_CRON)
         data["settings"].setdefault("av_cron", DEFAULT_AV_CRON)
+        data["settings"].setdefault("wash_cron", DEFAULT_WASH_CRON)
+        data["settings"].setdefault("postprocess_cron", DEFAULT_POSTPROCESS_CRON)
         data["settings"].setdefault("maker_cron", DEFAULT_MAKER_CRON)
         data["settings"].setdefault("max_coactors", DEFAULT_MAX_COACTORS)
         data["settings"].setdefault("poll_enabled", True)
@@ -124,14 +146,20 @@ class SubscriptionService:
         data["settings"].setdefault("last_poll_minute", "")
         data["settings"].setdefault("last_av_poll_at", 0)
         data["settings"].setdefault("last_av_poll_minute", "")
+        data["settings"].setdefault("last_wash_poll_at", 0)
+        data["settings"].setdefault("last_wash_poll_minute", "")
+        data["settings"].setdefault("last_postprocess_poll_at", 0)
+        data["settings"].setdefault("last_postprocess_poll_minute", "")
         data["settings"].setdefault("last_maker_poll_at", 0)
         data["settings"].setdefault("last_maker_poll_minute", "")
+        data["settings"]["wash"] = normalize_wash_settings(data["settings"].get("wash", {}))
         data["settings"]["pinned_makers"] = normalize_pinned_makers(data["settings"].get("pinned_makers"))
         for item in data.get("av", {}).values():
             if not isinstance(item, dict):
                 continue
             item["filters"] = normalize_filters(item.get("filters", {}))
             item.setdefault("subscription_mode", "strict")
+            item["wash"] = normalize_wash_request(item.get("wash", {}))
             if item.get("status", "pending") == "pending" and item.get("download_status") in {"ok", "exists", "sent"}:
                 item["status"] = "done"
         for item in data.get("actress", {}).values():
@@ -185,6 +213,10 @@ class SubscriptionService:
                 settings["actress_cron"] = normalize_cron(payload.get("actress_cron"), DEFAULT_ACTRESS_CRON)
             if "av_cron" in payload:
                 settings["av_cron"] = normalize_cron(payload.get("av_cron"), DEFAULT_AV_CRON)
+            if "wash_cron" in payload:
+                settings["wash_cron"] = normalize_cron(payload.get("wash_cron"), DEFAULT_WASH_CRON)
+            if "postprocess_cron" in payload:
+                settings["postprocess_cron"] = normalize_cron(payload.get("postprocess_cron"), DEFAULT_POSTPROCESS_CRON)
             if "maker_cron" in payload:
                 settings["maker_cron"] = normalize_cron(payload.get("maker_cron"), DEFAULT_MAKER_CRON)
             if "pinned_makers" in payload:
@@ -195,6 +227,8 @@ class SubscriptionService:
                 except (TypeError, ValueError):
                     count = DEFAULT_MAX_COACTORS
                 settings["max_coactors"] = max(1, min(12, count))
+            if "wash" in payload:
+                settings["wash"] = normalize_wash_settings(payload.get("wash"))
             self._save()
             return dict(settings)
 
@@ -217,12 +251,14 @@ class SubscriptionService:
                 "library_status": av.get("library_status", existing.get("library_status", "")),
                 "jellyfin_item_id": av.get("jellyfin_item_id", existing.get("jellyfin_item_id", "")),
                 "jellyfin_item_name": av.get("jellyfin_item_name", existing.get("jellyfin_item_name", "")),
+                "jellyfin_path": av.get("jellyfin_path", existing.get("jellyfin_path", "")),
                 "download_status": av.get("download_status", existing.get("download_status", "")),
                 "download_message": av.get("download_message", existing.get("download_message", "")),
                 "mteam_torrent_id": av.get("mteam_torrent_id", existing.get("mteam_torrent_id", "")),
                 "mteam_torrent_title": av.get("mteam_torrent_title", existing.get("mteam_torrent_title", "")),
                 "filters": normalize_filters(av.get("filters", existing.get("filters", {}))),
                 "subscription_mode": str(av.get("subscription_mode", existing.get("subscription_mode", "strict")) or "strict"),
+                "wash": normalize_wash_request(av.get("wash", existing.get("wash", {}))),
                 "detail": av.get("detail", existing.get("detail", {})),
                 "downloaded_at": av.get("downloaded_at", existing.get("downloaded_at", 0)),
                 "subscribed_at": existing.get("subscribed_at", time.time()),
@@ -232,6 +268,73 @@ class SubscriptionService:
             }
             self._save()
             return dict(self.data["av"][av_id])
+
+    def update_av_wash(self, av_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            item = self.data["av"].get(av_id)
+            if not item:
+                return None
+            current = normalize_wash_request(item.get("wash", {}))
+            mode = str(payload.get("mode") or current.get("mode") or "").strip().lower()
+            status = str(payload.get("status") or current.get("status") or "requested").strip().lower()
+            if mode not in {"chinese", "4k"}:
+                return None
+            if status not in {"requested", "downloading", "completed", "expired", "cancelled", "error"}:
+                status = "requested"
+            now = time.time()
+            requested_at = payload.get("requested_at")
+            if requested_at is None:
+                requested_at = now if mode != current.get("mode") else (current.get("requested_at") or now)
+            merged = {
+                **current,
+                "mode": mode,
+                "status": status,
+                "requested_at": float(requested_at or now),
+                "updated_at": now,
+                "completed_at": now if status == "completed" else current.get("completed_at", 0),
+            }
+            for key in (
+                "download_status",
+                "download_message",
+                "mteam_torrent_id",
+                "mteam_torrent_title",
+                "qb_hash",
+                "old_path",
+                "new_path",
+                "new_jellyfin_item_id",
+                "new_jellyfin_item_name",
+                "trash_path",
+                "replace_status",
+                "replace_message",
+                "last_checked_at",
+                "task_id",
+            ):
+                if key in payload:
+                    merged[key] = payload[key]
+            item["wash"] = normalize_wash_request(merged)
+            self._save()
+            return dict(item)
+
+    def expire_wash_requests(self) -> int:
+        with self._lock:
+            wash_settings = normalize_wash_settings(self.data.get("settings", {}).get("wash", {}))
+            if not wash_settings.get("auto_cancel_expired", True):
+                return 0
+            expire_days = int(wash_settings.get("expire_days") or DEFAULT_WASH_EXPIRE_DAYS)
+            cutoff = time.time() - max(1, expire_days) * 86400
+            changed = 0
+            for item in self.data.get("av", {}).values():
+                if not isinstance(item, dict):
+                    continue
+                wash = normalize_wash_request(item.get("wash", {}))
+                if wash.get("status") in {"requested", "downloading", "error"} and float(wash.get("requested_at") or 0) < cutoff:
+                    wash["status"] = "expired"
+                    wash["updated_at"] = time.time()
+                    item["wash"] = wash
+                    changed += 1
+            if changed:
+                self._save()
+            return changed
 
     def unsubscribe_av(self, av_id: str) -> bool:
         with self._lock:
@@ -259,10 +362,12 @@ class SubscriptionService:
                 "library_status",
                 "jellyfin_item_id",
                 "jellyfin_item_name",
+                "jellyfin_path",
                 "download_status",
                 "download_message",
                 "mteam_torrent_id",
                 "mteam_torrent_title",
+                "qb_hash",
                 "downloaded_at",
                 "detail",
             ):
@@ -357,6 +462,8 @@ class SubscriptionService:
         keys = {
             "actress_poll": ("last_poll_at", "last_poll_minute"),
             "av_download": ("last_av_poll_at", "last_av_poll_minute"),
+            "wash_download": ("last_wash_poll_at", "last_wash_poll_minute"),
+            "postprocess_qb": ("last_postprocess_poll_at", "last_postprocess_poll_minute"),
             "maker_refresh": ("last_maker_poll_at", "last_maker_poll_minute"),
         }
         if task_id not in keys:
@@ -437,4 +544,62 @@ def normalize_filters(value: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             number = 0
         result[key] = max(0, number)
+    return result
+
+
+def normalize_wash_settings(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    result = dict(DEFAULT_WASH_SETTINGS)
+    result.update({key: raw.get(key, result[key]) for key in result})
+    for key in ("enabled", "auto_cancel_expired", "check_chinese", "check_4k", "prefer_chinese", "prefer_4k"):
+        result[key] = bool(result.get(key))
+    try:
+        result["expire_days"] = int(result.get("expire_days") or DEFAULT_WASH_EXPIRE_DAYS)
+    except (TypeError, ValueError):
+        result["expire_days"] = DEFAULT_WASH_EXPIRE_DAYS
+    result["expire_days"] = max(7, min(365, result["expire_days"]))
+    try:
+        result["min_seeders"] = int(result.get("min_seeders") or 1)
+    except (TypeError, ValueError):
+        result["min_seeders"] = 1
+    result["min_seeders"] = max(0, min(999, result["min_seeders"]))
+    try:
+        result["max_size_gb"] = int(result.get("max_size_gb") or 80)
+    except (TypeError, ValueError):
+        result["max_size_gb"] = 80
+    result["max_size_gb"] = max(1, min(500, result["max_size_gb"]))
+    return result
+
+
+def normalize_wash_request(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    mode = str(raw.get("mode") or "").strip().lower()
+    status = str(raw.get("status") or "").strip().lower()
+    if mode not in {"chinese", "4k"}:
+        mode = ""
+    if status not in {"requested", "downloading", "completed", "expired", "cancelled", "error"}:
+        status = "requested" if mode else ""
+    result: dict[str, Any] = {
+        "mode": mode,
+        "status": status,
+        "requested_at": float(raw.get("requested_at") or 0),
+        "updated_at": float(raw.get("updated_at") or 0),
+        "completed_at": float(raw.get("completed_at") or 0),
+        "last_checked_at": float(raw.get("last_checked_at") or 0),
+        "download_status": str(raw.get("download_status") or ""),
+        "download_message": str(raw.get("download_message") or ""),
+        "task_id": str(raw.get("task_id") or ""),
+        "mteam_torrent_id": str(raw.get("mteam_torrent_id") or ""),
+        "mteam_torrent_title": str(raw.get("mteam_torrent_title") or ""),
+        "qb_hash": str(raw.get("qb_hash") or ""),
+        "old_path": str(raw.get("old_path") or ""),
+        "new_path": str(raw.get("new_path") or ""),
+        "new_jellyfin_item_id": str(raw.get("new_jellyfin_item_id") or ""),
+        "new_jellyfin_item_name": str(raw.get("new_jellyfin_item_name") or ""),
+        "trash_path": str(raw.get("trash_path") or ""),
+        "replace_status": str(raw.get("replace_status") or ""),
+        "replace_message": str(raw.get("replace_message") or ""),
+    }
+    if not mode:
+        result["status"] = ""
     return result

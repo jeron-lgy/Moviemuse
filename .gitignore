@@ -13,9 +13,9 @@ sample-media/
 .pytest_cache/
 .mypy_cache/
 
-# Frontend dependencies and cache. Keep frontend/dist tracked because the
-# current Unraid Docker image copies it directly.
+# Frontend dependencies and generated build output.
 frontend/node_modules/
+frontend/dist/
 frontend/.npm-cache/
 frontend/.vite/
 

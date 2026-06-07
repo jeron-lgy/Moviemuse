@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
-  plugins: [vue()],
-  base: '/subtitles/assets/',
+  plugins: [vue(), tailwindcss()],
+  base: '/assets/',
   build: {
     outDir: 'dist',
     emptyOutDir: true,

@@ -381,8 +381,68 @@ class JavDBService:
             "rebuild_requested": self._rebuild_requested,
         }
 
+    @staticmethod
+    def _looks_like_actor_id(value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9]+", str(value or "").strip()))
+
+    @staticmethod
+    def _is_bad_profile_name(value: str) -> bool:
+        text = str(value or "").strip().lower()
+        return not text or "404" in text or "页面未找到" in text or "page not found" in text
+
+    def _search_actress_sync(self, keyword: str, limit: int = 20) -> list[dict[str, Any]]:
+        url = f"{self.BASE_URL}/search?q={quote_plus(keyword)}&f=actor"
+        js = """() => {
+            const abs = (value) => {
+                if (!value) return '';
+                try { return new URL(value, location.origin).href; } catch { return value; }
+            };
+            const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const imageOf = (node) => {
+                const scope = node.closest('.item, .box, .actor-box, .actors, .grid-item, .column') || node;
+                const img = scope.querySelector('img') || node.querySelector('img');
+                if (!img) return '';
+                return abs(img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original') || '');
+            };
+            const results = [];
+            const seen = new Set();
+            document.querySelectorAll('a[href*="/actors/"]').forEach(a => {
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/\\/actors\\/([A-Za-z0-9]+)$/);
+                if (!m) return;
+                const id = m[1];
+                if (['censored','uncensored','western'].includes(id) || seen.has(id)) return;
+                seen.add(id);
+                const name = clean(a.textContent || a.getAttribute('title') || '');
+                if (name) results.push({ id, name, cover: imageOf(a) });
+            });
+            return results.slice(0, 20);
+        }"""
+        result = self._fetch_list_resilient(f"search_actress:v2:{keyword.lower()}", url, js, self._search_cache_ttl)
+        return (result or [])[:limit]
+
+    def _resolve_actress_ref_sync(self, actress_ref: str) -> dict[str, str]:
+        value = str(actress_ref or "").strip()
+        if not value:
+            return {"id": "", "name": "", "cover": ""}
+        if self._looks_like_actor_id(value):
+            return {"id": value, "name": "", "cover": ""}
+        matches = self._search_actress_sync(value, limit=5)
+        exact = next((item for item in matches if str(item.get("name") or "").strip() == value), None)
+        found = exact or (matches[0] if matches else {})
+        return {
+            "id": str(found.get("id") or value).strip(),
+            "name": str(found.get("name") or value).strip(),
+            "cover": str(found.get("cover") or "").strip(),
+        }
+
     def _get_actress_profile_sync(self, actress_id: str) -> dict[str, str]:
-        url = f"{self.BASE_URL}/actors/{actress_id}"
+        resolved = self._resolve_actress_ref_sync(actress_id)
+        actor_id = resolved.get("id") or str(actress_id or "").strip()
+        if not self._looks_like_actor_id(actor_id):
+            return {"id": actor_id, "name": resolved.get("name", ""), "cover": resolved.get("cover", "")}
+
+        url = f"{self.BASE_URL}/actors/{actor_id}"
         js = """() => {
             const abs = (value) => {
                 if (!value) return '';
@@ -401,6 +461,8 @@ class JavDBService:
         def fetch() -> dict[str, str]:
             profile = self._do_search(url, js) or {}
             name = str(profile.get("name") or "").strip()
+            if self._is_bad_profile_name(name):
+                name = ""
             if name:
                 name = " ".join(name.split())
                 name = name.split(" 部影片")[0].strip()
@@ -434,13 +496,17 @@ class JavDBService:
                     return actor || {};
                 }"""
                 found = self._do_search(search_url, search_js) or {}
-                if str(found.get("id") or "") == actress_id:
+                if str(found.get("id") or "") == actor_id:
                     cover = str(found.get("cover") or cover).strip()
                     name = str(found.get("name") or name).strip()
-            return {"id": actress_id, "name": name, "cover": cover}
+            return {
+                "id": actor_id,
+                "name": name or resolved.get("name", ""),
+                "cover": cover or resolved.get("cover", ""),
+            }
 
-        result = self._cached(f"actress_profile:v4:{actress_id}", fetch, self._detail_cache_ttl)
-        return result or {"id": actress_id, "name": "", "cover": ""}
+        result = self._cached(f"actress_profile:v5:{actress_id}", fetch, self._detail_cache_ttl)
+        return result or {"id": actor_id, "name": resolved.get("name", ""), "cover": resolved.get("cover", "")}
 
     def get_actress_profile(self, actress_id: str) -> dict[str, str]:
         return self._run(lambda: self._get_actress_profile_sync(actress_id))
@@ -490,39 +556,17 @@ class JavDBService:
     # ========== 搜索女优 ==========
 
     def search_actress(self, keyword: str, limit: int = 20) -> list[dict[str, Any]]:
-        url = f"{self.BASE_URL}/search?q={quote_plus(keyword)}&f=actor"
-        js = """() => {
-            const abs = (value) => {
-                if (!value) return '';
-                try { return new URL(value, location.origin).href; } catch { return value; }
-            };
-            const imageOf = (node) => {
-                const scope = node.closest('.item, .box, .actor-box, .actors, .grid-item, .column') || node;
-                const img = scope.querySelector('img') || node.querySelector('img');
-                if (!img) return '';
-                return abs(img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original') || '');
-            };
-            const results = [];
-            const seen = new Set();
-            document.querySelectorAll('a[href*="/actors/"]').forEach(a => {
-                const href = a.getAttribute('href') || '';
-                const m = href.match(/\\/actors\\/([A-Za-z0-9]+)$/);
-                if (!m) return;
-                const id = m[1];
-                if (['censored','uncensored','western'].includes(id) || seen.has(id)) return;
-                seen.add(id);
-                const name = a.textContent.trim();
-                if (name) results.push({ id, name, cover: imageOf(a) });
-            });
-            return results.slice(0, 20);
-        }"""
-        result = self._run(lambda: self._fetch_list_resilient(f"search_actress:{keyword.lower()}", url, js, self._search_cache_ttl))
-        return (result or [])[:limit]
+        return self._run(lambda: self._search_actress_sync(keyword, limit))
 
     # ========== 女优全部作品 ==========
 
     def get_actress_avs(self, actress_id: str, limit: int = 100) -> list[dict[str, Any]]:
-        url = f"{self.BASE_URL}/actors/{actress_id}"
+        resolved = self._run(lambda: self._resolve_actress_ref_sync(actress_id))
+        actor_id = resolved.get("id") or str(actress_id or "").strip()
+        if not self._looks_like_actor_id(actor_id):
+            return []
+
+        url = f"{self.BASE_URL}/actors/{actor_id}"
         js = """() => {
             const items = document.querySelectorAll('.movie-list .item');
             return Array.from(items).map(item => {
@@ -546,7 +590,7 @@ class JavDBService:
                 };
             }).filter(item => item.id);
         }"""
-        result = self._run(lambda: self._fetch_list_resilient(f"actress_avs:{actress_id}", url, js, self._actress_cache_ttl))
+        result = self._run(lambda: self._fetch_list_resilient(f"actress_avs:v2:{actor_id}", url, js, self._actress_cache_ttl))
         return (result or [])[:limit]
 
     # ========== 番号详情页 → 提取女优 ==========
@@ -596,10 +640,15 @@ class JavDBService:
                     const text = clean(block.textContent);
                     const label = labels.find(item => text.toLowerCase().startsWith(item.toLowerCase()));
                     if (!label) continue;
-                    const links = Array.from(block.querySelectorAll('a')).map(a => ({
-                        name: clean(a.textContent),
-                        url: abs(a.getAttribute('href') || ''),
-                    })).filter(x => x.name);
+                    const links = Array.from(block.querySelectorAll('a')).map(a => {
+                        const rawUrl = a.getAttribute('href') || '';
+                        const match = rawUrl.match(/\\/actors\\/([A-Za-z0-9]+)$/);
+                        return {
+                            id: match ? match[1] : '',
+                            name: clean(a.textContent),
+                            url: abs(rawUrl),
+                        };
+                    }).filter(x => x.name);
                     let value = text.replace(new RegExp('^' + label + '\\\\s*:?\\\\s*', 'i'), '').trim();
                     if (links.length) value = links.map(x => x.name).join(', ');
                     return { value, links };

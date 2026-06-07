@@ -60,6 +60,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             "subtitle_completed": False,
             "subtitle_failed": True,
         },
+        "templates": {},
     },
 }
 
@@ -111,6 +112,9 @@ class SystemSettingsService:
         events = notifications.setdefault("events", {})
         for key, default in DEFAULT_SETTINGS["notifications"]["events"].items():
             events[key] = bool(events.get(key, default))
+        templates = notifications.setdefault("templates", {})
+        if not isinstance(templates, dict):
+            notifications["templates"] = {}
 
 
 def merge_dict(target: dict[str, Any], source: dict[str, Any]) -> None:
