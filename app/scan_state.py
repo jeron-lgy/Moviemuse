@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .scanner import MovieFile, MovieGroup, ScanResult, SubtitleMatch, scan_libraries
 
@@ -192,7 +192,13 @@ class ScanCache:
         with self._lock:
             return self._snapshot
 
-    def start(self, media_dirs: list[Path], force: bool = False, excluded_dirs: list[Path] | None = None) -> bool:
+    def start(
+        self,
+        media_dirs: list[Path],
+        force: bool = False,
+        excluded_dirs: list[Path] | None = None,
+        completion_callback: Callable[[ScanSnapshot], None] | None = None,
+    ) -> bool:
         with self._lock:
             if self._snapshot.status == "running" and not force:
                 return False
@@ -204,12 +210,17 @@ class ScanCache:
                 scanned_dirs=tuple(media_dirs),
             )
             snapshot = self._snapshot
-            self._thread = threading.Thread(target=self._run, args=(list(media_dirs), excluded_dirs), daemon=True)
+            self._thread = threading.Thread(target=self._run, args=(list(media_dirs), excluded_dirs, completion_callback), daemon=True)
             self._thread.start()
         self._save_snapshot(snapshot)
         return True
 
-    def _run(self, media_dirs: list[Path], excluded_dirs: list[Path]) -> None:
+    def _run(
+        self,
+        media_dirs: list[Path],
+        excluded_dirs: list[Path],
+        completion_callback: Callable[[ScanSnapshot], None] | None = None,
+    ) -> None:
         def progress(processed: int, total: int, current_path: Path | None) -> None:
             with self._lock:
                 self._snapshot.processed_files = processed
@@ -226,6 +237,8 @@ class ScanCache:
                 self._snapshot.scanned_dirs = tuple(media_dirs)
                 snapshot = self._snapshot
             self._save_snapshot(snapshot)
+            if completion_callback:
+                completion_callback(snapshot)
             return
         with self._lock:
             self._snapshot.status = "completed"
@@ -238,6 +251,8 @@ class ScanCache:
             self._snapshot.current_path = None
             snapshot = self._snapshot
         self._save_snapshot(snapshot)
+        if completion_callback:
+            completion_callback(snapshot)
 
     def _connect(self, db_path: Path | None = None) -> sqlite3.Connection | None:
         path = db_path or self._db_path

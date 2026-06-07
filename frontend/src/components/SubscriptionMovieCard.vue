@@ -1,10 +1,10 @@
 <template>
-  <BaseCard as="article" class="subscription-movie-card" padding="none">
+  <BaseCard as="article" :class="cardClasses" padding="none">
     <div v-if="$slots.menu" class="card-menu">
       <slot name="menu" />
     </div>
 
-    <button class="poster" type="button" @click="emitDetail">
+    <button :class="posterClasses" type="button" @click="emitDetail">
       <img v-if="coverUrl" :src="coverUrl" alt="" loading="lazy">
       <span v-else>暂无封面</span>
     </button>
@@ -61,6 +61,14 @@ const props = defineProps({
   statusNote: {
     type: String,
     default: ''
+  },
+  variant: {
+    type: String,
+    default: ''
+  },
+  posterFit: {
+    type: String,
+    default: 'contain'
   }
 })
 
@@ -69,6 +77,9 @@ const emit = defineEmits(['detail', 'poster', 'actor'])
 const code = computed(() => props.item.id || props.item.code || props.item.name || '未知')
 const date = computed(() => props.item.date || props.item.release_date || '未知日期')
 const title = computed(() => props.item.title || props.item.name || props.item.id || '未命名作品')
+
+const cardClasses = computed(() => ['subscription-movie-card', props.variant ? `is-${props.variant}` : ''])
+const posterClasses = computed(() => ['poster', props.posterFit === 'cover' ? 'is-cover' : 'is-contain'])
 
 function emitDetail() {
   emit('detail', props.item)
@@ -94,6 +105,10 @@ function emitDetail() {
   box-shadow: 0 10px 30px rgba(0, 0, 0, .10);
 }
 
+.subscription-movie-card.is-compact {
+  min-height: 0;
+}
+
 .card-menu {
   position: absolute;
   top: 10px;
@@ -110,7 +125,7 @@ function emitDetail() {
   aspect-ratio: 3 / 2;
   padding: 0;
   border: 0;
-  background: var(--mm-surface);
+  background: #f6f6f6;
   color: var(--mm-muted);
   cursor: pointer;
   overflow: hidden;
@@ -120,18 +135,42 @@ function emitDetail() {
   width: 100%;
   max-width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   object-position: center;
+  background: #f6f6f6;
+}
+
+.poster.is-cover img {
+  object-fit: cover;
+}
+
+.poster.is-contain img {
+  object-fit: contain;
 }
 
 .movie-body {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(44px, auto) minmax(0, auto) minmax(0, 1fr) auto;
   gap: 10px;
   max-width: 100%;
   min-width: 0;
   min-height: 178px;
   padding: 14px;
+}
+
+.subscription-movie-card.is-compact .movie-body {
+  min-height: 166px;
+  padding: 12px;
+}
+
+.subscription-movie-card.is-compact h3 {
+  min-height: 42px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.subscription-movie-card.is-compact .card-actions {
+  gap: 8px;
 }
 
 .code-line {
@@ -209,5 +248,7 @@ h3 {
 
 .card-actions:deep(.mm-button) {
   width: 100%;
+  min-height: 34px;
+  padding-inline: 10px;
 }
 </style>

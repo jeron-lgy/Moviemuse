@@ -60,7 +60,7 @@ const { data, isLoading, error } = useQuery({
   queryKey: ['dashboard'],
   queryFn: () => api('/api/dashboard'),
   staleTime: 20_000,
-  refetchInterval: 60_000
+  refetchInterval: 10_000
 })
 
 const dashboard = computed(() => data.value?.dashboard || {})

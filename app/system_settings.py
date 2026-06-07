@@ -47,6 +47,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "library_name": "",
         "dedupe_enabled": True,
     },
+    "network": {
+        "proxy_enabled": False,
+        "http_proxy": "",
+        "https_proxy": "",
+        "no_proxy": "localhost,127.0.0.1",
+        "apply_to_javdb": True,
+    },
     "notifications": {
         "channels": [],
         "events": {
@@ -72,6 +79,7 @@ class SystemSettingsService:
         self._lock = threading.RLock()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
+        self._normalize_network()
         self._normalize_notifications()
 
     def _load(self) -> dict[str, Any]:
@@ -94,7 +102,7 @@ class SystemSettingsService:
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            for section in ("mteam", "qbittorrent", "jellyfin", "notifications"):
+            for section in ("mteam", "qbittorrent", "jellyfin", "network", "notifications"):
                 value = payload.get(section)
                 if isinstance(value, dict):
                     self.data.setdefault(section, {})
@@ -102,9 +110,20 @@ class SystemSettingsService:
                         if key in DEFAULT_SETTINGS[section]:
                             self.data[section][key] = item
             self.data["mteam"]["enabled"] = bool(self.data.get("mteam", {}).get("enabled"))
+            self._normalize_network()
             self._normalize_notifications()
             self._save()
             return self.get()
+
+    def _normalize_network(self) -> None:
+        network = self.data.setdefault("network", {})
+        defaults = DEFAULT_SETTINGS["network"]
+        for key, default in defaults.items():
+            network.setdefault(key, default)
+        network["proxy_enabled"] = bool(network.get("proxy_enabled"))
+        network["apply_to_javdb"] = bool(network.get("apply_to_javdb", True))
+        for key in ("http_proxy", "https_proxy", "no_proxy"):
+            network[key] = str(network.get(key) or "").strip()
 
     def _normalize_notifications(self) -> None:
         notifications = self.data.setdefault("notifications", {})

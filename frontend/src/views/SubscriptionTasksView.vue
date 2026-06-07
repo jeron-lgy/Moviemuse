@@ -1,6 +1,6 @@
 <template>
   <section class="tasks-view">
-    <PageHeader kicker="订阅管理" title="任务" description="集中维护订阅链路的定时任务，cron 修改在这里保存，单个任务可立即执行。">
+    <PageHeader v-if="!embedded" kicker="系统" title="自动任务" description="集中维护订阅链路的定时任务，cron 修改在这里保存，单个任务可立即执行。">
       <template #actions>
         <BaseButton type="button" :disabled="isLoading" @click="refetch">刷新</BaseButton>
         <BaseButton variant="primary" type="button" :disabled="saving" @click="saveCrons">
@@ -44,11 +44,17 @@
           </BaseButton>
         </div>
       </div>
+      <div v-if="embedded" class="task-actions">
+        <BaseButton type="button" :disabled="isLoading" @click="refetch">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveCrons">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
+      </div>
     </BaseCard>
 
     <BaseCard class="result-panel" >
       <h2>最近执行结果</h2>
-      <pre v-if="lastResult">{{ lastResult }}</pre>
+      <pre v-if="recentResultText">{{ recentResultText }}</pre>
       <p v-else>还没有手动执行结果。</p>
     </BaseCard>
   </section>
@@ -58,6 +64,13 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import { api, postJson } from '../lib/api'
+
+defineProps({
+  embedded: {
+    type: Boolean,
+    default: false
+  }
+})
 
 const cronKeys = {
   actress_poll: 'actress_cron',
@@ -77,10 +90,18 @@ const lastResult = ref('')
 const { data, isLoading, error, refetch } = useQuery({
   queryKey: ['subscription-tasks'],
   queryFn: () => api('/api/subscriptions/tasks'),
-  staleTime: 20_000
+  staleTime: 10_000,
+  refetchInterval: 10_000
 })
 
 const tasks = computed(() => Array.isArray(data.value?.tasks) ? data.value.tasks : [])
+const recentTaskResult = computed(() => {
+  return tasks.value
+    .map((task) => task.last_result || {})
+    .filter((item) => item && item.ran_at)
+    .sort((a, b) => Number(b.ran_at || 0) - Number(a.ran_at || 0))[0] || null
+})
+const recentResultText = computed(() => lastResult.value || formatResultRecord(recentTaskResult.value))
 
 watch(tasks, (rows) => {
   for (const task of rows) {
@@ -128,6 +149,11 @@ function formatTime(value) {
   const seconds = Number(value || 0)
   if (!seconds) return '暂无'
   return new Date(seconds * 1000).toLocaleString()
+}
+
+function formatResultRecord(record) {
+  if (!record?.result) return ''
+  return JSON.stringify(record.result, null, 2)
 }
 </script>
 
@@ -190,6 +216,14 @@ h1 {
   overflow: auto;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
+}
+
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-start;
+  margin-top: 16px;
 }
 
 .task-row {

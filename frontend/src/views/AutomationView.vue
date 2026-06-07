@@ -78,12 +78,15 @@
         </div>
       </BaseCard>
     </section>
+
+    <SubscriptionTasksView embedded />
   </section>
 </template>
 
 <script setup>
 import { computed, reactive, ref } from 'vue'
 import { api, postJson } from '../lib/api'
+import SubscriptionTasksView from './SubscriptionTasksView.vue'
 import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader } from '../components/ui'
 
 const loading = ref(false)

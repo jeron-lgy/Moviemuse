@@ -25,7 +25,7 @@
           v-for="item in javdbResults"
           :key="item.url || item.id"
           :item="item"
-          :cover-url="proxyImage(item.cover)"
+          :cover-url="proxyImage(item.cover, item)"
           :actors="normalizedActresses(item)"
           @detail="openDetail"
           @actor="searchActress"
@@ -62,7 +62,7 @@
     <SubscribeAvDialog
       v-if="subscribeItem"
       :item="subscribeItem"
-      :cover-url="proxyImage(subscribeItem.cover)"
+      :cover-url="proxyImage(subscribeItem.cover, subscribeItem)"
       :submitting="submitting"
       @close="subscribeItem = null"
       @confirm="confirmSubscribe"
@@ -72,7 +72,7 @@
       <BaseCard as="form" class="actress-subscribe-modal" @submit.prevent="confirmActressSubscribe">
         <button class="modal-close" type="button" @click="actressSubscribeItem = null">×</button>
         <div class="modal-title-row">
-          <img v-if="actressCover(actressSubscribeItem)" :src="proxyImage(actressCover(actressSubscribeItem))" alt="">
+          <img v-if="actressCover(actressSubscribeItem)" :src="actressCoverUrl(actressSubscribeItem)" alt="">
           <span v-else class="cover-placeholder">暂无封面</span>
           <div>
             <h2>订阅女优 {{ actressSubscribeItem.name || actressSubscribeItem.title || actressSubscribeItem.id }}</h2>
@@ -115,6 +115,7 @@ import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { BaseButton, BaseCard, FormField } from '../components/ui'
 import { api, postJson } from '../lib/api'
+import { imageProxyUrl } from '../lib/images'
 
 const route = useRoute()
 const router = useRouter()
@@ -167,6 +168,9 @@ async function runSearch(updateRoute = true) {
   try {
     if (updateRoute) router.replace({ path: '/subscription-search', query: { q: keyword.value, type: searchType.value } })
     const payload = await api(`/api/subscriptions/search?q=${encodeURIComponent(keyword.value)}&type=${encodeURIComponent(searchType.value)}&include_mteam=true`)
+    if (payload.status === 'error') {
+      errorMessage.value = payload.message || 'JavDB 当前不可用'
+    }
     results.value = payload.results || []
     mteam.value = payload.mteam || null
   } catch (error) {
@@ -185,6 +189,9 @@ async function loadActressAvs(actressId, actressName = '') {
   mteam.value = null
   try {
     const payload = await api(`/api/subscriptions/actress/${encodeURIComponent(actressId)}/avs`)
+    if (payload.status === 'error') {
+      errorMessage.value = payload.message || 'JavDB 当前不可用'
+    }
     results.value = (payload.results || []).map((item) => ({
       ...item,
       source_actress_id: actressId,
@@ -198,14 +205,27 @@ async function loadActressAvs(actressId, actressName = '') {
   }
 }
 
-function proxyImage(url) {
-  if (!url) return ''
-  return `/api/proxy/image?url=${encodeURIComponent(url)}`
+function proxyImage(url, item = null, options = {}) {
+  return imageProxyUrl(url, item, options)
+}
+
+function actorAssetId(item) {
+  return `actor-${item?.id || item?.javdb_id || item?.dmm_name || item?.name || 'unknown'}`
 }
 
 function actressCover(item) {
   if (!item) return ''
-  return item.cover || item.cover_url || item.avatar || item.image || item.photo || ''
+  return item.cover || item.cover_url || item.avatar || item.image || item.photo || item.latest_cover || item.latest?.cover || ''
+}
+
+function actressCoverUrl(item) {
+  const cover = actressCover(item)
+  if (!cover) return ''
+  if (cover === item?.latest_cover || cover === item?.latest?.cover) {
+    const latestId = item.latest_av_id || item.latest?.id || item.id
+    return proxyImage(cover, { id: latestId, cover }, { kind: 'cover', avId: latestId })
+  }
+  return proxyImage(cover, null, { kind: 'actor', entityId: actorAssetId(item) })
 }
 
 function normalizedActresses(item) {
@@ -244,6 +264,10 @@ async function confirmActressSubscribe() {
       id: item.id,
       name: item.name || item.title,
       cover: actressCover(item),
+      latest_cover: item.latest_cover || item.latest?.cover || '',
+      latest_av_id: item.latest_av_id || item.latest?.id || '',
+      latest_title: item.latest_title || item.latest?.title || '',
+      latest_date: item.latest_date || item.latest?.date || item.latest?.release_date || '',
       since_date: actressSubscribeForm.value.since_date,
       poll_enabled: true,
       include_vr: actressSubscribeForm.value.include_vr

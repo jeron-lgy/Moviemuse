@@ -4,20 +4,13 @@
       kicker="系统"
       title="系统"
       description="集中配置订阅链路、洗版策略、Jellyfin、MTeam、qBittorrent 和通知。"
-    >
-      <template #actions>
-        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
-        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
-          {{ saving ? '保存中' : '保存' }}
-        </BaseButton>
-      </template>
-    </PageHeader>
+    />
 
     <NoticeBanner v-if="message">{{ message }}</NoticeBanner>
     <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
 
     <BaseCard as="nav" class="setting-tabs">
-      <button v-for="tab in tabs" :key="tab.key" type="button" :class="{ active: activeTab === tab.key }" @click="activeTab = tab.key">
+      <button v-for="tab in tabs" :key="tab.key" type="button" :class="{ active: activeTab === tab.key }" @click="setActiveTab(tab.key)">
         {{ tab.label }}
       </button>
     </BaseCard>
@@ -53,6 +46,12 @@
           <input v-model.trim="system.mteam.api_key" type="password">
         </FormField>
       </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
+      </div>
     </BaseCard>
 
     <BaseCard v-else-if="activeTab === 'qb'" class="setting-panel">
@@ -82,6 +81,12 @@
         <FormField label="标签">
           <input v-model.trim="system.qbittorrent.tags">
         </FormField>
+      </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
       </div>
     </BaseCard>
 
@@ -124,6 +129,12 @@
           <input v-model="system.jellyfin.dedupe_enabled" type="checkbox">
         </FormField>
       </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
+      </div>
     </BaseCard>
 
     <BaseCard v-else-if="activeTab === 'strategy'" class="setting-panel">
@@ -138,7 +149,7 @@
           <input v-model="subscription.poll_enabled" type="checkbox">
         </FormField>
         <FormField label="最大共演人数">
-          <input v-model.number="subscription.max_coactors" type="number" min="1" max="12">
+          <input v-model.number="subscription.max_coactors" type="number" min="1" max="2">
         </FormField>
         <FormField label="洗版启用">
           <input v-model="subscription.wash.enabled" type="checkbox">
@@ -152,6 +163,12 @@
         <FormField label="洗版检查 4K">
           <input v-model="subscription.wash.check_4k" type="checkbox">
         </FormField>
+      </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
       </div>
     </BaseCard>
 
@@ -170,6 +187,109 @@
           <BaseButton type="button" @click="removeMaker(index)">删除</BaseButton>
         </div>
       </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
+      </div>
+    </BaseCard>
+
+    <BaseCard v-else-if="activeTab === 'network'" class="setting-panel">
+      <div class="panel-head">
+        <div>
+          <h2>系统代理</h2>
+          <p>Docker 当前代理和 JavDB 浏览器抓取共用这里的出口。未启用自定义代理时，会继续使用容器启动时已有的代理环境变量。</p>
+        </div>
+        <BaseButton type="button" :disabled="testingProxy" @click="testSystemProxy">
+          {{ testingProxy ? '测试中' : '测试代理' }}
+        </BaseButton>
+      </div>
+      <div class="proxy-status" v-if="proxyStatus">
+        <span>当前有效代理</span>
+        <strong>{{ proxyStatus.effective_proxy || '未检测到代理' }}</strong>
+      </div>
+      <div class="form-grid">
+        <FormField label="启用自定义代理">
+          <input v-model="system.network.proxy_enabled" type="checkbox">
+        </FormField>
+        <FormField label="JavDB 使用代理">
+          <input v-model="system.network.apply_to_javdb" type="checkbox">
+        </FormField>
+        <FormField label="HTTP 代理">
+          <input v-model.trim="system.network.http_proxy" placeholder="http://host.docker.internal:7897">
+        </FormField>
+        <FormField label="HTTPS 代理">
+          <input v-model.trim="system.network.https_proxy" placeholder="http://host.docker.internal:7897">
+        </FormField>
+        <FormField label="NO_PROXY" wide>
+          <input v-model.trim="system.network.no_proxy" placeholder="localhost,127.0.0.1">
+        </FormField>
+      </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
+      </div>
+    </BaseCard>
+
+    <BaseCard v-else-if="activeTab === 'cache'" class="setting-panel">
+      <div class="panel-head">
+        <div>
+          <h2>缓存维护</h2>
+          <p>管理订阅抓取产生的封面、剧照、女优头像和直链预告资产；已发售番号会在维护时冻结封面。</p>
+        </div>
+        <div class="panel-actions">
+          <BaseButton type="button" :disabled="loadingAssetCache" @click="loadAssetCache">
+            {{ loadingAssetCache ? '刷新中' : '刷新统计' }}
+          </BaseButton>
+          <BaseButton variant="primary" type="button" :disabled="maintainingAssetCache" @click="runAssetMaintenance">
+            {{ maintainingAssetCache ? '维护中' : '立即维护' }}
+          </BaseButton>
+          <BaseButton type="button" :disabled="maintainingAssetCache" @click="cleanupAssetCache">
+            清理非冻结缓存
+          </BaseButton>
+        </div>
+      </div>
+      <div class="cache-summary">
+        <div>
+          <span>资产数量</span>
+          <strong>{{ assetCache.asset_cache?.total || 0 }}</strong>
+        </div>
+        <div>
+          <span>本地占用</span>
+          <strong>{{ formatBytes(assetCache.asset_cache?.bytes || 0) }}</strong>
+        </div>
+        <div>
+          <span>容量上限</span>
+          <strong>{{ formatBytes((assetMaxMb || 0) * 1024 * 1024) }}</strong>
+        </div>
+        <div v-for="(kind, name) in assetCache.asset_cache?.kinds || {}" :key="name">
+          <span>{{ assetKindLabel(name) }}</span>
+          <strong>{{ kind.count || 0 }} / {{ formatBytes(kind.bytes || 0) }}</strong>
+        </div>
+      </div>
+      <div class="form-grid">
+        <FormField label="维护定时">
+          <input v-model.trim="subscription.asset_cron" placeholder="15 3 * * *">
+        </FormField>
+        <FormField label="容量上限 MB">
+          <input v-model.number="assetMaxMb" type="number" min="0">
+        </FormField>
+      </div>
+      <div v-if="assetMaintenanceResult" class="maintenance-result">
+        <span>冻结：{{ assetMaintenanceResult.freeze?.frozen || 0 }} / 检查 {{ assetMaintenanceResult.freeze?.checked || 0 }}</span>
+        <span>清理：{{ assetMaintenanceResult.cleanup?.deleted || 0 }} 项，{{ formatBytes(assetMaintenanceResult.cleanup?.deleted_bytes || 0) }}</span>
+        <span>缺失记录：{{ assetMaintenanceResult.cleanup?.removed_missing || 0 }} 项</span>
+        <span>当前占用：{{ formatBytes(assetMaintenanceResult.asset_cache?.bytes || 0) }}</span>
+      </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存' }}
+        </BaseButton>
+      </div>
     </BaseCard>
 
     <NotificationsView v-else ref="notificationsView" embedded />
@@ -177,7 +297,8 @@
 </template>
 
 <script setup>
-import { reactive, ref } from 'vue'
+import { reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api, postJson } from '../lib/api'
 import NotificationsView from './NotificationsView.vue'
 import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader } from '../components/ui'
@@ -188,8 +309,11 @@ const tabs = [
   { key: 'jellyfin', label: 'Jellyfin' },
   { key: 'strategy', label: '订阅与洗版' },
   { key: 'makers', label: '常驻厂牌' },
+  { key: 'network', label: '系统代理' },
   { key: 'notifications', label: '通知' }
 ]
+tabs.splice(Math.max(0, tabs.length - 1), 0, { key: 'cache', label: '缓存维护' })
+const tabKeys = new Set(tabs.map((tab) => tab.key))
 
 const defaultMakers = [
   { name: 'S1 NO.1 STYLE', url: 'https://javdb.com/makers/7R?f=download' },
@@ -199,30 +323,71 @@ const defaultMakers = [
   { name: 'SOD Create', url: 'https://javdb.com/makers/q6?f=download' }
 ]
 
-const activeTab = ref('jellyfin')
+const route = useRoute()
+const router = useRouter()
+const activeTab = ref(normalizeTab(route.query.tab) || normalizeTab(localStorage.getItem('systemActiveTab')) || 'jellyfin')
 const loading = ref(false)
 const saving = ref(false)
 const loadingLibraries = ref(false)
+const testingProxy = ref(false)
 const message = ref('')
 const errorMessage = ref('')
 const jellyfinLibraries = ref([])
 const selectedJellyfinLibrary = ref('')
 const notificationsView = ref(null)
+const proxyStatus = ref(null)
+const loadingAssetCache = ref(false)
+const maintainingAssetCache = ref(false)
+const assetCache = ref({})
+const assetMaintenanceResult = ref(null)
+const assetMaxMb = ref(2048)
 
 const system = reactive({
   mteam: { site_url: '', mode: 'rss', rss_url: '', api_url: '', api_key: '', enabled: false },
   qbittorrent: { url: '', username: '', password: '', save_path: '', category: '', tags: '' },
-  jellyfin: { url: '', api_key: '', username: '', library_id: '', library_name: '', dedupe_enabled: true }
+  jellyfin: { url: '', api_key: '', username: '', library_id: '', library_name: '', dedupe_enabled: true },
+  network: { proxy_enabled: false, http_proxy: '', https_proxy: '', no_proxy: 'localhost,127.0.0.1', apply_to_javdb: true }
 })
 
 const subscription = reactive({
   poll_enabled: true,
   max_coactors: 2,
+  asset_cron: '15 3 * * *',
+  asset_cache_max_mb: 2048,
   wash: { enabled: true, expire_days: 90, check_chinese: true, check_4k: true },
   pinned_makers: [...defaultMakers]
 })
 
 loadAll()
+syncTabQuery(activeTab.value)
+
+watch(
+  () => route.query.tab,
+  (tab) => {
+    const nextTab = normalizeTab(tab)
+    if (nextTab && nextTab !== activeTab.value) {
+      activeTab.value = nextTab
+      localStorage.setItem('systemActiveTab', nextTab)
+    }
+  }
+)
+
+function normalizeTab(value) {
+  const key = String(value || '')
+  return tabKeys.has(key) ? key : ''
+}
+
+function setActiveTab(key) {
+  const nextTab = normalizeTab(key) || 'jellyfin'
+  activeTab.value = nextTab
+  localStorage.setItem('systemActiveTab', nextTab)
+  syncTabQuery(nextTab)
+}
+
+function syncTabQuery(key) {
+  if (route.query.tab === key) return
+  router.replace({ path: route.path, query: { ...route.query, tab: key } })
+}
 
 async function loadAll() {
   loading.value = true
@@ -236,15 +401,21 @@ async function loadAll() {
     Object.assign(system.mteam, systemPayload.settings?.mteam || {})
     Object.assign(system.qbittorrent, systemPayload.settings?.qbittorrent || {})
     Object.assign(system.jellyfin, systemPayload.settings?.jellyfin || {})
+    Object.assign(system.network, systemPayload.settings?.network || {})
+    await loadProxyStatus()
+    await loadAssetCache()
     selectedJellyfinLibrary.value = system.jellyfin.library_id || ''
     Object.assign(subscription, {
       poll_enabled: subPayload.settings?.poll_enabled ?? true,
       max_coactors: subPayload.settings?.max_coactors ?? 2,
+      asset_cron: subPayload.settings?.asset_cron || '15 3 * * *',
+      asset_cache_max_mb: subPayload.settings?.asset_cache_max_mb ?? 2048,
       wash: { ...subscription.wash, ...(subPayload.settings?.wash || {}) },
       pinned_makers: Array.isArray(subPayload.settings?.pinned_makers) && subPayload.settings.pinned_makers.length
         ? subPayload.settings.pinned_makers.map((item) => ({ name: item.name || '', url: item.url || '' }))
         : [...defaultMakers]
     })
+    assetMaxMb.value = subscription.asset_cache_max_mb
   } catch (err) {
     errorMessage.value = err.message || '读取设置失败'
   } finally {
@@ -256,7 +427,8 @@ async function saveSystemSettings() {
   await postJson('/api/system-settings', {
     mteam: { ...system.mteam },
     qbittorrent: { ...system.qbittorrent },
-    jellyfin: { ...system.jellyfin }
+    jellyfin: { ...system.jellyfin },
+    network: { ...system.network }
   })
 }
 
@@ -264,6 +436,8 @@ async function saveSubscriptionSettings() {
   await postJson('/api/subscriptions/settings', {
     poll_enabled: subscription.poll_enabled,
     max_coactors: subscription.max_coactors,
+    asset_cron: subscription.asset_cron,
+    asset_cache_max_mb: assetMaxMb.value,
     wash: { ...subscription.wash },
     pinned_makers: subscription.pinned_makers
       .filter((item) => item.name || item.url)
@@ -301,6 +475,100 @@ async function testIntegration(name) {
   } catch (err) {
     errorMessage.value = err.message || `${name} 测试失败`
   }
+}
+
+async function loadProxyStatus() {
+  try {
+    proxyStatus.value = await api('/api/system-proxy/status')
+  } catch {
+    proxyStatus.value = null
+  }
+}
+
+async function testSystemProxy() {
+  testingProxy.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    await saveSystemSettings()
+    const result = await postJson('/api/system-proxy/test', {})
+    proxyStatus.value = result.proxy || null
+    if (result.status === 'ok') {
+      message.value = `代理测试成功：${result.body || result.status_code}`
+    } else {
+      errorMessage.value = result.message || '代理测试失败'
+    }
+  } catch (err) {
+    errorMessage.value = err.message || '代理测试失败'
+  } finally {
+    testingProxy.value = false
+  }
+}
+
+async function loadAssetCache() {
+  loadingAssetCache.value = true
+  try {
+    assetCache.value = await api('/api/subscriptions/asset-cache/status')
+    if (assetCache.value?.max_mb !== undefined) {
+      assetMaxMb.value = assetCache.value.max_mb
+    }
+  } catch {
+    assetCache.value = {}
+  } finally {
+    loadingAssetCache.value = false
+  }
+}
+
+async function runAssetMaintenance() {
+  maintainingAssetCache.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await postJson('/api/subscriptions/asset-cache/maintenance', { max_mb: assetMaxMb.value })
+    assetMaintenanceResult.value = payload.result || null
+    assetCache.value = { status: 'ok', asset_cache: payload.result?.asset_cache || {}, max_mb: assetMaxMb.value }
+    message.value = '资产缓存维护完成'
+  } catch (err) {
+    errorMessage.value = err.message || '资产缓存维护失败'
+  } finally {
+    maintainingAssetCache.value = false
+  }
+}
+
+async function cleanupAssetCache() {
+  const ok = window.confirm('将清理所有非冻结资产缓存。已冻结的已发售封面会保留，继续吗？')
+  if (!ok) return
+  maintainingAssetCache.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await postJson('/api/subscriptions/asset-cache/cleanup', { max_mb: 0, freeze: true })
+    assetMaintenanceResult.value = payload.result || null
+    assetCache.value = { status: 'ok', asset_cache: payload.result?.asset_cache || {}, max_mb: assetMaxMb.value }
+    message.value = '非冻结资产缓存已清理'
+  } catch (err) {
+    errorMessage.value = err.message || '资产缓存清理失败'
+  } finally {
+    maintainingAssetCache.value = false
+  }
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0)
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+function assetKindLabel(kind) {
+  return {
+    actor: '女优头像',
+    cover: '封面',
+    screenshot: '剧照',
+    trailer: '预告',
+    image: '普通图片'
+  }[kind] || kind
 }
 
 async function loadJellyfinLibraries() {
@@ -394,6 +662,14 @@ function removeMaker(index) {
   justify-content: flex-end;
 }
 
+.panel-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-start;
+  padding-top: 4px;
+}
+
 .panel-head h2 {
   margin: 0;
   color: var(--mm-text);
@@ -405,6 +681,56 @@ function removeMaker(index) {
   margin: 6px 0 0;
   color: var(--mm-muted);
   line-height: 1.6;
+}
+
+.proxy-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 10px 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: 14px;
+  background: #f8fafc;
+  color: var(--mm-muted);
+}
+
+.proxy-status strong {
+  color: var(--mm-text);
+  font-weight: var(--mm-font-weight-semibold);
+}
+
+.cache-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.cache-summary > div,
+.maintenance-result {
+  display: grid;
+  gap: 6px;
+  min-height: 74px;
+  padding: 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.cache-summary span,
+.maintenance-result span {
+  color: var(--mm-muted);
+  font-size: var(--mm-font-size-sm);
+}
+
+.cache-summary strong {
+  color: var(--mm-text);
+  font-weight: var(--mm-font-weight-semibold);
+}
+
+.maintenance-result {
+  min-height: 0;
 }
 
 .form-grid,
@@ -449,7 +775,8 @@ input[type="checkbox"] {
 @media (max-width: 760px) {
   .panel-head,
   .form-grid,
-  .maker-row {
+  .maker-row,
+  .cache-summary {
     grid-template-columns: 1fr;
     display: grid;
   }

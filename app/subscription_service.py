@@ -11,12 +11,14 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import quote_plus
+from urllib.parse import urlparse
 
 DEFAULT_ACTRESS_CRON = "0 21 * * *"
 DEFAULT_AV_CRON = "0 22 * * *"
 DEFAULT_WASH_CRON = "0 22 * * *"
 DEFAULT_POSTPROCESS_CRON = "*/5 * * * *"
 DEFAULT_MAKER_CRON = "0 */6 * * *"
+DEFAULT_ASSET_CRON = "15 3 * * *"
 DEFAULT_MAX_COACTORS = 2
 DEFAULT_WASH_EXPIRE_DAYS = 90
 DEFAULT_WASH_SETTINGS = {
@@ -105,6 +107,46 @@ class SubscriptionService:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscription_metadata_cache (
+                    namespace TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    PRIMARY KEY (namespace, cache_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subscription_metadata_cache_expires
+                ON subscription_metadata_cache (expires_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscription_asset_cache (
+                    asset_key TEXT PRIMARY KEY,
+                    entity_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    local_path TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    bytes INTEGER NOT NULL,
+                    immutable INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_subscription_asset_cache_entity
+                ON subscription_asset_cache (entity_id, kind)
+                """
+            )
 
     def _load(self) -> dict[str, Any]:
         data: dict[str, Any] = {"av": {}, "actress": {}, "settings": {}}
@@ -140,6 +182,8 @@ class SubscriptionService:
         data["settings"].setdefault("wash_cron", DEFAULT_WASH_CRON)
         data["settings"].setdefault("postprocess_cron", DEFAULT_POSTPROCESS_CRON)
         data["settings"].setdefault("maker_cron", DEFAULT_MAKER_CRON)
+        data["settings"].setdefault("asset_cron", DEFAULT_ASSET_CRON)
+        data["settings"].setdefault("asset_cache_max_mb", 2048)
         data["settings"].setdefault("max_coactors", DEFAULT_MAX_COACTORS)
         data["settings"].setdefault("poll_enabled", True)
         data["settings"].setdefault("last_poll_at", 0)
@@ -152,6 +196,9 @@ class SubscriptionService:
         data["settings"].setdefault("last_postprocess_poll_minute", "")
         data["settings"].setdefault("last_maker_poll_at", 0)
         data["settings"].setdefault("last_maker_poll_minute", "")
+        data["settings"].setdefault("last_asset_poll_at", 0)
+        data["settings"].setdefault("last_asset_poll_minute", "")
+        data["settings"].setdefault("last_task_results", {})
         data["settings"]["wash"] = normalize_wash_settings(data["settings"].get("wash", {}))
         data["settings"]["pinned_makers"] = normalize_pinned_makers(data["settings"].get("pinned_makers"))
         for item in data.get("av", {}).values():
@@ -204,6 +251,280 @@ class SubscriptionService:
         with self._lock:
             return dict(self.data.get("settings", {}))
 
+    def get_metadata_cache(self, namespace: str, cache_key: str, *, allow_stale: bool = False) -> Any | None:
+        ns = str(namespace or "").strip()
+        key = str(cache_key or "").strip()
+        if not ns or not key:
+            return None
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT data, expires_at FROM subscription_metadata_cache WHERE namespace = ? AND cache_key = ?",
+                    (ns, key),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        try:
+            expires_at = float(row["expires_at"] or 0)
+            if expires_at <= now and not allow_stale:
+                return None
+            return json.loads(row["data"])
+        except Exception:
+            return None
+
+    def set_metadata_cache(self, namespace: str, cache_key: str, value: Any, ttl_seconds: int) -> None:
+        ns = str(namespace or "").strip()
+        key = str(cache_key or "").strip()
+        if not ns or not key or value in (None, "", [], {}):
+            return
+        now = time.time()
+        ttl = max(60, int(ttl_seconds or 60))
+        try:
+            payload = json.dumps(value, ensure_ascii=False)
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO subscription_metadata_cache
+                    (namespace, cache_key, data, updated_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (ns, key, payload, now, now + ttl),
+                )
+        except Exception:
+            return
+
+    def delete_expired_metadata_cache(self) -> int:
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM subscription_metadata_cache WHERE expires_at <= ?", (now,))
+                return int(cur.rowcount or 0)
+        except Exception:
+            return 0
+
+    def metadata_cache_stats(self) -> dict[str, Any]:
+        try:
+            with self._connect() as conn:
+                total = conn.execute("SELECT COUNT(*) AS count FROM subscription_metadata_cache").fetchone()["count"]
+                expired = conn.execute(
+                    "SELECT COUNT(*) AS count FROM subscription_metadata_cache WHERE expires_at <= ?",
+                    (time.time(),),
+                ).fetchone()["count"]
+                rows = conn.execute(
+                    "SELECT namespace, COUNT(*) AS count FROM subscription_metadata_cache GROUP BY namespace ORDER BY namespace"
+                ).fetchall()
+            return {
+                "total": int(total or 0),
+                "expired": int(expired or 0),
+                "namespaces": {str(row["namespace"]): int(row["count"] or 0) for row in rows},
+            }
+        except Exception:
+            return {"total": 0, "expired": 0, "namespaces": {}}
+
+    @staticmethod
+    def asset_cache_key(entity_id: str, kind: str) -> str:
+        return f"{str(kind or '').strip().lower()}:{str(entity_id or '').strip().upper()}"
+
+    def get_asset_cache(self, entity_id: str, kind: str = "cover") -> dict[str, Any] | None:
+        asset_key = self.asset_cache_key(entity_id, kind)
+        if not asset_key or asset_key == ":":
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT asset_key, entity_id, kind, source_url, local_path, media_type,
+                           sha256, bytes, immutable, updated_at
+                    FROM subscription_asset_cache
+                    WHERE asset_key = ?
+                    """,
+                    (asset_key,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "asset_key": str(row["asset_key"]),
+            "entity_id": str(row["entity_id"]),
+            "kind": str(row["kind"]),
+            "source_url": str(row["source_url"]),
+            "local_path": str(row["local_path"]),
+            "media_type": str(row["media_type"]),
+            "sha256": str(row["sha256"]),
+            "bytes": int(row["bytes"] or 0),
+            "immutable": bool(row["immutable"]),
+            "updated_at": float(row["updated_at"] or 0),
+        }
+
+    def set_asset_cache(
+        self,
+        entity_id: str,
+        kind: str,
+        source_url: str,
+        local_path: str,
+        media_type: str,
+        sha256: str,
+        bytes_count: int,
+        *,
+        immutable: bool = False,
+    ) -> dict[str, Any]:
+        entity = str(entity_id or "").strip().upper()
+        safe_kind = str(kind or "cover").strip().lower()
+        asset_key = self.asset_cache_key(entity, safe_kind)
+        if not entity or not safe_kind or not local_path:
+            return {}
+        now = time.time()
+        payload = {
+            "asset_key": asset_key,
+            "entity_id": entity,
+            "kind": safe_kind,
+            "source_url": str(source_url or "").strip(),
+            "local_path": str(local_path or "").strip(),
+            "media_type": str(media_type or "image/jpeg").strip(),
+            "sha256": str(sha256 or "").strip(),
+            "bytes": max(0, int(bytes_count or 0)),
+            "immutable": bool(immutable),
+            "updated_at": now,
+        }
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO subscription_asset_cache
+                    (asset_key, entity_id, kind, source_url, local_path, media_type,
+                     sha256, bytes, immutable, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload["asset_key"],
+                        payload["entity_id"],
+                        payload["kind"],
+                        payload["source_url"],
+                        payload["local_path"],
+                        payload["media_type"],
+                        payload["sha256"],
+                        payload["bytes"],
+                        1 if payload["immutable"] else 0,
+                        payload["updated_at"],
+                    ),
+                )
+        except Exception:
+            return {}
+        return payload
+
+    def set_asset_immutable(self, entity_id: str, kind: str = "cover", immutable: bool = True) -> bool:
+        asset_key = self.asset_cache_key(entity_id, kind)
+        if not asset_key or asset_key == ":":
+            return False
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE subscription_asset_cache SET immutable = ?, updated_at = ? WHERE asset_key = ?",
+                    (1 if immutable else 0, time.time(), asset_key),
+                )
+                return bool(cur.rowcount)
+        except Exception:
+            return False
+
+    def list_metadata_cache(self, namespace: str, limit: int = 10000) -> list[dict[str, Any]]:
+        ns = str(namespace or "").strip()
+        if not ns:
+            return []
+        safe_limit = max(1, min(100000, int(limit or 10000)))
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT namespace, cache_key, data, updated_at, expires_at
+                    FROM subscription_metadata_cache
+                    WHERE namespace = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (ns, safe_limit),
+                ).fetchall()
+        except Exception:
+            return []
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                data = json.loads(row["data"])
+            except Exception:
+                continue
+            result.append({
+                "namespace": str(row["namespace"]),
+                "cache_key": str(row["cache_key"]),
+                "data": data,
+                "updated_at": float(row["updated_at"] or 0),
+                "expires_at": float(row["expires_at"] or 0),
+            })
+        return result
+
+    def cleanup_asset_cache(self, max_bytes: int | None = None) -> dict[str, Any]:
+        deleted = 0
+        deleted_bytes = 0
+        removed_missing = 0
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT asset_key, local_path, bytes, immutable, updated_at
+                    FROM subscription_asset_cache
+                    ORDER BY immutable ASC, updated_at ASC
+                    """
+                ).fetchall()
+                total_bytes = int(conn.execute("SELECT COALESCE(SUM(bytes), 0) AS bytes FROM subscription_asset_cache").fetchone()["bytes"] or 0)
+                for row in rows:
+                    path = (self.data_dir / str(row["local_path"] or "")).resolve()
+                    if not str(row["local_path"] or "") or not path.exists() or not path.is_file():
+                        conn.execute("DELETE FROM subscription_asset_cache WHERE asset_key = ?", (row["asset_key"],))
+                        removed_missing += 1
+                if max_bytes is not None:
+                    target = max(0, int(max_bytes or 0))
+                    for row in rows:
+                        if total_bytes <= target:
+                            break
+                        if int(row["immutable"] or 0):
+                            continue
+                        asset_key = str(row["asset_key"] or "")
+                        path = (self.data_dir / str(row["local_path"] or "")).resolve()
+                        size = int(row["bytes"] or 0)
+                        try:
+                            if path.exists() and path.is_file():
+                                path.unlink()
+                        except Exception:
+                            pass
+                        conn.execute("DELETE FROM subscription_asset_cache WHERE asset_key = ?", (asset_key,))
+                        deleted += 1
+                        deleted_bytes += size
+                        total_bytes -= size
+            return {"deleted": deleted, "deleted_bytes": deleted_bytes, "removed_missing": removed_missing}
+        except Exception:
+            return {"deleted": deleted, "deleted_bytes": deleted_bytes, "removed_missing": removed_missing}
+
+    def asset_cache_stats(self) -> dict[str, Any]:
+        try:
+            with self._connect() as conn:
+                total = conn.execute("SELECT COUNT(*) AS count FROM subscription_asset_cache").fetchone()["count"]
+                bytes_total = conn.execute("SELECT COALESCE(SUM(bytes), 0) AS bytes FROM subscription_asset_cache").fetchone()["bytes"]
+                rows = conn.execute(
+                    "SELECT kind, COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes FROM subscription_asset_cache GROUP BY kind ORDER BY kind"
+                ).fetchall()
+            return {
+                "total": int(total or 0),
+                "bytes": int(bytes_total or 0),
+                "kinds": {
+                    str(row["kind"]): {"count": int(row["count"] or 0), "bytes": int(row["bytes"] or 0)}
+                    for row in rows
+                },
+            }
+        except Exception:
+            return {"total": 0, "bytes": 0, "kinds": {}}
+
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             settings = self.data.setdefault("settings", {})
@@ -219,6 +540,13 @@ class SubscriptionService:
                 settings["postprocess_cron"] = normalize_cron(payload.get("postprocess_cron"), DEFAULT_POSTPROCESS_CRON)
             if "maker_cron" in payload:
                 settings["maker_cron"] = normalize_cron(payload.get("maker_cron"), DEFAULT_MAKER_CRON)
+            if "asset_cron" in payload:
+                settings["asset_cron"] = normalize_cron(payload.get("asset_cron"), DEFAULT_ASSET_CRON)
+            if "asset_cache_max_mb" in payload:
+                try:
+                    settings["asset_cache_max_mb"] = max(0, int(float(payload.get("asset_cache_max_mb") or 0)))
+                except (TypeError, ValueError):
+                    settings["asset_cache_max_mb"] = 2048
             if "pinned_makers" in payload:
                 settings["pinned_makers"] = normalize_pinned_makers(payload.get("pinned_makers"))
             if "max_coactors" in payload:
@@ -226,7 +554,7 @@ class SubscriptionService:
                     count = int(payload.get("max_coactors") or DEFAULT_MAX_COACTORS)
                 except (TypeError, ValueError):
                     count = DEFAULT_MAX_COACTORS
-                settings["max_coactors"] = max(1, min(12, count))
+                settings["max_coactors"] = max(1, min(DEFAULT_MAX_COACTORS, count))
             if "wash" in payload:
                 settings["wash"] = normalize_wash_settings(payload.get("wash"))
             self._save()
@@ -388,15 +716,30 @@ class SubscriptionService:
 
     def subscribe_actress(self, actress: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            aid = actress.get("id", "")
+            aid = str(actress.get("id") or "").strip()
             if not aid:
                 return {}
+            duplicate_id = self._find_actress_duplicate_id(actress, aid)
+            if duplicate_id and duplicate_id != aid:
+                merged = dict(self.data["actress"].get(duplicate_id, {}))
+                merged.update({key: value for key, value in actress.items() if value not in ("", None)})
+                merged["id"] = aid
+                self.data["actress"].pop(duplicate_id, None)
+                actress = merged
             existing = self.data["actress"].get(aid, {})
             since_date = normalize_date(actress.get("since_date") or existing.get("since_date") or str(date.today()))
             self.data["actress"][aid] = {
                 "id": aid,
                 "name": actress.get("name", existing.get("name", "")),
                 "cover": actress.get("cover", actress.get("cover_url", existing.get("cover", ""))),
+                "latest_cover": actress.get("latest_cover", existing.get("latest_cover", "")),
+                "latest_av_id": actress.get("latest_av_id", existing.get("latest_av_id", "")),
+                "latest_title": actress.get("latest_title", existing.get("latest_title", "")),
+                "latest_date": actress.get("latest_date", existing.get("latest_date", "")),
+                "source": actress.get("source", existing.get("source", "")),
+                "javdb_id": actress.get("javdb_id", existing.get("javdb_id", "")),
+                "dmm_name": actress.get("dmm_name", existing.get("dmm_name", "")),
+                "dmm_url": actress.get("dmm_url", existing.get("dmm_url", "")),
                 "since_date": since_date,
                 "poll_enabled": bool(actress.get("poll_enabled", existing.get("poll_enabled", True))),
                 "include_vr": bool(actress.get("include_vr", existing.get("include_vr", False))),
@@ -407,14 +750,27 @@ class SubscriptionService:
             self._save()
             return dict(self.data["actress"][aid])
 
+    def _find_actress_duplicate_id(self, actress: dict[str, Any], target_id: str) -> str:
+        target_keys = actress_identity_keys({**actress, "id": target_id})
+        if not target_keys:
+            return ""
+        for current_id, item in self.data.get("actress", {}).items():
+            if current_id == target_id:
+                continue
+            if target_keys & actress_identity_keys(item):
+                return str(current_id)
+        return ""
+
     def update_actress_subscription(self, actress_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         with self._lock:
             item = self.data["actress"].get(actress_id)
             if not item:
                 return None
-            for key in ("name", "cover"):
+            for key in ("name", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date", "source", "javdb_id", "dmm_name", "dmm_url"):
+                if key not in payload:
+                    continue
                 value = payload.get(key)
-                if value:
+                if value or key == "cover":
                     item[key] = value
             if "since_date" in payload:
                 item["since_date"] = normalize_date(payload.get("since_date") or item.get("since_date"))
@@ -458,13 +814,14 @@ class SubscriptionService:
                 settings["last_poll_minute"] = minute_key
             self._save()
 
-    def mark_task_poll(self, task_id: str, minute_key: str | None = None) -> None:
+    def mark_task_poll(self, task_id: str, minute_key: str | None = None, result: dict[str, Any] | None = None) -> None:
         keys = {
             "actress_poll": ("last_poll_at", "last_poll_minute"),
             "av_download": ("last_av_poll_at", "last_av_poll_minute"),
             "wash_download": ("last_wash_poll_at", "last_wash_poll_minute"),
             "postprocess_qb": ("last_postprocess_poll_at", "last_postprocess_poll_minute"),
             "maker_refresh": ("last_maker_poll_at", "last_maker_poll_minute"),
+            "asset_maintenance": ("last_asset_poll_at", "last_asset_poll_minute"),
         }
         if task_id not in keys:
             return
@@ -474,6 +831,17 @@ class SubscriptionService:
             settings[at_key] = time.time()
             if minute_key:
                 settings[minute_key_name] = minute_key
+            if result is not None:
+                results = settings.setdefault("last_task_results", {})
+                if not isinstance(results, dict):
+                    results = {}
+                    settings["last_task_results"] = results
+                results[task_id] = {
+                    "task_id": task_id,
+                    "ran_at": settings[at_key],
+                    "status": "ok",
+                    "result": result,
+                }
             self._save()
 
 
@@ -492,6 +860,20 @@ def date_is_after(value: str | None, boundary: str | None) -> bool:
     except ValueError:
         return False
     return item_date > boundary_date
+
+
+def actress_identity_keys(item: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for field in ("id", "name"):
+        value = str(item.get(field) or "").strip().lower()
+        if value:
+            keys.add(value)
+    cover = str(item.get("cover") or item.get("cover_url") or "").strip()
+    if cover:
+        stem = Path(urlparse(cover).path).stem.strip().lower()
+        if stem:
+            keys.add(stem)
+    return keys
 
 
 def normalize_cron(value: Any, fallback: str) -> str:

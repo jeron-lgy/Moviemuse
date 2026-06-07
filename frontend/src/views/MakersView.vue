@@ -1,6 +1,6 @@
 <template>
   <section class="makers-view">
-    <PageHeader kicker="订阅管理" :title="activeMaker?.name || '厂牌发售'" description="首屏读取厂牌最近 14 条作品，详情页再加载女优字段，让页面响应更轻。">
+    <PageHeader kicker="订阅管理" :title="activeMaker?.name || '厂牌发售'" description="首屏读取厂牌最近 14 条作品，JavDB 与 DMM/FANZA 统一走本地缓存。">
       <template #actions>
         <BaseButton variant="primary" type="button" :disabled="loading" @click="refreshCurrent">
           {{ loading ? '刷新中' : '刷新当前厂牌' }}
@@ -25,7 +25,7 @@
         <input v-model.trim="manualUrl" type="url" placeholder="厂牌：javdb 链接，例如 https://javdb.com/makers/7R?f=download">
         <BaseButton  type="submit" :disabled="!manualUrl">读取</BaseButton>
       </form>
-      <p>数据源：JavDB listing 缓存。演员信息只在详情页读取。</p>
+      <p>数据源：JavDB listing + DMM/FANZA，本地 SQLite 缓存；演员信息在详情页补齐后复用。</p>
     </BaseCard>
 
     <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
@@ -43,8 +43,10 @@
           v-for="item in movies"
           :key="item.url || item.id"
           :item="item"
-          :cover-url="proxyImage(item.cover)"
+          :cover-url="proxyImage(item.cover, item)"
           :show-actors="false"
+          variant="compact"
+          poster-fit="contain"
           @detail="openDetail"
         >
           <template #actions>
@@ -63,7 +65,7 @@
     <SubscribeAvDialog
       v-if="subscribeItem"
       :item="subscribeItem"
-      :cover-url="proxyImage(subscribeItem.cover)"
+      :cover-url="proxyImage(subscribeItem.cover, subscribeItem)"
       :submitting="submitting"
       @close="closeSubscribe"
       @confirm="confirmSubscribe"
@@ -110,6 +112,7 @@ import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { api, postJson } from '../lib/api'
+import { imageProxyUrl } from '../lib/images'
 
 const route = useRoute()
 const router = useRouter()
@@ -206,6 +209,7 @@ async function loadListing(force = false, keepContent = false) {
   try {
     const requestedLimit = listingLimit.value + 1
     const params = new URLSearchParams({ url, limit: String(requestedLimit) })
+    if (activeMaker.value?.name) params.set('name', activeMaker.value.name)
     if (force) params.set('force', 'true')
     const payload = await api(`/api/javdb/listing?${params.toString()}`)
     const results = Array.isArray(payload.results) ? payload.results : []
@@ -228,8 +232,8 @@ async function loadListing(force = false, keepContent = false) {
   }
 }
 
-function proxyImage(url) {
-  return url ? `/api/proxy/image?url=${encodeURIComponent(url)}` : ''
+function proxyImage(url, item = null) {
+  return imageProxyUrl(url, item)
 }
 
 function openDetail(item) {

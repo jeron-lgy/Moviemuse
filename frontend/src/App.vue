@@ -36,7 +36,6 @@
             <RouterLink to="/subscription-search">搜索</RouterLink>
             <RouterLink to="/subscriptions">订阅</RouterLink>
             <RouterLink to="/makers">厂牌发售</RouterLink>
-            <RouterLink to="/subscription-tasks">任务</RouterLink>
           </div>
         </div>
 

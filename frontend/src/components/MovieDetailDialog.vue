@@ -6,7 +6,7 @@
 
         <div class="detail-hero">
           <div class="detail-cover">
-            <img v-if="coverUrl" :src="proxyImage(coverUrl)" alt="" />
+            <img v-if="coverUrl" :src="proxyImage(coverUrl, mergedItem)" alt="" />
             <span v-else>暂无封面</span>
           </div>
 
@@ -17,6 +17,12 @@
             <div class="detail-actions">
               <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', mergedItem)">
                 订阅番号
+              </BaseButton>
+              <BaseButton v-if="primaryActor" type="button" :disabled="busyActor === actorKey(primaryActor)" @click.stop="openActorSubscribe(primaryActor)">
+                订阅女优
+              </BaseButton>
+              <BaseButton v-else-if="actors.length > 1" type="button" :disabled="busyActor === '__all__'" @click.stop="subscribeAllActors">
+                订阅全部女优
               </BaseButton>
               <BaseButton v-if="detailUrl" as="a" :href="detailUrl" target="_blank" rel="noreferrer">
                 打开 JavDB
@@ -88,7 +94,7 @@
           <div class="section-head">
             <h3>预告</h3>
           </div>
-          <video v-if="detail.trailer" controls :src="detail.trailer"></video>
+          <video v-if="detail.trailer" controls :src="proxyMedia(detail.trailer, mergedItem)"></video>
           <BaseCard v-else class="empty-media">JavDB 当前没有提供预告</BaseCard>
         </section>
 
@@ -98,8 +104,8 @@
             <span>{{ screenshots.length }} 张</span>
           </div>
           <div v-if="screenshots.length" class="screenshot-grid">
-            <a v-for="shot in screenshots" :key="shot" :href="shot" target="_blank" rel="noreferrer">
-              <img :src="proxyImage(shot)" alt="" loading="lazy" />
+            <a v-for="(shot, index) in screenshots" :key="shot" :href="shot" target="_blank" rel="noreferrer">
+              <img :src="proxyImage(shot, null, { kind: 'screenshot', entityId: `${movieCode}-${index + 1}` })" alt="" loading="lazy" />
             </a>
           </div>
           <BaseCard v-else class="empty-media">暂无剧照</BaseCard>
@@ -115,7 +121,7 @@
               v-for="movie in recommendations"
               :key="movie.url || movie.id || movie.title"
               :item="movie"
-              :cover-url="proxyImage(movie.cover)"
+              :cover-url="proxyImage(movie.cover, movie)"
               :show-actors="false"
               @detail="emit('recommend', $event)"
             >
@@ -157,6 +163,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { api, postJson } from '../lib/api'
+import { imageProxyUrl, mediaProxyUrl } from '../lib/images'
 import SubscriptionMovieCard from './SubscriptionMovieCard.vue'
 import { BaseButton, BaseCard, NoticeBanner } from './ui'
 
@@ -186,7 +193,8 @@ const movieTitle = computed(() => detail.value.title || props.item.title || prop
 const dialogTitle = computed(() => `${movieCode.value} 详情`)
 const releaseDate = computed(() => detail.value.release_date || detail.value.date || props.item.date || props.item.release_date || '未知')
 const mergedItem = computed(() => ({ ...props.item, ...detail.value, id: movieCode.value }))
-const actors = computed(() => normalizePeople(detail.value.actors?.length ? detail.value.actors : (props.item.actresses || props.item.actress || [])))
+const actors = computed(() => normalizePeople(detail.value.actors?.length ? detail.value.actors : (detail.value.actresses?.length ? detail.value.actresses : (props.item.actresses || props.item.actress || []))))
+const primaryActor = computed(() => actors.value.length === 1 ? actors.value[0] : null)
 const directors = computed(() => normalizeLinks(detail.value.director))
 const makers = computed(() => normalizeLinks(detail.value.maker))
 const tags = computed(() => normalizeLinks(detail.value.tags))
@@ -214,8 +222,12 @@ async function loadDetail() {
   }
 }
 
-function proxyImage(url) {
-  return url ? `/api/proxy/image?url=${encodeURIComponent(url)}` : ''
+function proxyImage(url, item = null, options = {}) {
+  return imageProxyUrl(url, item, options)
+}
+
+function proxyMedia(url, item = null, options = {}) {
+  return mediaProxyUrl(url, item, options)
 }
 
 function displayValue(value) {
@@ -224,17 +236,29 @@ function displayValue(value) {
 
 function normalizePeople(value) {
   const list = Array.isArray(value) ? value : (value ? [value] : [])
-  return list.map((actor) => {
-    if (typeof actor === 'string') return { name: actor, id: '', url: '', cover: '' }
+  return list.flatMap((actor) => {
+    if (typeof actor === 'string') return splitActorNames(actor).map((name) => ({ name, id: '', url: '', cover: '' }))
     const url = actor?.url || ''
     const idFromUrl = String(url).match(/\/actors\/([A-Za-z0-9]+)$/)?.[1] || ''
     return {
       name: actor?.name || actor?.value || '',
       id: actor?.id || actor?.code || idFromUrl,
       url,
-      cover: actor?.cover || ''
+      cover: actor?.cover || '',
+      source: actor?.source || '',
+      dmm_name: actor?.dmm_name || actor?.name || actor?.value || ''
     }
   }).filter((actor) => actor.name)
+}
+
+function splitActorNames(value) {
+  const text = String(value || '').trim()
+  if (!text) return []
+  const parts = text.split(/\s*[、,|]\s*|\s{2,}/).map((item) => item.trim()).filter(Boolean)
+  if (parts.length > 1) return parts
+  const spaced = text.split(/\s+/).map((item) => item.trim()).filter(Boolean)
+  if (spaced.length >= 2 && spaced.length <= 20 && spaced.every((item) => item.length >= 2 && item.length <= 16)) return spaced
+  return [text]
 }
 
 function normalizeLinks(value) {
@@ -255,7 +279,11 @@ function actorPayload(actor) {
   return {
     id: actor.id || actor.name,
     name: actor.name,
-    cover: actor.cover || coverUrl.value || '',
+    cover: actor.cover || '',
+    source: actor.source || (actor.id ? 'javdb' : 'dmm'),
+    javdb_id: actor.id || '',
+    dmm_name: actor.dmm_name || actor.name,
+    dmm_url: actor.url && actor.url.includes('dmm.co.jp') ? actor.url : '',
     since_date: actorSubscribeForm.since_date,
     poll_enabled: true,
     include_vr: actorSubscribeForm.include_vr
@@ -283,6 +311,21 @@ async function subscribeActress(actor) {
   errorMessage.value = ''
   try {
     await postJson('/api/subscriptions/actress', actorPayload(actor))
+    closeActorSubscribe()
+  } catch (error) {
+    errorMessage.value = error.message || '订阅女优失败'
+  } finally {
+    busyActor.value = ''
+  }
+}
+
+async function subscribeAllActors() {
+  busyActor.value = '__all__'
+  errorMessage.value = ''
+  try {
+    for (const actor of actors.value) {
+      await postJson('/api/subscriptions/actress', actorPayload(actor))
+    }
     closeActorSubscribe()
   } catch (error) {
     errorMessage.value = error.message || '订阅女优失败'

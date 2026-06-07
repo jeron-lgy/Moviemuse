@@ -32,6 +32,8 @@ class JavDBService:
         self._ctx: BrowserContext | None = None
         self._age_passed = False
         self._logger: Callable[[str, str, str, dict[str, Any] | None], None] | None = None
+        self._proxy_provider: Callable[[], str] | None = None
+        self._ctx_proxy = ""
         self._cache: dict[str, tuple[float, Any]] = {}
         self._cache_lock = threading.RLock()
         cache_root = os.getenv("JAVDB_CACHE_DIR") or str(Path(os.getenv("APP_DATA_DIR", "data")) / "javdb-cache")
@@ -63,6 +65,18 @@ class JavDBService:
 
     def set_logger(self, logger: Callable[[str, str, str, dict[str, Any] | None], None]) -> None:
         self._logger = logger
+
+    def set_proxy_provider(self, provider: Callable[[], str]) -> None:
+        self._proxy_provider = provider
+        self._rebuild_requested = True
+
+    def _proxy_url(self) -> str:
+        if self._proxy_provider:
+            try:
+                return str(self._proxy_provider() or "").strip()
+            except Exception:
+                return ""
+        return str(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or "").strip()
 
     def _log(self, level: str, message: str, data: dict[str, Any] | None = None) -> None:
         payload = data or {}
@@ -103,12 +117,13 @@ class JavDBService:
             raise
 
     def _ensure_ctx(self) -> BrowserContext:
+        proxy_url = self._proxy_url()
         # 如果 context 还能用就复用。
         if self._ctx and not self._rebuild_requested:
             try:
                 _ = self._ctx.pages
                 age = time.monotonic() - self._ctx_created_at
-                if self._ctx_uses < self._max_context_uses and age < self._max_context_age:
+                if self._ctx_proxy == proxy_url and self._ctx_uses < self._max_context_uses and age < self._max_context_age:
                     return self._ctx
                 self._log("info", "JavDB 浏览器上下文达到回收条件", {
                     "stage": "javdb_context_recycle",
@@ -128,6 +143,8 @@ class JavDBService:
         chromium_path = os.getenv("JAVDB_CHROMIUM_PATH")
         if chromium_path:
             launch_args["executable_path"] = chromium_path
+        if proxy_url:
+            launch_args["proxy"] = {"server": proxy_url}
         self._browser = self._pw.chromium.launch(**launch_args)
         self._ctx = self._browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -137,6 +154,7 @@ class JavDBService:
         self._age_passed = False
         self._ctx_created_at = time.monotonic()
         self._ctx_uses = 0
+        self._ctx_proxy = proxy_url
         self._rebuild_requested = False
         self._log("info", "JavDB Playwright 浏览器已启动", {"stage": "javdb_browser_start"})
         return self._ctx
@@ -182,6 +200,12 @@ class JavDBService:
                 "context_uses": self._ctx_uses,
             })
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            try:
+                body_text = page.locator("body").inner_text(timeout=1000)
+            except Exception:
+                body_text = ""
+            if "banned your access" in body_text or "管理員禁止了你的訪問" in body_text or "異常行為" in body_text:
+                raise RuntimeError("JavDB 已触发访问限制，请暂停抓取或更换代理后再试")
 
             if not self._age_passed:
                 self._pass_age_gate(page, timeout)
@@ -248,6 +272,14 @@ class JavDBService:
         try:
             return self._do_search_once(url, js_code)
         except Exception as exc:
+            if is_access_ban_error(exc):
+                self._last_error = str(exc)
+                self._log("error", "JavDB access is currently limited; skip retry", {
+                    "stage": "javdb_access_banned",
+                    "url": url,
+                    "error": str(exc),
+                })
+                return None
             self._log("warning", "JavDB 首次抓取失败，重建 Playwright 后重试", {
                 "stage": "javdb_retry_rebuild",
                 "url": url,
@@ -274,6 +306,8 @@ class JavDBService:
         def fetch() -> Any:
             result = self._do_search(url, js_code)
             if isinstance(result, list) and result:
+                return result
+            if is_access_ban_error(self._last_error):
                 return result
             self._log("warning", "JavDB 列表解析为空，重建 Playwright 后重试", {
                 "stage": "javdb_empty_retry",
@@ -799,6 +833,19 @@ class JavDBService:
     def close(self) -> None:
         self._tasks.put(None)
         self._worker.join(timeout=5)
+
+
+def is_access_ban_error(exc: object) -> bool:
+    text = str(exc or "")
+    lowered = text.lower()
+    return (
+        ("access" in lowered and "banned" in lowered)
+        or "访问限制" in text
+        or "访问被限制" in text
+        or "禁止" in text
+        or "訪問" in text
+        or "異常行為" in text
+    )
 
 
 javdb = JavDBService()

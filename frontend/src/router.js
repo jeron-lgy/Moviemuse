@@ -21,7 +21,7 @@ export const routes = [
   { path: '/subscription-search', name: 'subscription-search', component: SubscriptionSearchView, meta: { title: '搜索', module: '订阅管理' } },
   { path: '/subscriptions', name: 'subscriptions', component: SubscriptionListView, meta: { title: '订阅', module: '订阅管理' } },
   { path: '/makers', name: 'makers', component: MakersView, meta: { title: '厂牌发售', module: '订阅管理' } },
-  { path: '/subscription-tasks', name: 'subscription-tasks', component: SubscriptionTasksView, meta: { title: '任务', module: '订阅管理' } },
+  { path: '/subscription-tasks', redirect: '/automation' },
   { path: '/subscription-settings', redirect: '/system' },
   { path: '/subscription-wash', redirect: '/system' },
   { path: '/notifications', redirect: '/system' },

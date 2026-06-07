@@ -12,8 +12,8 @@ import uuid
 import hashlib
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -29,7 +29,9 @@ from .mteam_service import download_mteam_torrent, search_mteam
 from .postprocess_service import PostprocessService
 from .subscription_service import SubscriptionService, date_is_after
 from .system_settings import SystemSettingsService
-from .javdb_service import javdb
+from .dmm_service import dmm
+from .javdb_service import is_access_ban_error, javdb
+from .javlibrary_service import javlibrary
 from .subtitle_service import (
     SubtitleJob,
     SubtitleSegment,
@@ -1292,6 +1294,40 @@ def dashboard_trend(current: int, previous: int) -> dict[str, str]:
     return {"text": "较上周持平", "tone": "flat"}
 
 
+def task_label(task_id: str) -> str:
+    labels = {
+        "actress_poll": "女优订阅轮询",
+        "av_download": "番号订阅下载",
+        "wash_download": "洗版轮询",
+        "postprocess_qb": "后处理下载检查",
+        "maker_refresh": "厂牌发售更新",
+    }
+    return labels.get(task_id, task_id or "自动任务")
+
+
+def task_result_summary(result: dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    parts: list[str] = []
+    if "checked" in result:
+        parts.append(f"检查 {result.get('checked')} 个")
+    if "added" in result:
+        added = result.get("added")
+        parts.append(f"新增 {len(added) if isinstance(added, list) else added} 个")
+    if "skipped" in result:
+        skipped = result.get("skipped")
+        parts.append(f"跳过 {len(skipped) if isinstance(skipped, list) else skipped} 个")
+    if "errors" in result:
+        errors = result.get("errors")
+        parts.append(f"错误 {len(errors) if isinstance(errors, list) else errors} 个")
+    if "processed" in result:
+        parts.append(f"处理 {result.get('processed')} 个")
+    if "refreshed" in result:
+        refreshed = result.get("refreshed")
+        parts.append(f"刷新 {len(refreshed) if isinstance(refreshed, list) else refreshed} 个")
+    return " / ".join(parts) or str(result)[:80]
+
+
 def dashboard_payload() -> dict[str, Any]:
     media_dirs, trash_dir, data_dir = settings()
     scan_cache.configure(data_dir)
@@ -1375,6 +1411,21 @@ def dashboard_payload() -> dict[str, Any]:
                 "time": dashboard_time(item.get("subscribed_at")),
                 "ts": float(item.get("subscribed_at") or 0),
                 "note": str(item.get("title") or "")[:80],
+            }
+        )
+    last_task_results = settings_data.get("last_task_results") if isinstance(settings_data.get("last_task_results"), dict) else {}
+    for item in last_task_results.values():
+        if not isinstance(item, dict):
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        recent_tasks.append(
+            {
+                "type": "自动任务",
+                "title": task_label(str(item.get("task_id") or "")),
+                "status": str(item.get("status") or "ok"),
+                "time": dashboard_time(item.get("ran_at")),
+                "ts": float(item.get("ran_at") or 0),
+                "note": task_result_summary(result),
             }
         )
     recent_tasks = sorted(recent_tasks, key=lambda item: float(item.get("ts") or 0), reverse=True)[:8]
@@ -1478,7 +1529,7 @@ def api_scan_run(paths: list[str] = Form(default=[])) -> dict[str, object]:
     scan_dirs = selected_scan_dirs(media_dirs, paths, [trash_dir])
     if not scan_dirs:
         raise HTTPException(status_code=400, detail="请至少选择一个媒体子目录")
-    started = scan_cache.start(scan_dirs, force=True, excluded_dirs=[trash_dir])
+    started = scan_cache.start(scan_dirs, force=True, excluded_dirs=[trash_dir], completion_callback=notify_scan_completed)
     return {"status": "running", "started": started, "scan_dirs": [str(path) for path in scan_dirs]}
 
 
@@ -1488,8 +1539,31 @@ def scan_run(paths: list[str] = Form(default=[])) -> RedirectResponse:
     scan_cache.configure(data_dir)
     scan_dirs = selected_scan_dirs(media_dirs, paths, [trash_dir])
     if scan_dirs:
-        scan_cache.start(scan_dirs, force=True, excluded_dirs=[trash_dir])
+        scan_cache.start(scan_dirs, force=True, excluded_dirs=[trash_dir], completion_callback=notify_scan_completed)
     return RedirectResponse("/", status_code=303)
+
+
+def notify_scan_completed(snapshot: Any) -> None:
+    try:
+        result = getattr(snapshot, "result", None)
+        status = str(getattr(snapshot, "status", "") or "")
+        if status == "completed" and result:
+            send_notification_event("scan_completed", {
+                "status": "completed",
+                "title": "重复视频扫描完成",
+                "detail": f"扫描 {result.total_files} 个文件，发现 {len(result.groups)} 组重复、{result.duplicate_files} 个重复文件",
+                "total_files": result.total_files,
+                "duplicate_groups": len(result.groups),
+                "duplicate_files": result.duplicate_files,
+            })
+        elif status == "failed":
+            send_notification_event("task_failed", {
+                "status": "failed",
+                "title": "重复视频扫描失败",
+                "detail": str(getattr(snapshot, "error", "") or "扫描失败"),
+            })
+    except Exception as exc:
+        app_log("error", "notification", "扫描完成通知失败", {"error": str(exc)})
 
 
 @app.post("/scan/subtitles")
@@ -2361,7 +2435,7 @@ def is_relative_to(path: Path, parent: Path) -> bool:
 
 
 # ============================================================
-# 订阅功能 API（纯 javdb 数据源）
+# 订阅功能 API
 # ============================================================
 
 subscription_service: SubscriptionService | None = None
@@ -2370,8 +2444,100 @@ system_settings_service: SystemSettingsService | None = None
 app_log_service: AppLogService | None = None
 subscription_poll_thread: threading.Thread | None = None
 subscription_poll_stop = threading.Event()
-IMAGE_PROXY_HOSTS = ("javbus.com", "javdb.com", "jdbstatic.com", "dmm.co.jp", "libredmm.com")
+IMAGE_PROXY_HOSTS = ("javbus.com", "javdb.com", "jdbstatic.com", "dmm.co.jp", "libredmm.com", "javlibrary.com")
 JAVDB_HOSTS = ("javdb.com",)
+DMM_HOSTS = ("dmm.co.jp",)
+JAVLIBRARY_HOSTS = ("javlibrary.com",)
+DMM_MAKER_LIST_URLS = {
+    "s1 no.1 style": [
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=3152/list_type=reserve/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=3152/sort=date/",
+    ],
+    "prestige": [
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=40136/list_type=reserve/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=40136/sort=date/",
+    ],
+    "idea pocket": [
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=1219/list_type=reserve/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=1219/sort=date/",
+    ],
+    "madonna": [
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=2661/list_type=reserve/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=2661/sort=date/",
+    ],
+    "sod create": [
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=45276/list_type=reserve/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=45276/sort=date/",
+    ],
+}
+DMM_MAKER_ALIASES = {
+    "s1 no.1 style": ("s1", "s1 no.1 style", "エスワン", "エスワン ナンバーワンスタイル"),
+    "prestige": ("prestige", "プレステージ"),
+    "idea pocket": ("idea pocket", "ideapocket", "アイデアポケット"),
+    "madonna": ("madonna", "マドンナ"),
+    "sod create": ("sod create", "sodクリエイト", "sodクリエイト"),
+}
+DMM_MAKER_SEARCH_TERMS = {
+    "s1 no.1 style": ("S1 NO.1 STYLE",),
+    "prestige": ("PRESTIGE",),
+    "idea pocket": ("IDEA POCKET",),
+    "madonna": ("Madonna",),
+    "sod create": ("SODクリエイト", "SOD Create"),
+}
+DMM_MAKER_PRIMARY_LABELS = {
+    "s1 no.1 style": ("S1 NO.1 STYLE",),
+    "prestige": ("ABSOLUTELY FANTASIA",),
+    "idea pocket": ("ティッシュ",),
+    "madonna": ("Madonna",),
+    "sod create": ("SODSTAR",),
+}
+JAVLIBRARY_FLARESOLVERR_URL = os.getenv("JAVLIBRARY_FLARESOLVERR_URL", "http://127.0.0.1:8281/v1")
+JAVLIBRARY_ACTOR_IDS = {
+    "涼森れむ": "aeqfy",
+    "桜空もも": "aemco",
+    "野々浦暖": "aesse",
+}
+JAVLIBRARY_MAKER_URLS = {
+    "s1 no.1 style": [
+        "https://www.javlibrary.com/cn/vl_label.php?l=bvla",
+        "https://www.javlibrary.com/cn/vl_maker.php?m=arlq",
+    ],
+    "idea pocket": [
+        "https://www.javlibrary.com/cn/vl_label.php?l=buwq",
+        "https://www.javlibrary.com/cn/vl_maker.php?m=aq4q",
+    ],
+    "madonna": [
+        "https://www.javlibrary.com/cn/vl_label.php?l=bvkq",
+        "https://www.javlibrary.com/cn/vl_maker.php?m=aqsa",
+    ],
+    "prestige": [
+        "https://www.javlibrary.com/cn/vl_label.php?l=aqmuc",
+        "https://www.javlibrary.com/cn/vl_maker.php?m=aa",
+    ],
+    "sod create": [
+        "https://www.javlibrary.com/cn/vl_label.php?l=defa",
+        "https://www.javlibrary.com/cn/vl_maker.php?m=oq",
+    ],
+}
+PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy")
+METADATA_SEARCH_TTL = int(os.getenv("SUBSCRIPTION_METADATA_SEARCH_TTL_SECONDS", "21600"))
+METADATA_ACTRESS_AVS_TTL = int(os.getenv("SUBSCRIPTION_METADATA_ACTRESS_AVS_TTL_SECONDS", "21600"))
+METADATA_JAVLIBRARY_LIST_TTL = int(os.getenv("SUBSCRIPTION_JAVLIBRARY_LIST_TTL_SECONDS", "43200"))
+METADATA_JAVLIBRARY_MAP_TTL = int(os.getenv("SUBSCRIPTION_JAVLIBRARY_MAP_TTL_SECONDS", "2592000"))
+METADATA_DETAIL_TTL = int(os.getenv("SUBSCRIPTION_METADATA_DETAIL_TTL_SECONDS", "2592000"))
+METADATA_PROFILE_TTL = int(os.getenv("SUBSCRIPTION_METADATA_PROFILE_TTL_SECONDS", "604800"))
+METADATA_LISTING_TTL = int(os.getenv("SUBSCRIPTION_METADATA_LISTING_TTL_SECONDS", "43200"))
+ASSET_IMAGE_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_IMAGE_MAX_BYTES", str(12 * 1024 * 1024)))
+ASSET_CACHE_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+ASSET_MEDIA_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_MEDIA_MAX_BYTES", str(300 * 1024 * 1024)))
+GLOBAL_MAX_COACTORS = 2
+ASSET_KIND_DIRS = {
+    "cover": "covers",
+    "screenshot": "screenshots",
+    "actor": "actors",
+    "trailer": "trailers",
+    "image": "images",
+}
 
 
 def allowed_external_url(url: str, allowed_hosts: tuple[str, ...]) -> bool:
@@ -2380,6 +2546,89 @@ def allowed_external_url(url: str, allowed_hosts: tuple[str, ...]) -> bool:
         return False
     host = parsed.hostname.lower().rstrip(".")
     return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
+
+
+def metadata_cache_key(*parts: object) -> str:
+    return ":".join(str(part or "").strip().lower() for part in parts if str(part or "").strip())
+
+
+def cache_get(namespace: str, key: str, *, allow_stale: bool = False) -> Any | None:
+    return get_subscription_service().get_metadata_cache(namespace, key, allow_stale=allow_stale)
+
+
+def cache_set(namespace: str, key: str, value: Any, ttl_seconds: int) -> None:
+    get_subscription_service().set_metadata_cache(namespace, key, value, ttl_seconds)
+
+
+def cached_metadata(namespace: str, key: str, ttl_seconds: int, fetch: Callable[[], Any]) -> Any:
+    cached = cache_get(namespace, key)
+    if cached is not None:
+        app_log("info", "metadata-cache", "元数据缓存命中", {"stage": "metadata_cache_hit", "namespace": namespace, "key": key})
+        return cached
+    try:
+        value = fetch()
+    except Exception:
+        stale = cache_get(namespace, key, allow_stale=True)
+        if stale is not None:
+            app_log("warning", "metadata-cache", "外站抓取失败，返回过期元数据缓存", {"stage": "metadata_cache_stale", "namespace": namespace, "key": key})
+            return stale
+        raise
+    if value not in (None, "", [], {}):
+        cache_set(namespace, key, value, ttl_seconds)
+        app_log("info", "metadata-cache", "元数据缓存写入", {"stage": "metadata_cache_store", "namespace": namespace, "key": key, "ttl": ttl_seconds})
+    return value
+
+
+def network_proxy_settings() -> dict[str, Any]:
+    settings_data = get_system_settings_service().get()
+    network = settings_data.get("network")
+    return network if isinstance(network, dict) else {}
+
+
+def configured_proxy_url() -> str:
+    network = network_proxy_settings()
+    if network.get("proxy_enabled"):
+        https_proxy = str(network.get("https_proxy") or "").strip()
+        http_proxy = str(network.get("http_proxy") or "").strip()
+        return https_proxy or http_proxy
+    return str(
+        os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("http_proxy")
+        or ""
+    ).strip()
+
+
+def apply_system_proxy_settings() -> None:
+    network = network_proxy_settings()
+    if network.get("proxy_enabled"):
+        http_proxy = str(network.get("http_proxy") or "").strip()
+        https_proxy = str(network.get("https_proxy") or http_proxy).strip()
+        no_proxy = str(network.get("no_proxy") or "").strip()
+        if http_proxy:
+            os.environ["HTTP_PROXY"] = http_proxy
+            os.environ["http_proxy"] = http_proxy
+        if https_proxy:
+            os.environ["HTTPS_PROXY"] = https_proxy
+            os.environ["https_proxy"] = https_proxy
+        if no_proxy:
+            os.environ["NO_PROXY"] = no_proxy
+            os.environ["no_proxy"] = no_proxy
+    javdb.set_proxy_provider(lambda: configured_proxy_url() if network_proxy_settings().get("apply_to_javdb", True) else "")
+    dmm.set_proxy_provider(lambda: configured_proxy_url() if network_proxy_settings().get("apply_to_javdb", True) else "")
+    javlibrary.set_service_url_provider(lambda: str(os.getenv("JAVLIBRARY_FLARESOLVERR_URL") or JAVLIBRARY_FLARESOLVERR_URL).strip())
+
+
+def proxy_status_payload() -> dict[str, object]:
+    network = network_proxy_settings()
+    env = {key: os.getenv(key, "") for key in PROXY_ENV_KEYS}
+    return {
+        "settings": network,
+        "env": env,
+        "effective_proxy": configured_proxy_url(),
+        "javdb_proxy_enabled": bool(network.get("apply_to_javdb", True)),
+    }
 
 
 def get_subscription_service() -> SubscriptionService:
@@ -2440,16 +2689,1282 @@ def app_log(level: str, source: str, message: str, data: dict[str, Any] | None =
 
 
 javdb.set_logger(app_log)
+dmm.set_logger(app_log)
+javlibrary.set_logger(app_log)
+apply_system_proxy_settings()
 
 
 def is_vr_work(av: dict[str, Any]) -> bool:
     return "VR" in str(av.get("title") or "").upper()
 
 
+def normalize_actor_items(items: object) -> list[dict[str, str]]:
+    if not isinstance(items, list):
+        items = [items] if items else []
+    actors: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, dict):
+            actor_id = str(item.get("id") or item.get("code") or item.get("url") or "").strip()
+            name = str(item.get("name") or item.get("value") or "").strip()
+            url = str(item.get("url") or "").strip()
+            source = str(item.get("source") or "").strip()
+            dmm_name = str(item.get("dmm_name") or "").strip()
+        else:
+            actor_id = ""
+            name = str(item or "").strip()
+            url = ""
+            source = ""
+            dmm_name = ""
+        actor_names = split_actor_names(name)
+        is_split_group = len(actor_names) > 1
+        for actor_name in actor_names:
+            key = ((actor_id or url or actor_name) if not is_split_group else actor_name).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            actor = {"id": actor_id if not is_split_group else "", "name": actor_name}
+            if url and not is_split_group:
+                actor["url"] = url
+            if source:
+                actor["source"] = source
+            if dmm_name:
+                actor["dmm_name"] = actor_name if is_split_group else dmm_name
+            actors.append(actor)
+    return actors
+
+
+def split_actor_names(value: object) -> list[str]:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return []
+    parts = [part.strip() for part in re.split(r"\s*[、,|]\s*|\s{2,}", text) if part.strip()]
+    if len(parts) > 1:
+        return parts
+    spaced = [part.strip() for part in text.split(" ") if part.strip()]
+    if 2 <= len(spaced) <= 80 and all(1 <= len(part) <= 32 for part in spaced):
+        return spaced
+    return [text]
+
+
+def configured_max_coactors() -> int:
+    try:
+        value = int(get_subscription_service().get_settings().get("max_coactors") or GLOBAL_MAX_COACTORS)
+    except (TypeError, ValueError):
+        value = GLOBAL_MAX_COACTORS
+    return max(1, min(GLOBAL_MAX_COACTORS, value))
+
+
+def resolve_av_actors_for_limit(av: dict[str, Any]) -> list[dict[str, str]]:
+    detail_actors = []
+    if av.get("url") and allowed_external_url(str(av.get("url") or ""), JAVDB_HOSTS):
+        detail_actors = javdb.get_av_actresses(str(av.get("url") or ""), include_profiles=False)
+    return normalize_actor_items(detail_actors) or normalize_actor_items(av.get("actresses") or av.get("actress"))
+
+
+def av_date_key(item: dict[str, Any]) -> str:
+    return str(item.get("date") or item.get("release_date") or "")[:10]
+
+
+def canonical_av_id(value: object) -> str:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    compact = re.sub(r"(?:BOD|EC|R|V)$", "", compact)
+    for prefix in ("FTKT", "ZTKT", "TKT", "TK"):
+        if compact.startswith(prefix) and re.fullmatch(rf"{prefix}[A-Z]{{2,}}\d{{2,}}", compact):
+            compact = compact[len(prefix) :]
+            break
+    match = re.fullmatch(r"([A-Z]{2,})(\d{2,})", compact)
+    if not match:
+        return raw
+    return f"{match.group(1)}-{match.group(2)}"
+
+
+def merge_av_sources(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        for raw in source:
+            if not isinstance(raw, dict):
+                continue
+            original_id = str(raw.get("id") or "").strip().upper()
+            av_id = canonical_av_id(original_id)
+            if not av_id:
+                continue
+            item = dict(raw)
+            item["id"] = av_id
+            if original_id and original_id != av_id:
+                item.setdefault("source_id", original_id)
+            existing = merged.get(av_id)
+            if not existing:
+                merged[av_id] = item
+                continue
+            combined = dict(existing)
+            for key, value in item.items():
+                if value not in ("", None, [], {}):
+                    combined[key] = value
+            if isinstance(existing.get("detail"), dict) and isinstance(item.get("detail"), dict):
+                combined["detail"] = {**existing["detail"], **item["detail"]}
+            elif isinstance(existing.get("detail"), dict) and not combined.get("detail"):
+                combined["detail"] = existing["detail"]
+            merged[av_id] = combined
+    return sorted(merged.values(), key=lambda item: (av_date_key(item), str(item.get("id") or "")), reverse=True)
+
+
+def metadata_item_released(item: dict[str, Any]) -> bool:
+    value = av_date_key(item)
+    if not value:
+        return False
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date() <= date.today()
+    except ValueError:
+        return False
+
+
+def image_proxy_url(source_url: str, av_id: str = "", kind: str = "image", *, immutable: bool = False) -> str:
+    url = str(source_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith(("/api/proxy/image", "data:")):
+        return url
+    params: dict[str, str] = {"url": url}
+    safe_kind = str(kind or "image").strip().lower()
+    if safe_kind:
+        params["kind"] = safe_kind
+    normalized_id = canonical_av_id(av_id)
+    if normalized_id:
+        params["av_id"] = normalized_id
+    if immutable:
+        params["immutable"] = "1"
+    return f"/api/proxy/image?{urlencode(params)}"
+
+
+def public_metadata_item(item: dict[str, Any]) -> dict[str, Any]:
+    payload = {key: value for key, value in dict(item).items() if not str(key).startswith("_")}
+    av_id = canonical_av_id(payload.get("id"))
+    cover = str(payload.get("cover") or "").strip()
+    if av_id and cover:
+        payload["id"] = av_id
+        payload["cover_proxy"] = image_proxy_url(cover, av_id, "cover", immutable=metadata_item_released(payload))
+    return payload
+
+
+def remember_av_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    av_id = canonical_av_id(item.get("id"))
+    if not av_id:
+        return {}
+    payload = public_metadata_item({**item, "id": av_id})
+    existing = cached_av_summary(av_id)
+    if existing:
+        combined = dict(existing)
+        for key, value in payload.items():
+            if value not in ("", None, [], {}):
+                combined[key] = value
+        payload = combined
+    cache_set("av_summary", av_id, payload, METADATA_DETAIL_TTL)
+    return payload
+
+
+def remember_av_summaries(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        if isinstance(item, dict):
+            remember_av_metadata(item)
+
+
+def cached_av_summary(av_id: str) -> dict[str, Any]:
+    normalized = canonical_av_id(av_id)
+    cached = cache_get("av_summary", normalized)
+    if isinstance(cached, dict) and (cached.get("date") or cached.get("release_date")):
+        return cached
+    detail = cache_get("av_detail", f"id:{normalized}")
+    if isinstance(detail, dict):
+        if isinstance(cached, dict):
+            combined = dict(detail)
+            combined.update({key: value for key, value in cached.items() if value not in ("", None, [], {})})
+            return combined
+        return detail
+    return cached if isinstance(cached, dict) else {}
+
+
+def hydrate_av_with_cached_summary(item: dict[str, Any]) -> dict[str, Any]:
+    av_id = canonical_av_id(item.get("id"))
+    if not av_id:
+        return item
+    cached = cached_av_summary(av_id)
+    if not cached:
+        return item
+    result = dict(item)
+    for field in ("date", "release_date", "duration", "rating", "maker", "label", "director"):
+        if not result.get(field) and cached.get(field):
+            result[field] = cached.get(field)
+    if not result.get("title") or result.get("title") == "Product":
+        result["title"] = cached.get("title") or result.get("title")
+    if not result.get("cover") and cached.get("cover"):
+        result["cover"] = cached.get("cover")
+    if not result.get("actresses") and cached.get("actresses"):
+        result["actresses"] = cached.get("actresses")
+    if cached.get("cover_proxy"):
+        result["cover_proxy"] = cached.get("cover_proxy")
+    return result
+
+
+def detail_cache_keys(payload: dict[str, Any] | str) -> list[str]:
+    if isinstance(payload, dict):
+        av_id = canonical_av_id(payload.get("id"))
+        url = str(payload.get("url") or "").strip()
+    else:
+        av_id = ""
+        url = str(payload or "").strip()
+    keys: list[str] = []
+    if av_id:
+        keys.append(f"id:{av_id}")
+    if url:
+        keys.append(f"url:{hashlib.sha256(url.encode('utf-8')).hexdigest()}")
+    return keys
+
+
+def cached_av_detail(payload: dict[str, Any] | str) -> dict[str, Any]:
+    for key in detail_cache_keys(payload):
+        cached = cache_get("av_detail", key)
+        if isinstance(cached, dict):
+            return cached
+    return {}
+
+
+def detail_has_actors(detail: dict[str, Any]) -> bool:
+    actors = detail.get("actors") or detail.get("actresses")
+    if actors:
+        return True
+    nested = detail.get("detail") if isinstance(detail.get("detail"), dict) else {}
+    return bool(nested.get("actors") or nested.get("actresses"))
+
+
+def detail_needs_refresh(detail: dict[str, Any], target_url: str) -> bool:
+    if not detail:
+        return False
+    if not allowed_external_url(target_url, DMM_HOSTS):
+        return False
+    actors = detail.get("actresses") or detail.get("actors") or []
+    if not actors and isinstance(detail.get("detail"), dict):
+        actors = detail["detail"].get("actresses") or detail["detail"].get("actors") or []
+    has_dmm_actor_url = any(isinstance(actor, dict) and str(actor.get("url") or "").strip() for actor in (actors if isinstance(actors, list) else []))
+    return not detail_has_actors(detail) or not has_dmm_actor_url
+
+
+def store_av_detail(payload: dict[str, Any] | str, detail: dict[str, Any]) -> None:
+    if not detail:
+        return
+    for key in detail_cache_keys(payload):
+        cache_set("av_detail", key, detail, METADATA_DETAIL_TTL)
+    av_id = canonical_av_id(detail.get("id") or (payload.get("id") if isinstance(payload, dict) else ""))
+    if av_id:
+        normalized_detail = {**detail, "id": av_id}
+        cache_set("av_detail", f"id:{av_id}", normalized_detail, METADATA_DETAIL_TTL)
+        remember_av_metadata(normalized_detail)
+
+
+def actress_lookup_name(actress: dict[str, Any]) -> str:
+    name = str(actress.get("name") or "").strip()
+    if name and not bad_actress_name(name):
+        return name
+    dmm_name = str(actress.get("dmm_name") or "").strip()
+    if dmm_name and not bad_actress_name(dmm_name):
+        return dmm_name
+    return str(actress.get("id") or "").strip()
+
+
+def actress_dmm_lookup_url(actress: dict[str, Any]) -> str:
+    return str(actress.get("dmm_url") or "").strip()
+
+
+def actress_javdb_lookup_id(actress: dict[str, Any]) -> str:
+    javdb_id = str(actress.get("javdb_id") or "").strip()
+    if javdb_id:
+        return javdb_id
+    source = str(actress.get("source") or "").lower()
+    raw_id = str(actress.get("id") or "").strip()
+    if source == "dmm":
+        return ""
+    return raw_id
+
+
+def actress_identity_key(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or item.get("dmm_name") or "").strip().lower()
+    if name and not bad_actress_name(name):
+        return name
+    return str(item.get("id") or "").strip().lower()
+
+
+def merge_actress_sources(javdb_results: list[dict[str, Any]], dmm_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in javdb_results:
+        if not isinstance(raw, dict):
+            continue
+        item = public_metadata_item(dict(raw))
+        item["source"] = str(item.get("source") or "javdb")
+        if item["source"] == "javdb":
+            item["javdb_id"] = str(item.get("id") or "").strip()
+        key = actress_identity_key(item)
+        if key:
+            merged[key] = item
+    for raw in dmm_results:
+        if not isinstance(raw, dict):
+            continue
+        item = public_metadata_item(dict(raw))
+        item["source"] = "dmm"
+        item["dmm_name"] = str(item.get("dmm_name") or item.get("name") or item.get("id") or "").strip()
+        if item.get("url") and allowed_external_url(str(item.get("url") or ""), DMM_HOSTS):
+            item["dmm_url"] = item.get("url")
+        key = actress_identity_key(item)
+        if not key:
+            continue
+        existing = merged.get(key)
+        if existing:
+            combined = dict(existing)
+            existing_source = str(existing.get("source") or "").strip()
+            combined["source"] = existing_source if "dmm" in existing_source else f"{existing_source}+dmm".strip("+")
+            combined["dmm_name"] = item.get("dmm_name") or item.get("name") or combined.get("dmm_name", "")
+            combined["dmm_url"] = item.get("dmm_url") or combined.get("dmm_url", "")
+            combined["latest"] = item.get("latest") or combined.get("latest")
+            combined["latest_cover"] = item.get("latest_cover") or combined.get("latest_cover", "")
+            combined["latest_av_id"] = item.get("latest_av_id") or combined.get("latest_av_id", "")
+            combined["latest_title"] = item.get("latest_title") or combined.get("latest_title", "")
+            combined["latest_date"] = item.get("latest_date") or combined.get("latest_date", "")
+            if not combined.get("cover"):
+                combined["cover"] = item.get("cover", "")
+            merged[key] = combined
+        else:
+            merged[key] = item
+    return list(merged.values())
+
+
+def normalized_person_name(value: object) -> str:
+    return re.sub(r"[\s・･._\\-]+", "", str(value or "").strip().lower())
+
+
+def person_name_aliases(value: object) -> set[str]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    aliases = {text}
+    for match in re.finditer(r"[（(]([^（）()]+)[）)]", text):
+        aliases.add(match.group(1).strip())
+    aliases.add(re.sub(r"[（(].*?[）)]", "", text).strip())
+    parts = re.split(r"\s*[、,/|]\s*", text)
+    aliases.update(part.strip() for part in parts if part.strip())
+    return {normalized for alias in aliases if (normalized := normalized_person_name(alias))}
+
+
+def actress_aliases(actress: dict[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    for key in ("name", "dmm_name", "source_actress_name", "id"):
+        value = str(actress.get(key) or "").strip()
+        if value and not bad_actress_name(value):
+            aliases.update(person_name_aliases(value))
+    return aliases
+
+
+def actor_matches_actress(actor: dict[str, Any], targets: set[str]) -> bool:
+    if not targets:
+        return False
+    aliases: set[str] = set()
+    for key in ("name", "dmm_name", "value"):
+        aliases.update(person_name_aliases(actor.get(key) if isinstance(actor, dict) else actor))
+    return bool(aliases & targets)
+
+
+def av_matches_actress(av: dict[str, Any], actress: dict[str, Any]) -> bool:
+    targets = actress_aliases(actress)
+    if not targets:
+        return True
+    actors = normalize_actor_items(av.get("actors") or av.get("actresses") or av.get("actress"))
+    if actors:
+        return any(actor_matches_actress(actor, targets) for actor in actors)
+    title_key = normalized_person_name(av.get("title"))
+    return any(target and target in title_key for target in targets)
+
+
+def dmm_actress_queries(actress: dict[str, Any]) -> list[str]:
+    values = [
+        actress.get("dmm_name"),
+        actress.get("name"),
+        actress_lookup_name(actress),
+        actress.get("id"),
+    ]
+    queries: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or bad_actress_name(text):
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(text)
+    return queries
+
+
+def javlibrary_video_actresses(av_id: str) -> list[dict[str, Any]]:
+    normalized_id = canonical_av_id(av_id)
+    if not normalized_id:
+        return []
+    key = metadata_cache_key("video", normalized_id)
+    cached = cache_get("javlibrary_video_actors", key)
+    if isinstance(cached, list):
+        return [item for item in cached if isinstance(item, dict)]
+    try:
+        actors = javlibrary.get_video_actresses(normalized_id)
+    except Exception as exc:
+        stale = cache_get("javlibrary_video_actors", key, allow_stale=True)
+        if isinstance(stale, list):
+            app_log("warning", "javlibrary", "JavLibrary 番号演员反查失败，返回过期缓存", {
+                "stage": "javlibrary_video_actors_stale",
+                "av_id": normalized_id,
+                "error": str(exc),
+            })
+            return [item for item in stale if isinstance(item, dict)]
+        app_log("warning", "javlibrary", "JavLibrary 番号演员反查失败", {
+            "stage": "javlibrary_video_actors_error",
+            "av_id": normalized_id,
+            "error": str(exc),
+        })
+        return []
+    if actors:
+        cache_set("javlibrary_video_actors", key, actors, METADATA_DETAIL_TTL)
+    return actors
+
+
+def cache_javlibrary_actor_map(name: str, star_id: str) -> None:
+    target_id = str(star_id or "").strip()
+    if not target_id:
+        return
+    for alias in person_name_aliases(name):
+        cache_set("javlibrary_actor_map", alias, target_id, METADATA_JAVLIBRARY_MAP_TTL)
+
+
+def javlibrary_seed_disallowed(seed: dict[str, Any]) -> bool:
+    if actor_count_from_summary(seed) > GLOBAL_MAX_COACTORS:
+        return True
+    text = f"{seed.get('id') or ''} {seed.get('title') or ''}".lower()
+    return any(token in text for token in (
+        "best",
+        "総集",
+        "総集編",
+        "合集",
+        "精選",
+        "精选",
+        "オールスター",
+        "all star",
+        "コラボ",
+        "collab",
+        "×",
+    ))
+
+
+def javlibrary_actor_star_id(actress: dict[str, Any], seed_avs: list[dict[str, Any]] | None = None) -> str:
+    for value in dmm_actress_queries(actress):
+        normalized = normalized_person_name(value)
+        if not normalized:
+            continue
+        cached = cache_get("javlibrary_actor_map", normalized)
+        if isinstance(cached, str) and cached.strip():
+            return cached.strip()
+        for name, star_id in JAVLIBRARY_ACTOR_IDS.items():
+            if normalized_person_name(name) == normalized:
+                cache_javlibrary_actor_map(name, star_id)
+                return star_id
+    targets = actress_aliases(actress)
+    if not targets:
+        return ""
+    for seed in seed_avs or []:
+        if not isinstance(seed, dict):
+            continue
+        if javlibrary_seed_disallowed(seed):
+            continue
+        av_id = canonical_av_id(seed.get("id") or seed.get("code"))
+        if not av_id:
+            continue
+        actors = javlibrary_video_actresses(av_id)
+        if len(actors) > GLOBAL_MAX_COACTORS:
+            app_log("info", "javlibrary", "跳过超过共演人数限制的 JavLibrary 反查锚点", {
+                "stage": "javlibrary_actor_map_seed_skip",
+                "av_id": av_id,
+                "actor_count": len(actors),
+                "max_coactors": GLOBAL_MAX_COACTORS,
+            })
+            continue
+        for actor in actors:
+            star_id = str(actor.get("star_id") or actor.get("id") or "").strip()
+            actor_name = str(actor.get("name") or "").strip()
+            if not star_id or not actor_name:
+                continue
+            if actor_matches_actress(actor, targets):
+                cache_javlibrary_actor_map(actor_name, star_id)
+                for value in dmm_actress_queries(actress):
+                    cache_javlibrary_actor_map(value, star_id)
+                app_log("info", "javlibrary", "已通过番号详情反查 JavLibrary 女优 ID", {
+                    "stage": "javlibrary_actor_map_from_video",
+                    "actress": actress_lookup_name(actress),
+                    "av_id": av_id,
+                    "star_id": star_id,
+                })
+                return star_id
+    return ""
+
+
+def javlibrary_actor_avs(actress: dict[str, Any], limit: int, seed_avs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    star_id = javlibrary_actor_star_id(actress, seed_avs=seed_avs)
+    if not star_id:
+        return []
+    key = metadata_cache_key("star", star_id)
+    cached = cache_get("javlibrary_actor_avs", key)
+    if isinstance(cached, list):
+        return [
+            item for item in cached
+            if isinstance(item, dict) and not javlibrary_seed_disallowed({"id": item.get("id", ""), "title": item.get("title", "")})
+        ][:limit]
+    try:
+        items = javlibrary.get_actor_avs(star_id, limit=max(limit, 20))
+    except Exception as exc:
+        stale = cache_get("javlibrary_actor_avs", key, allow_stale=True)
+        if isinstance(stale, list):
+            app_log("warning", "javlibrary", "JavLibrary 女优作品抓取失败，返回过期缓存", {
+                "stage": "javlibrary_actor_avs_stale",
+                "star_id": star_id,
+                "error": str(exc),
+            })
+            return [
+                item for item in stale
+                if isinstance(item, dict) and not javlibrary_seed_disallowed({"id": item.get("id", ""), "title": item.get("title", "")})
+            ][:limit]
+        app_log("warning", "javlibrary", "JavLibrary 女优作品抓取失败", {
+            "stage": "javlibrary_actor_avs_error",
+            "star_id": star_id,
+            "error": str(exc),
+        })
+        return []
+    actor_name = actress_lookup_name(actress)
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        av_id = canonical_av_id(item.get("id") or item.get("code"))
+        if not av_id:
+            continue
+        if javlibrary_seed_disallowed({"id": av_id, "title": item.get("title", "")}):
+            continue
+        payload = {
+            **item,
+            "id": av_id,
+            "source": "javlibrary",
+            "actresses": [{"name": actor_name}] if actor_name else [],
+        }
+        normalized.append(payload)
+    if normalized:
+        cache_set("javlibrary_actor_avs", key, [public_metadata_item(item) for item in normalized], METADATA_JAVLIBRARY_LIST_TTL)
+    return normalized[:limit]
+
+
+def javlibrary_urls_for_maker(maker_name: str) -> list[str]:
+    key = str(maker_name or "").strip().lower()
+    return list(JAVLIBRARY_MAKER_URLS.get(key, []))
+
+
+def javlibrary_maker_scope(url: str) -> str:
+    target = str(url or "").lower()
+    if "vl_label.php" in target:
+        return "label"
+    if "vl_maker.php" in target:
+        return "maker"
+    return ""
+
+
+def sort_javlibrary_maker_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(item: dict[str, Any]) -> tuple[str, int, str]:
+        scope = str(item.get("source_scope") or "").lower()
+        scope_rank = 1 if scope == "label" else 0
+        return (av_date_key(item), scope_rank, str(item.get("id") or ""))
+
+    return sorted(items, key=key, reverse=True)
+
+
+def javlibrary_maker_avs(maker_name: str, limit: int) -> list[dict[str, Any]]:
+    urls = javlibrary_urls_for_maker(maker_name)
+    if not urls:
+        return []
+    merged: list[dict[str, Any]] = []
+    for url in urls:
+        scope = javlibrary_maker_scope(url)
+        key = metadata_cache_key("url", url)
+        cached = cache_get("javlibrary_maker_avs", key)
+        if isinstance(cached, list):
+            merged.extend(
+                {**item, "source_scope": item.get("source_scope") or scope} for item in cached
+                if isinstance(item, dict) and not javlibrary_seed_disallowed({"id": item.get("id", ""), "title": item.get("title", "")})
+            )
+            continue
+        try:
+            items = javlibrary.get_listing_avs(url, limit=max(limit, 20))
+        except Exception as exc:
+            stale = cache_get("javlibrary_maker_avs", key, allow_stale=True)
+            if isinstance(stale, list):
+                app_log("warning", "javlibrary", "JavLibrary 厂牌抓取失败，返回过期缓存", {
+                    "stage": "javlibrary_maker_avs_stale",
+                    "maker": maker_name,
+                    "url": url,
+                    "error": str(exc),
+                })
+                merged.extend(
+                    {**item, "source_scope": item.get("source_scope") or scope} for item in stale
+                    if isinstance(item, dict) and not javlibrary_seed_disallowed({"id": item.get("id", ""), "title": item.get("title", "")})
+                )
+                continue
+            app_log("warning", "javlibrary", "JavLibrary 厂牌抓取失败", {
+                "stage": "javlibrary_maker_avs_error",
+                "maker": maker_name,
+                "url": url,
+                "error": str(exc),
+            })
+            continue
+        normalized: list[dict[str, Any]] = []
+        for item in items:
+            av_id = canonical_av_id(item.get("id") or item.get("code"))
+            if not av_id:
+                continue
+            if javlibrary_seed_disallowed({"id": av_id, "title": item.get("title", "")}):
+                continue
+            normalized.append({**item, "id": av_id, "source": "javlibrary", "maker": maker_name, "source_scope": scope})
+        if normalized:
+            cache_set("javlibrary_maker_avs", key, [public_metadata_item(item) for item in normalized], METADATA_JAVLIBRARY_LIST_TTL)
+            merged.extend(normalized)
+    dedupe_order = sorted(merged, key=lambda item: 1 if str(item.get("source_scope") or "").lower() == "label" else 0)
+    return sort_javlibrary_maker_items(merge_av_sources(dedupe_order))[:limit]
+
+
+def enrich_dmm_actress_items(items: list[dict[str, Any]], actress: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    detail_limit = max(4, min(len(items), 8))
+    verified: list[dict[str, Any]] = []
+    for item in items[:detail_limit]:
+        if not isinstance(item, dict):
+            continue
+        merged = dict(item)
+        if actor_count_from_summary(merged) > GLOBAL_MAX_COACTORS:
+            continue
+        if av_matches_actress(merged, actress):
+            verified.append(merged)
+            continue
+        title = str(item.get("title") or "").strip()
+        if title and title.lower() != "product":
+            continue
+        url = str(item.get("url") or "")
+        if url and allowed_external_url(url, DMM_HOSTS):
+            try:
+                detail = cached_detail_for_url(url) or dmm.get_av_detail(item)
+                if detail:
+                    store_av_detail(item, detail)
+                    merged = {**item, **detail}
+            except Exception as exc:
+                app_log("warning", "subscription", "DMM/FANZA 女优作品详情校验失败", {
+                    "stage": "actress_dmm_detail_verify_error",
+                    "actress": actress_lookup_name(actress),
+                    "av_id": item.get("id", ""),
+                    "url": url,
+                    "error": str(exc),
+                })
+        if av_matches_actress(merged, actress):
+            verified.append(merged)
+    for item in items[detail_limit:]:
+        if not isinstance(item, dict):
+            continue
+        if actor_count_from_summary(item) > GLOBAL_MAX_COACTORS:
+            continue
+        if av_matches_actress(item, actress):
+            verified.append(item)
+    return verified
+
+
+def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, include_dmm_detail: bool = False) -> list[dict[str, Any]]:
+    actress_id = str(actress.get("id") or "").strip()
+    javdb_id = actress_javdb_lookup_id(actress)
+    lookup_name = actress_lookup_name(actress)
+    dmm_url = actress_dmm_lookup_url(actress)
+    cache_key = metadata_cache_key("v7", "actress_avs", actress_id, javdb_id, lookup_name, dmm_url)
+    cached = cache_get("actress_avs", cache_key) if cache_key else None
+    if isinstance(cached, list):
+        cached = filter_avs_by_actor_limit([item for item in cached if isinstance(item, dict)], context="actress_avs_cache")
+        remember_av_summaries(cached)
+        app_log("info", "metadata-cache", "女优作品列表命中 SQLite 缓存", {
+            "stage": "actress_avs_sqlite_cache_hit",
+            "actress_id": actress_id,
+            "actress": lookup_name,
+            "count": len(cached),
+        })
+        return cached[:limit]
+
+    dmm_results: list[dict[str, Any]] = []
+    for query in dmm_actress_queries(actress):
+        try:
+            results = dmm.get_actress_avs(query, limit=min(max(limit, 40), 100), include_detail=False)
+            dmm_results.extend(enrich_dmm_actress_items(results, {**actress, "dmm_name": query}, limit))
+        except Exception as exc:
+            app_log("warning", "subscription", "DMM/FANZA 女优名字搜索失败", {
+                "stage": "actress_avs_dmm_search_error",
+                "actress_id": actress_id,
+                "actress": lookup_name,
+                "query": query,
+                "error": str(exc),
+            })
+    if dmm_url and len(merge_av_sources(dmm_results)) < min(limit, 20):
+        try:
+            page_results = dmm.get_listing_avs(dmm_url, limit=min(max(limit, 40), 100), include_detail=False)
+            dmm_results.extend(enrich_dmm_actress_items(page_results, actress, limit))
+        except Exception as exc:
+            app_log("warning", "subscription", "DMM 女优专页作品读取失败，尝试按名字搜索", {
+                "stage": "actress_avs_dmm_url_error",
+                "actress_id": actress_id,
+                "actress": lookup_name,
+                "dmm_url": dmm_url,
+                "error": str(exc),
+            })
+    javlibrary_results: list[dict[str, Any]] = []
+    if len(merge_av_sources(dmm_results)) < min(limit, 20):
+        javlibrary_results = javlibrary_actor_avs(actress, limit, seed_avs=merge_av_sources(dmm_results)[:6])
+    javdb_results: list[dict[str, Any]] = []
+    if javdb_id and len(merge_av_sources(javdb_results, javlibrary_results, dmm_results)) < min(limit, 20):
+        try:
+            javdb_results = javdb.get_actress_avs(javdb_id, limit=limit)
+        except Exception as exc:
+            app_log("warning", "subscription", "JavDB 女优作品读取失败", {
+                "stage": "actress_avs_javdb_error",
+                "actress_id": actress_id,
+                "javdb_id": javdb_id,
+                "error": str(exc),
+            })
+    merged = filter_avs_by_actor_limit(merge_av_sources(javdb_results, javlibrary_results, dmm_results), context="actress_avs")
+    remember_av_summaries(merged)
+    if cache_key and merged:
+        cache_set("actress_avs", cache_key, [public_metadata_item(item) for item in merged], METADATA_ACTRESS_AVS_TTL)
+    app_log("info", "subscription", "女优作品数据源合并完成", {
+        "stage": "actress_avs_merged",
+        "actress_id": actress_id,
+        "actress": lookup_name,
+        "javdb_count": len(javdb_results),
+        "javlibrary_count": len(javlibrary_results),
+        "dmm_count": len(dmm_results),
+        "merged_count": len(merged),
+    })
+    return merged[:limit]
+
+
+def prepare_subscription_av_payload(av: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(av)
+    cached_detail = cached_av_detail(payload)
+    payload_url = str(payload.get("url") or "")
+    if cached_detail and not detail_needs_refresh(cached_detail, payload_url):
+        payload = {**payload, **cached_detail}
+        payload["detail"] = cached_detail.get("detail") if isinstance(cached_detail.get("detail"), dict) else cached_detail
+        return payload
+    if str(payload.get("source") or "").lower() == "dmm" and payload.get("url"):
+        try:
+            detail = cached_detail_for_url(str(payload.get("url") or "")) or dmm.get_av_detail(payload)
+            if detail:
+                store_av_detail(payload, detail)
+                payload = {**payload, **detail}
+                payload["detail"] = detail.get("detail") if isinstance(detail.get("detail"), dict) else detail
+        except Exception as exc:
+            app_log("warning", "subscription", "DMM 番号详情补全失败", {
+                "stage": "dmm_detail_enrich_error",
+                "av_id": payload.get("id", ""),
+                "url": payload.get("url", ""),
+                "error": str(exc),
+            })
+    return payload
+
+
+def fetch_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
+    query = str(q or "").strip()
+    if not query:
+        return []
+    if search_type == "actress":
+        javdb_results: list[dict[str, Any]] = []
+        dmm_results: list[dict[str, Any]] = []
+        javlibrary_results: list[dict[str, Any]] = []
+        dmm_works: list[dict[str, Any]] = []
+        try:
+            dmm_works = dmm.get_actress_avs(query, limit=12, include_detail=False)
+            dmm_works = enrich_dmm_actress_items(dmm_works, {"id": query, "name": query, "dmm_name": query}, 12)
+            dmm_works = filter_avs_by_actor_limit(dmm_works, context="actress_search_latest")
+            remember_av_summaries(dmm_works)
+            if dmm_works:
+                dmm_results = [{
+                    "id": query,
+                    "name": query,
+                    "dmm_name": query,
+                    "source": "dmm",
+                    "latest": dmm_works[0],
+                    "latest_cover": dmm_works[0].get("cover", ""),
+                    "latest_av_id": dmm_works[0].get("id", ""),
+                    "latest_title": dmm_works[0].get("title", ""),
+                    "latest_date": dmm_works[0].get("date") or dmm_works[0].get("release_date") or "",
+                }]
+        except Exception as exc:
+            app_log("warning", "subscription", "DMM/FANZA 女优搜索失败", {
+                "stage": "actress_search_dmm_error",
+                "query": query,
+                "error": str(exc),
+            })
+        if not dmm_results:
+            jl_works = javlibrary_actor_avs({"id": query, "name": query}, 12, seed_avs=dmm_works[:3])
+            if jl_works:
+                remember_av_summaries(jl_works)
+                javlibrary_results = [{
+                    "id": query,
+                    "name": query,
+                    "source": "javlibrary",
+                    "latest": jl_works[0],
+                    "latest_cover": jl_works[0].get("cover", ""),
+                    "latest_av_id": jl_works[0].get("id", ""),
+                    "latest_title": jl_works[0].get("title", ""),
+                    "latest_date": jl_works[0].get("date") or jl_works[0].get("release_date") or "",
+                }]
+        if not dmm_results and not javlibrary_results:
+            try:
+                javdb_results = javdb.search_actress(query)
+            except Exception as exc:
+                app_log("warning", "subscription", "JavDB 女优搜索失败", {
+                    "stage": "actress_search_javdb_error",
+                    "query": query,
+                    "error": str(exc),
+                })
+        results = merge_actress_sources(javdb_results + javlibrary_results, dmm_results)
+        return [public_metadata_item(item) for item in results if isinstance(item, dict)]
+    dmm_avs: list[dict[str, Any]] = []
+    javdb_avs: list[dict[str, Any]] = []
+    try:
+        dmm_avs = dmm.search_av(query, limit=12, include_detail=True)
+    except Exception as exc:
+        app_log("warning", "subscription", "DMM/FANZA 番号搜索失败", {"stage": "av_search_dmm_error", "query": query, "error": str(exc)})
+    if not dmm_avs:
+        try:
+            javdb_avs = javdb.search_av(query)
+        except Exception as exc:
+            app_log("warning", "subscription", "JavDB 番号搜索失败", {"stage": "av_search_javdb_error", "query": query, "error": str(exc)})
+    results = filter_avs_by_actor_limit(merge_av_sources(dmm_avs, javdb_avs), context="av_search")
+    remember_av_summaries(results)
+    return [public_metadata_item(item) for item in results]
+
+
+def cached_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
+    query = str(q or "").strip()
+    safe_type = "actress" if search_type == "actress" else "av"
+    key = metadata_cache_key("v6", safe_type, query)
+    result = cached_metadata(
+        "subscription_search",
+        key,
+        METADATA_SEARCH_TTL,
+        lambda: fetch_subscription_search(query, safe_type),
+    )
+    return result if isinstance(result, list) else []
+
+
+def cached_actress_profile(actress_id: str) -> dict[str, Any]:
+    key = metadata_cache_key("profile", actress_id)
+    result = cached_metadata(
+        "actress_profile",
+        key,
+        METADATA_PROFILE_TTL,
+        lambda: javdb.get_actress_profile(actress_id) or {},
+    )
+    return result if isinstance(result, dict) else {}
+
+
+def cached_actress_identity(query: str) -> dict[str, Any]:
+    value = str(query or "").strip()
+    if not value:
+        return {}
+    candidates = cached_subscription_search(value, "actress")
+    if not candidates:
+        return {}
+    value_key = value.lower()
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").strip().lower() == value_key or str(item.get("id") or "").strip().lower() == value_key:
+            return item
+    return next((item for item in candidates if isinstance(item, dict)), {})
+
+
+def maker_name_for_listing_url(page_url: str, explicit_name: str = "") -> str:
+    name = str(explicit_name or "").strip()
+    if name:
+        return name
+    target_url = str(page_url or "").strip()
+    if not target_url:
+        return ""
+    for maker in get_subscription_service().get_settings().get("pinned_makers") or []:
+        if not isinstance(maker, dict):
+            continue
+        if str(maker.get("url") or "").strip() == target_url:
+            return str(maker.get("name") or "").strip()
+    return ""
+
+
+def dmm_listing_urls_for_maker(maker_name: str) -> list[str]:
+    key = str(maker_name or "").strip().lower()
+    return list(DMM_MAKER_LIST_URLS.get(key, []))
+
+
+def dmm_search_terms_for_maker(maker_name: str) -> list[str]:
+    key = str(maker_name or "").strip().lower()
+    terms = list(DMM_MAKER_SEARCH_TERMS.get(key, ()))
+    if maker_name and maker_name not in terms:
+        terms.append(maker_name)
+    return [term for term in terms if str(term or "").strip()]
+
+
+def dmm_detail_matches_maker(item: dict[str, Any], maker_name: str) -> bool:
+    maker = str(item.get("maker") or "").strip().lower()
+    if not maker:
+        nested = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+        maker = str(nested.get("maker") or "").strip().lower()
+    if not maker:
+        return True
+    key = str(maker_name or "").strip().lower()
+    aliases = DMM_MAKER_ALIASES.get(key, (key,))
+    return any(str(alias or "").strip().lower() and str(alias or "").strip().lower() in maker for alias in aliases)
+
+
+def dmm_primary_label_aliases(maker_name: str) -> tuple[str, ...]:
+    key = str(maker_name or "").strip().lower()
+    return DMM_MAKER_PRIMARY_LABELS.get(key, ())
+
+
+def dmm_item_label(item: dict[str, Any]) -> str:
+    label = str(item.get("label") or "").strip()
+    if label:
+        return label
+    nested = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    return str(nested.get("label") or "").strip()
+
+
+def dmm_detail_matches_primary_label(item: dict[str, Any], maker_name: str) -> bool:
+    label = dmm_item_label(item).lower()
+    if not label:
+        return False
+    return any(str(alias or "").strip().lower() and str(alias or "").strip().lower() in label for alias in dmm_primary_label_aliases(maker_name))
+
+
+def prioritize_dmm_maker_labels(items: list[dict[str, Any]], maker_name: str, limit: int) -> list[dict[str, Any]]:
+    if not dmm_primary_label_aliases(maker_name):
+        return items
+    preferred: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in merge_av_sources(items):
+        av_id = canonical_av_id(item.get("id"))
+        if not av_id or av_id in seen:
+            continue
+        seen.add(av_id)
+        if dmm_detail_matches_primary_label(item, maker_name):
+            preferred.append({**item, "source_scope": "label"})
+        else:
+            fallback.append({**item, "source_scope": "maker"})
+    combined = preferred if len(preferred) >= limit else preferred + fallback
+    return combined
+
+
+def sort_maker_listing_items(items: list[dict[str, Any]], maker_name: str) -> list[dict[str, Any]]:
+    if not dmm_primary_label_aliases(maker_name):
+        return sorted(items, key=lambda item: (av_date_key(item), str(item.get("id") or "")), reverse=True)
+
+    def key(item: dict[str, Any]) -> tuple[int, str, str]:
+        label_rank = 1 if str(item.get("source_scope") or "").lower() == "label" or dmm_detail_matches_primary_label(item, maker_name) else 0
+        return (label_rank, av_date_key(item), str(item.get("id") or ""))
+
+    return sorted(items, key=key, reverse=True)
+
+
+def enrich_dmm_maker_items(items: list[dict[str, Any]], maker_name: str, limit: int) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    target_limit = max(1, min(limit, len(items)))
+    enriched: list[dict[str, Any]] = []
+    for item in items[:target_limit]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        detail = {}
+        if url and allowed_external_url(url, DMM_HOSTS):
+            try:
+                detail = cached_detail_for_url(url) or dmm.get_av_detail(item)
+                if detail:
+                    store_av_detail(item, detail)
+            except Exception as exc:
+                app_log("warning", "maker", "DMM/FANZA 厂牌详情校验失败，保留列表摘要", {
+                    "stage": "maker_dmm_detail_enrich_error",
+                    "maker": maker_name,
+                    "av_id": item.get("id", ""),
+                    "url": url,
+                    "error": str(exc),
+                })
+        merged = {**item, **detail} if detail else item
+        if dmm_detail_matches_maker(merged, maker_name):
+            enriched.append(merged)
+    return prioritize_dmm_maker_labels(enriched, maker_name, limit)
+
+
+def fetch_listing_sources(page_url: str, maker_name: str, safe_limit: int, *, force_refresh: bool) -> list[dict[str, Any]]:
+    javdb_results: list[dict[str, Any]] = []
+    dmm_results: list[dict[str, Any]] = []
+    javlibrary_results: list[dict[str, Any]] = []
+    dmm_limit = min(80, max(safe_limit * 3, safe_limit + 14))
+    if allowed_external_url(page_url, DMM_HOSTS):
+        try:
+            dmm_results.extend(dmm.get_listing_avs(page_url, limit=dmm_limit))
+        except Exception as exc:
+            app_log("warning", "maker", "DMM/FANZA 厂牌页面读取失败", {
+                "stage": "maker_dmm_page_listing_error",
+                "url": page_url,
+                "error": str(exc),
+            })
+    mapped_dmm_urls = dmm_listing_urls_for_maker(maker_name)
+    for dmm_url in mapped_dmm_urls:
+        try:
+            dmm_results.extend(dmm.get_listing_avs(dmm_url, limit=dmm_limit))
+        except Exception as exc:
+            app_log("warning", "maker", "DMM/FANZA 厂牌映射读取失败", {
+                "stage": "maker_dmm_mapped_listing_error",
+                "maker": maker_name,
+                "url": dmm_url,
+                "error": str(exc),
+            })
+    if not mapped_dmm_urls or len(merge_av_sources(dmm_results)) < safe_limit:
+        for term in dmm_search_terms_for_maker(maker_name):
+            try:
+                dmm_results.extend(dmm.get_maker_avs(term, limit=dmm_limit))
+            except Exception as exc:
+                app_log("warning", "maker", "DMM/FANZA 厂牌发售读取失败", {
+                    "stage": "maker_dmm_listing_error",
+                    "maker": maker_name,
+                    "term": term,
+                    "error": str(exc),
+                })
+    if any("/mono/dvd/" in str(item.get("url") or "") for item in dmm_results):
+        dmm_results = [item for item in dmm_results if "/mono/dvd/" in str(item.get("url") or "")]
+    if maker_name:
+        dmm_results = enrich_dmm_maker_items(dmm_results, maker_name, max(safe_limit * 2, safe_limit + 8))
+    if len(merge_av_sources(dmm_results)) < safe_limit:
+        javlibrary_results = javlibrary_maker_avs(maker_name, safe_limit)
+    if allowed_external_url(page_url, JAVDB_HOSTS) and len(merge_av_sources(javdb_results, javlibrary_results, dmm_results)) < safe_limit:
+        try:
+            javdb_results = javdb.get_listing(page_url, limit=safe_limit, force_refresh=force_refresh)
+        except Exception as exc:
+            app_log("warning", "maker", "JavDB 厂牌发售读取失败", {
+                "stage": "maker_javdb_listing_error",
+                "url": page_url,
+                "error": str(exc),
+            })
+    results = [hydrate_av_with_cached_summary(item) for item in merge_av_sources(javdb_results, javlibrary_results, dmm_results)]
+    results = filter_avs_by_actor_limit(results, context="maker_listing")
+    results = sort_maker_listing_items(results, maker_name)
+    app_log("info", "maker", "厂牌发售数据源合并完成", {
+        "stage": "maker_listing_merged",
+        "maker": maker_name,
+        "javdb_count": len(javdb_results),
+        "javlibrary_count": len(javlibrary_results),
+        "dmm_count": len(dmm_results),
+        "merged_count": len(results),
+    })
+    return results
+
+
+def cached_listing(page_url: str, limit: int = 60, *, force_refresh: bool = False, maker_name: str = "") -> list[dict[str, Any]]:
+    url = str(page_url or "").strip()
+    if not url:
+        return []
+    safe_limit = max(1, min(60, int(limit or 60)))
+    resolved_maker_name = maker_name_for_listing_url(url, maker_name)
+    key = hashlib.sha256(f"v15|{url}|{resolved_maker_name}".encode("utf-8")).hexdigest()
+    if force_refresh:
+        results = fetch_listing_sources(url, resolved_maker_name, safe_limit, force_refresh=True)
+        if results:
+            cache_set("listing", key, [public_metadata_item(item) for item in results], METADATA_LISTING_TTL)
+            remember_av_summaries(results)
+        return results[:safe_limit]
+    cached = cache_get("listing", key)
+    if isinstance(cached, list) and len(cached) >= safe_limit:
+        result = cached
+        app_log("info", "metadata-cache", "厂牌发售命中 SQLite 缓存", {
+            "stage": "listing_sqlite_cache_hit",
+            "maker": resolved_maker_name,
+            "count": len(cached),
+            "limit": safe_limit,
+        })
+    else:
+        result = fetch_listing_sources(url, resolved_maker_name, safe_limit, force_refresh=False)
+        if result:
+            cache_set("listing", key, [public_metadata_item(item) for item in result], METADATA_LISTING_TTL)
+    items = filter_avs_by_actor_limit(result if isinstance(result, list) else [], context="listing_cache")
+    remember_av_summaries([item for item in items if isinstance(item, dict)])
+    return items[:safe_limit]
+
+
+def cached_detail_for_url(url: str) -> dict[str, Any]:
+    target_url = str(url or "").strip()
+    if not target_url:
+        return {}
+    cached = cached_av_detail(target_url)
+    if cached and not detail_needs_refresh(cached, target_url):
+        app_log("info", "metadata-cache", "番号详情命中 SQLite 缓存", {"stage": "av_detail_sqlite_cache_hit", "url": target_url})
+        return cached
+    if cached:
+        app_log("info", "metadata-cache", "DMM 详情缓存缺少女优字段，刷新详情", {"stage": "dmm_detail_cache_refresh", "url": target_url})
+
+    summary = {}
+    for item in cache_get("subscription_search", metadata_cache_key("av", target_url), allow_stale=True) or []:
+        if isinstance(item, dict) and str(item.get("url") or "").strip() == target_url:
+            summary = item
+            break
+
+    def fetch() -> dict[str, Any]:
+        if allowed_external_url(target_url, DMM_HOSTS):
+            return dmm.get_av_detail(summary or target_url)
+        return javdb.get_av_detail(target_url)
+
+    detail = fetch()
+    if isinstance(detail, dict) and detail:
+        store_av_detail({"url": target_url, **summary}, detail)
+        return detail
+    stale = cache_get("av_detail", detail_cache_keys(target_url)[0], allow_stale=True) if detail_cache_keys(target_url) else None
+    return stale if isinstance(stale, dict) else {}
+
+
+def estimate_actor_count_from_title(title: object) -> int:
+    text = str(title or "")
+    counts: list[int] = []
+    for match in re.finditer(r"(?<!\d)(\d{1,3})\s*(?:人|名)", text):
+        try:
+            counts.append(int(match.group(1)))
+        except ValueError:
+            continue
+    multi_tokens = (
+        "BEST",
+        "ベスト",
+        "総集編",
+        "総集",
+        "合集",
+        "合辑",
+        "オールスター",
+        "ハーレム",
+        "大乱交",
+        "乱交",
+        "複数話",
+        "多人",
+        "共演",
+        "全員",
+        "スペシャルコラボ",
+        "コラボ",
+        "集めました",
+        "まとめ",
+        "厳選",
+        "COLLECTION",
+        "コレクション",
+        "タイトル",
+        "連発",
+    )
+    if any(token.lower() in text.lower() for token in multi_tokens):
+        counts.append(GLOBAL_MAX_COACTORS + 1)
+    return max(counts) if counts else 0
+
+
+def actor_count_for_limit(av: dict[str, Any], actors: list[dict[str, str]]) -> int:
+    return max(len(actors), estimate_actor_count_from_title(av.get("title")))
+
+
+def actor_count_from_summary(av: dict[str, Any]) -> int:
+    actors = normalize_actor_items(av.get("actors") or av.get("actresses") or av.get("actress"))
+    return actor_count_for_limit(av, actors)
+
+
+def av_within_global_actor_limit(av: dict[str, Any], *, max_coactors: int | None = None) -> bool:
+    safe_max = max(1, min(GLOBAL_MAX_COACTORS, int(max_coactors or configured_max_coactors())))
+    return actor_count_from_summary(av) <= safe_max
+
+
+def filter_avs_by_actor_limit(items: list[dict[str, Any]], *, context: str = "", max_coactors: int | None = None) -> list[dict[str, Any]]:
+    safe_max = max(1, min(GLOBAL_MAX_COACTORS, int(max_coactors or configured_max_coactors())))
+    result: list[dict[str, Any]] = []
+    skipped = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        actor_count = actor_count_from_summary(item)
+        if actor_count > safe_max:
+            skipped += 1
+            continue
+        result.append(item)
+    if skipped:
+        app_log("info", "subscription", "已按全局共演人数过滤番号", {
+            "stage": "global_actor_limit_filter",
+            "context": context,
+            "max_coactors": safe_max,
+            "kept": len(result),
+            "skipped": skipped,
+        })
+    return result
+
+
+def subscribed_avs_with_global_filter(context: str = "subscribed_av") -> list[dict[str, Any]]:
+    return filter_avs_by_actor_limit(get_subscription_service().get_subscribed_av(), context=context)
+
+
+def dirty_subscription_candidates() -> list[dict[str, Any]]:
+    dirty: list[dict[str, Any]] = []
+    max_coactors = configured_max_coactors()
+    for item in get_subscription_service().get_subscribed_av():
+        if not isinstance(item, dict):
+            continue
+        actor_count = actor_count_from_summary(item)
+        if actor_count > max_coactors:
+            dirty.append({
+                "id": item.get("id", ""),
+                "title": item.get("title", ""),
+                "date": item.get("date", ""),
+                "actor_count": actor_count,
+                "max_coactors": max_coactors,
+                "reason": f"超过全局 {max_coactors} 人共演限制",
+            })
+    return dirty
+
+
+def cleanup_dirty_subscriptions(*, dry_run: bool = True) -> dict[str, Any]:
+    candidates = dirty_subscription_candidates()
+    removed: list[dict[str, Any]] = []
+    if not dry_run:
+        service = get_subscription_service()
+        for item in candidates:
+            av_id = str(item.get("id") or "")
+            if av_id and service.unsubscribe_av(av_id):
+                removed.append(item)
+        app_log("info", "subscription", "历史脏订阅清理完成", {
+            "stage": "dirty_subscription_cleanup",
+            "candidates": len(candidates),
+            "removed": len(removed),
+        })
+    return {
+        "dry_run": dry_run,
+        "candidates": candidates,
+        "removed": removed,
+        "candidate_count": len(candidates),
+        "removed_count": len(removed),
+    }
+
+
 def poll_subscriptions_once() -> dict[str, Any]:
     service = get_subscription_service()
-    sub_settings = service.get_settings()
-    max_coactors = int(sub_settings.get("max_coactors") or 2)
+    max_coactors = configured_max_coactors()
     actresses = [item for item in service.get_subscribed_actresses() if item.get("poll_enabled", True)]
     added: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -2460,7 +3975,7 @@ def poll_subscriptions_once() -> dict[str, Any]:
             continue
         new_count = 0
         try:
-            avs = javdb.get_actress_avs(actress_id, limit=100)
+            avs = subscription_avs_for_actress(actress, limit=100)
             since_date = str(actress.get("since_date") or "")
             for av in avs:
                 if not date_is_after(str(av.get("date") or ""), since_date):
@@ -2471,11 +3986,15 @@ def poll_subscriptions_once() -> dict[str, Any]:
                 if not actress.get("include_vr", False) and is_vr_work(av):
                     app_log("info", "subscription", "跳过 VR 女优作品", {"av_id": av_id, "actress_id": actress_id})
                     continue
-                actors = javdb.get_av_actresses(str(av.get("url") or "")) if av.get("url") else []
-                if actors and len(actors) > max_coactors:
-                    app_log("info", "subscription", "跳过超过共演人数限制的番号", {"av_id": av_id, "actor_count": len(actors)})
+                actors = resolve_av_actors_for_limit(av)
+                actor_count = actor_count_for_limit(av, actors)
+                if actor_count > max_coactors:
+                    app_log("info", "subscription", "跳过超过共演人数限制的番号", {"av_id": av_id, "actor_count": actor_count, "max_coactors": max_coactors})
                     continue
-                payload = dict(av)
+                payload = prepare_subscription_av_payload(av)
+                if not av_within_global_actor_limit(payload, max_coactors=max_coactors):
+                    app_log("info", "subscription", "详情补全后跳过超过共演人数限制的番号", {"av_id": av_id, "max_coactors": max_coactors})
+                    continue
                 payload["auto_subscribed"] = True
                 payload["source_actress_id"] = actress_id
                 payload["source_actress_name"] = actress.get("name", "")
@@ -2484,11 +4003,25 @@ def poll_subscriptions_once() -> dict[str, Any]:
                 saved = service.subscribe_av(payload)
                 added.append(saved)
                 app_log("info", "subscription", "自动订阅新增番号", {"av_id": av_id, "status": saved.get("status"), "actress": actress.get("name", "")})
+                send_notification_event("actress_new_av", {
+                    "status": saved.get("status") or "subscribed",
+                    "title": str(saved.get("title") or av_id),
+                    "detail": f"{actress.get('name', '')} 发现新番号 {av_id}",
+                    "av_id": av_id,
+                    "actress": actress.get("name", ""),
+                    "release_date": av.get("date", ""),
+                })
                 new_count += 1
             service.mark_actress_polled(actress_id, new_count)
         except Exception as exc:
             errors.append(f"{actress.get('name') or actress_id}: {exc}")
             app_log("error", "subscription", "女优轮询失败", {"actress_id": actress_id, "error": str(exc)})
+            send_notification_event("task_failed", {
+                "status": "failed",
+                "title": "女优订阅轮询失败",
+                "detail": f"{actress.get('name') or actress_id}: {exc}",
+                "actress": actress.get("name", ""),
+            })
     service.mark_global_poll()
     app_log("info", "subscription", "订阅轮询完成", {"checked": len(actresses), "added": len(added), "errors": len(errors)})
     return {"checked": len(actresses), "added": added, "errors": errors}
@@ -2496,8 +4029,7 @@ def poll_subscriptions_once() -> dict[str, Any]:
 
 def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool = False) -> dict[str, Any]:
     service = get_subscription_service()
-    sub_settings = service.get_settings()
-    max_coactors = int(sub_settings.get("max_coactors") or 2)
+    max_coactors = configured_max_coactors()
     actress_id = str(actress.get("id") or "")
     since_date = str(actress.get("since_date") or "")
     added: list[dict[str, Any]] = []
@@ -2513,7 +4045,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
         "include_vr": bool(actress.get("include_vr", False)),
     })
     try:
-        avs = javdb.get_actress_avs(actress_id, limit=100)
+        avs = subscription_avs_for_actress(actress, limit=100, include_dmm_detail=True)
     except Exception as exc:
         app_log("error", "subscription", "读取女优作品失败", {"stage": "actress_subscribe_latest_error", "actress_id": actress_id, "error": str(exc)})
         return {"added": [], "skipped": [], "errors": [str(exc)]}
@@ -2543,11 +4075,15 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
             skipped.append({"id": av_id, "reason": "已订阅"})
             continue
         try:
-            actors = javdb.get_av_actresses(str(av.get("url") or ""), include_profiles=False) if av.get("url") else []
-            if actors and len(actors) > max_coactors:
-                skipped.append({"id": av_id, "reason": f"共演人数 {len(actors)} 超过限制"})
+            actors = resolve_av_actors_for_limit(av)
+            actor_count = actor_count_for_limit(av, actors)
+            if actor_count > max_coactors:
+                skipped.append({"id": av_id, "reason": f"共演人数 {actor_count} 超过限制"})
                 continue
-            payload = dict(av)
+            payload = prepare_subscription_av_payload(av)
+            if not av_within_global_actor_limit(payload, max_coactors=max_coactors):
+                skipped.append({"id": av_id, "reason": f"详情补全后共演人数超过 {max_coactors}"})
+                continue
             payload["auto_subscribed"] = True
             payload["source_actress_id"] = actress_id
             payload["source_actress_name"] = actress.get("name", "")
@@ -2563,10 +4099,33 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                 "release_date": release_date,
                 "status": saved.get("status"),
             })
+            send_notification_event("av_subscribed", {
+                "status": saved.get("status") or "subscribed",
+                "title": str(saved.get("title") or av_id),
+                "detail": f"已订阅 {av_id}：{saved.get('title') or ''}".strip(),
+                "av_id": av_id,
+                "actress": actress.get("name", ""),
+                "release_date": release_date,
+            })
             if saved.get("status") != "in_library":
                 download_av_from_mteam(saved)
+            else:
+                send_notification_event("jellyfin_in_library", {
+                    "status": "in_library",
+                    "title": str(saved.get("title") or av_id),
+                    "detail": f"{av_id} 已在 Jellyfin 媒体库中",
+                    "av_id": av_id,
+                    "path": saved.get("jellyfin_path", ""),
+                })
         except Exception as exc:
             errors.append(f"{av_id}: {exc}")
+            send_notification_event("task_failed", {
+                "status": "failed",
+                "title": "女优最新作品订阅失败",
+                "detail": f"{av_id}: {exc}",
+                "av_id": av_id,
+                "actress": actress.get("name", ""),
+            })
     service.mark_actress_polled(actress_id, len(added))
     app_log("info", "subscription", "一键订阅女优最新作品完成", {
         "stage": "actress_subscribe_latest_done",
@@ -2581,7 +4140,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
 def refresh_library_status_for_subscriptions(limit: int = 80) -> int:
     service = get_subscription_service()
     changed = 0
-    items = [item for item in service.get_subscribed_av() if item.get("status") != "in_library"][:limit]
+    items = [item for item in subscribed_avs_with_global_filter("library_refresh") if item.get("status") != "in_library"][:limit]
     for item in items:
         updated = refresh_subscription_library_status(item)
         if updated.get("status") == "in_library":
@@ -2593,7 +4152,7 @@ def refresh_library_status_for_subscriptions(limit: int = 80) -> int:
 
 def download_pending_subscriptions() -> dict[str, Any]:
     service = get_subscription_service()
-    items = [item for item in service.get_subscribed_av() if item.get("status", "pending") == "pending"]
+    items = [item for item in subscribed_avs_with_global_filter("bulk_download") if item.get("status", "pending") == "pending"]
     app_log("info", "download", "开始一键下载订阅中番号", {"stage": "bulk_download_start", "count": len(items)})
     results = [download_av_from_mteam(item) for item in items]
     sent = len([item for item in results if item.get("status") in {"ok", "exists", "sent"}])
@@ -2605,7 +4164,7 @@ def download_pending_wash_subscriptions() -> dict[str, Any]:
     service = get_subscription_service()
     expired = expire_wash_requests_with_postprocess()
     items = [
-        item for item in service.get_subscribed_av()
+        item for item in subscribed_avs_with_global_filter("wash_bulk_download")
         if isinstance(item.get("wash"), dict)
         and item.get("wash", {}).get("mode") in {"chinese", "4k"}
         and item.get("wash", {}).get("status") in {"requested", "error"}
@@ -2646,7 +4205,7 @@ def refresh_pinned_makers() -> dict[str, Any]:
         name = str(maker.get("name") or "")
         url = str(maker.get("url") or "")
         try:
-            results = javdb.get_listing(url, force_refresh=True)
+            results = cached_listing(url, force_refresh=False, maker_name=name)
             refreshed.append({"name": name, "url": url, "count": len(results)})
             app_log("info", "maker", "厂牌刷新完成", {"stage": "maker_refresh_item_done", "name": name, "count": len(results)})
         except Exception as exc:
@@ -2656,14 +4215,60 @@ def refresh_pinned_makers() -> dict[str, Any]:
     return {"refreshed": refreshed, "errors": errors}
 
 
+def freeze_released_asset_cache() -> dict[str, Any]:
+    service = get_subscription_service()
+    checked = 0
+    frozen = 0
+    for row in service.list_metadata_cache("av_summary", limit=50000):
+        item = row.get("data") if isinstance(row.get("data"), dict) else {}
+        if not item:
+            continue
+        av_id = canonical_av_id(item.get("id"))
+        if not av_id or not metadata_item_released(item):
+            continue
+        checked += 1
+        asset = service.get_asset_cache(av_id, "cover")
+        if asset and not asset.get("immutable") and service.set_asset_immutable(av_id, "cover", True):
+            frozen += 1
+    app_log("info", "asset-cache", "已发售封面资产冻结完成", {
+        "stage": "asset_freeze_released",
+        "checked": checked,
+        "frozen": frozen,
+    })
+    return {"checked": checked, "frozen": frozen}
+
+
+def maintain_asset_cache(max_bytes: int | None = None) -> dict[str, Any]:
+    service = get_subscription_service()
+    if max_bytes is None:
+        try:
+            max_mb = int(float(service.get_settings().get("asset_cache_max_mb") or 2048))
+            max_bytes = max(0, max_mb * 1024 * 1024)
+        except (TypeError, ValueError):
+            max_bytes = ASSET_CACHE_MAX_BYTES
+    freeze_result = freeze_released_asset_cache()
+    cleanup_result = service.cleanup_asset_cache(max_bytes)
+    stats = service.asset_cache_stats()
+    result = {
+        "freeze": freeze_result,
+        "cleanup": cleanup_result,
+        "asset_cache": stats,
+        "max_bytes": max_bytes,
+    }
+    app_log("info", "asset-cache", "资产缓存维护完成", {"stage": "asset_maintenance_done", **result})
+    return result
+
+
 def subscription_tasks_payload() -> list[dict[str, Any]]:
     sub_settings = get_subscription_service().get_settings()
+    last_results = sub_settings.get("last_task_results") if isinstance(sub_settings.get("last_task_results"), dict) else {}
     return [
         {
             "id": "actress_poll",
             "name": "女优订阅轮询",
             "cron": sub_settings.get("actress_cron") or "0 21 * * *",
             "last_run_at": sub_settings.get("last_poll_at") or 0,
+            "last_result": last_results.get("actress_poll") or {},
             "description": "检查已订阅女优在限制日期之后的新番号。",
         },
         {
@@ -2671,6 +4276,7 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
             "name": "番号订阅下载",
             "cron": sub_settings.get("av_cron") or "0 22 * * *",
             "last_run_at": sub_settings.get("last_av_poll_at") or 0,
+            "last_result": last_results.get("av_download") or {},
             "description": "为订阅中的番号检查 Jellyfin、搜索 MTeam 并推送 qBittorrent。",
         },
         {
@@ -2678,6 +4284,7 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
             "name": "洗版轮询",
             "cron": sub_settings.get("wash_cron") or "0 22 * * *",
             "last_run_at": sub_settings.get("last_wash_poll_at") or 0,
+            "last_result": last_results.get("wash_download") or {},
             "description": "为等待中的洗版番号搜索中文或 4K 资源并推送 qBittorrent。",
         },
         {
@@ -2685,6 +4292,7 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
             "name": "后处理下载检查",
             "cron": sub_settings.get("postprocess_cron") or "*/5 * * * *",
             "last_run_at": sub_settings.get("last_postprocess_poll_at") or 0,
+            "last_result": last_results.get("postprocess_qb") or {},
             "description": "轮询系统绑定的 qB 种子，确认下载完成并进入转码/字幕队列。",
         },
         {
@@ -2692,7 +4300,16 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
             "name": "厂牌发售更新",
             "cron": sub_settings.get("maker_cron") or "0 */6 * * *",
             "last_run_at": sub_settings.get("last_maker_poll_at") or 0,
+            "last_result": last_results.get("maker_refresh") or {},
             "description": "刷新订阅设置中常驻厂牌的最近发售缓存。",
+        },
+        {
+            "id": "asset_maintenance",
+            "name": "资产缓存维护",
+            "cron": sub_settings.get("asset_cron") or "15 3 * * *",
+            "last_run_at": sub_settings.get("last_asset_poll_at") or 0,
+            "last_result": last_results.get("asset_maintenance") or {},
+            "description": "冻结已发售番号封面，清理缺失记录，并按容量回收非冻结资产。",
         },
     ]
 
@@ -2700,19 +4317,30 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
 def run_subscription_task(task_id: str, *, minute_key: str | None = None) -> dict[str, Any]:
     service = get_subscription_service()
     app_log("info", "task", "开始执行定时任务", {"stage": "task_start", "task_id": task_id})
-    if task_id == "actress_poll":
-        result = poll_subscriptions_once()
-    elif task_id == "av_download":
-        result = download_pending_subscriptions()
-    elif task_id == "wash_download":
-        result = download_pending_wash_subscriptions()
-    elif task_id == "postprocess_qb":
-        result = poll_postprocess_once()
-    elif task_id == "maker_refresh":
-        result = refresh_pinned_makers()
-    else:
-        raise HTTPException(status_code=404, detail="未知订阅任务")
-    service.mark_task_poll(task_id, minute_key)
+    try:
+        if task_id == "actress_poll":
+            result = poll_subscriptions_once()
+        elif task_id == "av_download":
+            result = download_pending_subscriptions()
+        elif task_id == "wash_download":
+            result = download_pending_wash_subscriptions()
+        elif task_id == "postprocess_qb":
+            result = poll_postprocess_once()
+        elif task_id == "maker_refresh":
+            result = refresh_pinned_makers()
+        elif task_id == "asset_maintenance":
+            result = maintain_asset_cache()
+        else:
+            raise HTTPException(status_code=404, detail="未知订阅任务")
+    except Exception as exc:
+        send_notification_event("task_failed", {
+            "status": "failed",
+            "title": "定时任务执行失败",
+            "detail": f"{task_id}: {exc}",
+            "task_id": task_id,
+        })
+        raise
+    service.mark_task_poll(task_id, minute_key, result)
     app_log("info", "task", "定时任务执行完成", {"stage": "task_done", "task_id": task_id})
     return result
 
@@ -2731,6 +4359,7 @@ def subscription_poll_loop() -> None:
                     ("wash_download", "wash_cron", "last_wash_poll_minute"),
                     ("postprocess_qb", "postprocess_cron", "last_postprocess_poll_minute"),
                     ("maker_refresh", "maker_cron", "last_maker_poll_minute"),
+                    ("asset_maintenance", "asset_cron", "last_asset_poll_minute"),
                 )
                 for task_id, cron_key, last_minute_key in schedules:
                     if sub_settings.get(last_minute_key) != minute_key and cron_matches(str(sub_settings.get(cron_key) or ""), now):
@@ -2804,6 +4433,14 @@ def refresh_subscription_library_status(av: dict[str, Any]) -> dict[str, Any]:
             "jellyfin_item_name": probe.get("jellyfin_item_name", ""),
             "jellyfin_path": probe.get("jellyfin_path", ""),
         })
+        if str(av.get("status") or "") != "in_library":
+            send_notification_event("jellyfin_in_library", {
+                "status": "in_library",
+                "title": str(probe.get("title") or probe.get("id") or ""),
+                "detail": f"{probe.get('id', '')} 已在 Jellyfin 媒体库中",
+                "av_id": probe.get("id", ""),
+                "path": probe.get("jellyfin_path", ""),
+            })
         return saved or probe
     return av
 
@@ -2997,11 +4634,25 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         app_log("error", "mteam", "MTeam 未找到资源", {"stage": "mteam_search_empty", "av_id": av_id, "message": message, "raw_count": len(torrents_all)})
         if save_to_subscription:
             service.update_av_download(av_id, {"download_status": "not_found", "download_message": message})
+        send_notification_event("task_failed", {
+            "status": "not_found",
+            "title": f"MTeam 未找到资源：{av_id}",
+            "detail": message,
+            "av_id": av_id,
+        })
         return {"av_id": av_id, "status": "not_found", "message": message}
 
     torrent = choose_mteam_torrent(av_id, torrents)
     torrent_id = str(torrent.get("id") or "")
     torrent_title = str(torrent.get("title") or "")
+    send_notification_event("mteam_found", {
+        "status": "found",
+        "title": str(av.get("title") or av_id),
+        "detail": f"{av_id} 命中 MTeam：{torrent_title}",
+        "av_id": av_id,
+        "torrent_id": torrent_id,
+        "torrent_title": torrent_title,
+    })
     if save_to_subscription:
         post_task = create_subscription_postprocess_task(av)
         get_postprocess_service().update_task(
@@ -3038,6 +4689,13 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
                 error_code="mteam_missing_id",
                 error_message=message,
             )
+        send_notification_event("task_failed", {
+            "status": "failed",
+            "title": f"MTeam 资源异常：{av_id}",
+            "detail": message,
+            "av_id": av_id,
+            "torrent_title": torrent_title,
+        })
         return {"av_id": av_id, "status": "error", "message": message}
 
     app_log("info", "mteam", "开始下载 MTeam 种子文件", {"stage": "mteam_torrent_download_start", "av_id": av_id, "torrent_id": torrent_id, "title": torrent_title})
@@ -3067,6 +4725,14 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
                 "torrent_id": torrent_id,
                 "hash": qb_result.get("hash", ""),
             })
+            send_notification_event("task_failed", {
+                "status": "conflict",
+                "title": f"下载链路冲突：{av_id}",
+                "detail": message,
+                "av_id": av_id,
+                "torrent_id": torrent_id,
+                "torrent_title": torrent_title,
+            })
             return {"av_id": av_id, "status": "conflict", "message": message, "torrent": torrent}
         qb_accepted = qb_status in ("ok", "exists", "sent")
         payload = {
@@ -3081,6 +4747,25 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         if save_to_subscription:
             service.update_av_download(av_id, payload)
         app_log("info", "download", "下载链路完成", {"stage": "download_done", "av_id": av_id, "torrent_id": torrent_id, "status": qb_status, "message": payload["download_message"]})
+        if qb_accepted:
+            send_notification_event("torrent_sent", {
+                "status": qb_status,
+                "title": str(av.get("title") or av_id),
+                "detail": f"{av_id} 已推送到 qBittorrent：{payload['download_message']}",
+                "av_id": av_id,
+                "torrent_id": torrent_id,
+                "torrent_title": torrent_title,
+                "qb_hash": qb_result.get("hash", ""),
+            })
+        else:
+            send_notification_event("task_failed", {
+                "status": qb_status,
+                "title": f"qBittorrent 推送失败：{av_id}",
+                "detail": str(payload["download_message"]),
+                "av_id": av_id,
+                "torrent_id": torrent_id,
+                "torrent_title": torrent_title,
+            })
         return {"av_id": av_id, "status": qb_status, "message": payload["download_message"], "torrent": torrent}
     except Exception as exc:
         message = str(exc)
@@ -3094,6 +4779,14 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
                 error_message=message,
             )
         app_log("error", "download", "下载链路失败", {"stage": "download_error", "av_id": av_id, "torrent_id": torrent_id, "error": message})
+        send_notification_event("task_failed", {
+            "status": "failed",
+            "title": f"下载链路失败：{av_id}",
+            "detail": message,
+            "av_id": av_id,
+            "torrent_id": torrent_id,
+            "torrent_title": torrent_title,
+        })
         return {"av_id": av_id, "status": "error", "message": message, "torrent": torrent}
 
 
@@ -3727,10 +5420,33 @@ def pick_main_video_file(files: list[dict[str, Any]], av_id: str, content_path: 
     return None
 
 
+def local_postprocess_path_candidates(path: str) -> list[tuple[str, Path]]:
+    candidates: list[tuple[str, Path]] = []
+    raw = str(path or "").strip()
+    if not raw:
+        return candidates
+    rewritten = rewrite_proxy_path(raw)
+    for label, value in (("mapped_path", rewritten), ("path", raw)):
+        if not value:
+            continue
+        candidate = Path(str(value))
+        if any(existing == candidate for _, existing in candidates):
+            continue
+        candidates.append((label, candidate))
+    return candidates
+
+
 def local_postprocess_file_ready(path: str, expected_size: int = 0) -> dict[str, Any]:
-    target = Path(path)
-    if not target.exists() or not target.is_file():
-        return {"ok": False, "reason": "控制端无法读取下载文件", "path": str(target)}
+    candidates = local_postprocess_path_candidates(path)
+    target = next((candidate for _, candidate in candidates if candidate.exists() and candidate.is_file()), None)
+    if target is None:
+        checked = [{label: str(candidate)} for label, candidate in candidates]
+        return {
+            "ok": False,
+            "reason": "控制端无法读取下载文件，请检查 qB 下载目录和路径映射",
+            "path": str(path or ""),
+            "checked_paths": checked,
+        }
     first = target.stat().st_size
     time.sleep(0.2)
     second = target.stat().st_size
@@ -4616,6 +6332,25 @@ def validate_and_activate_postprocess_task(
             "download_message": user_message,
             "downloaded_at": time.time(),
         })
+    if bool(task.get("needs_subtitle")):
+        if subtitle_failure:
+            send_notification_event("subtitle_failed", {
+                "status": "failed",
+                "title": f"字幕任务失败：{task.get('av_id') or task_id}",
+                "detail": str(subtitle_failure.get("message") or subtitle_failure.get("reason") or "字幕阶段失败"),
+                "av_id": task.get("av_id", ""),
+                "task_id": task_id,
+                "path": product_path,
+            })
+        elif has_chinese_subtitle:
+            send_notification_event("subtitle_completed", {
+                "status": "completed",
+                "title": f"字幕任务完成：{task.get('av_id') or task_id}",
+                "detail": f"中文字幕已生成并通过校验：{subtitle_path}",
+                "av_id": task.get("av_id", ""),
+                "task_id": task_id,
+                "path": subtitle_path,
+            })
     return {
         "status": "completed",
         "version": post.get_version(version["id"]),
@@ -4923,6 +6658,7 @@ def get_jellyfin_user_id(config: dict[str, Any]) -> str:
 @app.on_event("startup")
 def start_subscription_polling() -> None:
     global subscription_poll_thread
+    apply_system_proxy_settings()
     if subscription_poll_thread is None:
         subscription_poll_thread = threading.Thread(target=subscription_poll_loop, name="subscription-poll", daemon=True)
         subscription_poll_thread.start()
@@ -5396,17 +7132,17 @@ async def api_test_notification_payload(request: Request) -> dict[str, object]:
 
 @app.get("/api/subscriptions/search")
 def api_search_subscriptions(q: str = "", type: str = "av", include_mteam: bool = False) -> dict[str, object]:
-    """搜索番号或女优（数据来自 javdb）"""
+    """搜索番号或女优。"""
     if not q.strip():
         return {"results": [], "type": type}
     try:
         mteam = search_mteam(q.strip(), get_system_settings_service().get()) if include_mteam else None
-        if type == "actress":
-            results = javdb.search_actress(q.strip())
-            return {"results": results, "type": "actress", "mteam": mteam}
-        else:
-            results = javdb.search_av(q.strip())
-            return {"results": results, "type": "av", "mteam": mteam}
+        search_type = "actress" if type == "actress" else "av"
+        results = cached_subscription_search(q.strip(), search_type)
+        if not results and is_access_ban_error(javdb.stats().get("last_error")):
+            target = "女优" if search_type == "actress" else "番号"
+            return {"status": "error", "message": f"JavDB 当前访问被限制，DMM 预售数据源也没有找到该{target}。请暂停抓取或更换代理后再试。", "results": [], "type": search_type, "mteam": mteam}
+        return {"results": results, "type": search_type, "mteam": mteam}
     except Exception as e:
         print(f"[API] search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -5418,7 +7154,11 @@ async def api_subscribe_av(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict) or not payload.get("id"):
         raise HTTPException(status_code=400, detail="番号信息格式不正确")
+    payload["id"] = canonical_av_id(payload.get("id"))
     app_log("info", "subscription", "开始订阅番号", {"stage": "subscribe_start", "av_id": payload.get("id")})
+    payload = prepare_subscription_av_payload(payload)
+    if not av_within_global_actor_limit(payload):
+        raise HTTPException(status_code=400, detail=f"该番号超过全局 {GLOBAL_MAX_COACTORS} 人共演限制，已自动过滤")
     apply_jellyfin_status(payload)
     service = get_subscription_service()
     result = service.subscribe_av(payload)
@@ -5427,6 +7167,20 @@ async def api_subscribe_av(request: Request) -> dict[str, object]:
         download_result = download_av_from_mteam(result)
         latest = next((item for item in service.get_subscribed_av() if item.get("id") == result.get("id")), result)
         result = latest
+    send_notification_event("av_subscribed", {
+        "status": result.get("status") or "subscribed",
+        "title": str(result.get("title") or result.get("id") or ""),
+        "detail": f"已订阅 {result.get('id', '')}：{result.get('title') or ''}".strip(),
+        "av_id": result.get("id", ""),
+    })
+    if result.get("status") == "in_library":
+        send_notification_event("jellyfin_in_library", {
+            "status": "in_library",
+            "title": str(result.get("title") or result.get("id") or ""),
+            "detail": f"{result.get('id', '')} 已在 Jellyfin 媒体库中",
+            "av_id": result.get("id", ""),
+            "path": result.get("jellyfin_path", ""),
+        })
     app_log("info", "subscription", "订阅番号完成", {"stage": "subscribe_done", "av_id": result.get("id"), "status": result.get("status"), "download_status": download_result.get("status")})
     return {"status": "ok", "subscription": result, "download": download_result}
 
@@ -5445,7 +7199,7 @@ def api_get_subscribed_av() -> dict[str, object]:
     """获取已订阅番号列表"""
     service = get_subscription_service()
     expire_wash_requests_with_postprocess()
-    return {"subscriptions": service.get_subscribed_av()}
+    return {"subscriptions": subscribed_avs_with_global_filter("subscription_list")}
 
 
 @app.post("/api/subscriptions/av/{av_id}/download")
@@ -5462,6 +7216,18 @@ def api_download_subscription_av(av_id: str) -> dict[str, object]:
 @app.post("/api/subscriptions/av/download-pending")
 def api_download_pending_av() -> dict[str, object]:
     return {"status": "ok", **download_pending_subscriptions()}
+
+
+@app.post("/api/subscriptions/av/cleanup-dirty")
+async def api_cleanup_dirty_subscriptions(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    dry_run = bool(payload.get("dry_run", True))
+    return {"status": "ok", "result": cleanup_dirty_subscriptions(dry_run=dry_run)}
 
 
 @app.post("/api/subscriptions/av/{av_id}/status")
@@ -5544,24 +7310,76 @@ def bad_actress_name(value: object) -> bool:
     return not text or "404" in text or "页面未找到" in text or "頁面未找到" in text or "page not found" in text
 
 
-def first_actress_work_cover(actress_id: str) -> str:
+def latest_actress_work_summary(actress: dict[str, Any] | str) -> dict[str, str]:
+    payload = {"id": actress, "name": actress} if isinstance(actress, str) else dict(actress)
     try:
-        works = javdb.get_actress_avs(actress_id)
+        works = subscription_avs_for_actress(payload, limit=20)
     except Exception as exc:
-        app_log("warning", "subscription", "女优作品封面兜底失败", {"actress_id": actress_id, "error": str(exc)})
-        return ""
-    return next((str(item.get("cover") or "") for item in works if item.get("cover")), "")
+        app_log("warning", "subscription", "女优作品封面兜底失败", {"actress_id": payload.get("id", ""), "error": str(exc)})
+        return {}
+    for item in works:
+        cover = str(item.get("cover") or "").strip()
+        if cover:
+            return {
+                "latest_cover": cover,
+                "latest_av_id": str(item.get("id") or ""),
+                "latest_title": str(item.get("title") or ""),
+                "latest_date": str(item.get("date") or item.get("release_date") or ""),
+            }
+    return {}
+
+
+def first_actress_work_cover(actress_id: str) -> str:
+    return latest_actress_work_summary(actress_id).get("latest_cover", "")
+
+
+def av_cover_used_as_actress_cover(value: object) -> bool:
+    url = str(value or "").strip()
+    if not url:
+        return False
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    host = parsed.netloc.lower()
+    return "dmm.co.jp" in host and "/mono/movie/adult/" in path
 
 
 def enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(payload)
+    if av_cover_used_as_actress_cover(result.get("cover")):
+        result.setdefault("latest_cover", result.get("cover"))
+        result["cover"] = ""
     actress_ref = str(result.get("id") or result.get("name") or "").strip()
     if not actress_ref:
         return result
+    actress_name = str(result.get("name") or actress_ref).strip()
+    identity: dict[str, Any] = {}
+    try:
+        identity = cached_actress_identity(actress_name or actress_ref)
+    except Exception as exc:
+        app_log("warning", "subscription", "女优双源身份补全失败", {"actress_id": actress_ref, "name": actress_name, "error": str(exc)})
+
+    if identity:
+        if identity.get("javdb_id"):
+            result["javdb_id"] = identity.get("javdb_id")
+        elif identity.get("source") == "javdb" and identity.get("id"):
+            result["javdb_id"] = identity.get("id")
+        if identity.get("dmm_name"):
+            result["dmm_name"] = identity.get("dmm_name")
+        elif identity.get("name"):
+            result["dmm_name"] = identity.get("name")
+        if identity.get("dmm_url"):
+            result["dmm_url"] = identity.get("dmm_url")
+        if identity.get("source"):
+            result["source"] = identity.get("source")
+        if not result.get("cover") and identity.get("source") != "dmm" and identity.get("cover"):
+            result["cover"] = identity.get("cover")
+        if bad_actress_name(result.get("name")) and identity.get("name"):
+            result["name"] = identity.get("name")
 
     profile: dict[str, Any] = {}
     try:
-        profile = javdb.get_actress_profile(actress_ref) or {}
+        profile_ref = str(result.get("javdb_id") or actress_ref)
+        profile = cached_actress_profile(profile_ref) or {}
     except Exception as exc:
         app_log("warning", "subscription", "女优资料补全失败", {"actress_id": actress_ref, "error": str(exc)})
 
@@ -5571,13 +7389,20 @@ def enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     if profile_id and profile_id != actress_ref and re.fullmatch(r"[A-Za-z0-9]+", profile_id):
         result["id"] = profile_id
+        result["javdb_id"] = profile_id
     if profile_name and bad_actress_name(result.get("name")) and not bad_actress_name(profile_name):
         result["name"] = profile_name
     elif bad_actress_name(result.get("name")):
         result["name"] = actress_ref
 
-    if not result.get("cover"):
-        result["cover"] = profile_cover or first_actress_work_cover(str(result.get("id") or actress_ref))
+    if not result.get("cover") and profile_cover:
+        result["cover"] = profile_cover
+    if not result.get("cover") and not result.get("latest_cover"):
+        result.update(latest_actress_work_summary(result))
+    if not result.get("dmm_name") and not bad_actress_name(result.get("name")):
+        result["dmm_name"] = result.get("name")
+    if not result.get("dmm_url") and str(result.get("url") or "").strip() and allowed_external_url(str(result.get("url") or ""), DMM_HOSTS):
+        result["dmm_url"] = str(result.get("url") or "").strip()
     return result
 
 
@@ -5587,14 +7412,25 @@ def hydrate_actress_subscriptions(items: list[dict[str, Any]]) -> list[dict[str,
     for item in items:
         current = dict(item)
         needs_name = bad_actress_name(current.get("name"))
-        needs_cover = not current.get("cover")
+        bad_cover = av_cover_used_as_actress_cover(current.get("cover"))
+        needs_cover = not current.get("cover") or bad_cover
+        enriched = enriched_actress_payload(current)
+        enriched_id = str(enriched.get("id") or "").strip()
+        current_id = str(current.get("id") or "").strip()
+        if enriched_id and enriched_id != current_id:
+            current = service.subscribe_actress({**current, **enriched})
+            needs_name = False
+            needs_cover = False
         if needs_name or needs_cover:
-            enriched = enriched_actress_payload(current)
             patch: dict[str, Any] = {}
             if needs_name and not bad_actress_name(enriched.get("name")):
                 patch["name"] = enriched.get("name")
-            if needs_cover and enriched.get("cover"):
-                patch["cover"] = enriched.get("cover")
+            if needs_cover and (bad_cover or enriched.get("cover") or enriched.get("latest_cover")):
+                patch["cover"] = enriched.get("cover") or ""
+                patch["latest_cover"] = enriched.get("latest_cover") or ""
+                patch["latest_av_id"] = enriched.get("latest_av_id") or ""
+                patch["latest_title"] = enriched.get("latest_title") or ""
+                patch["latest_date"] = enriched.get("latest_date") or ""
             if patch:
                 updated = service.update_actress_subscription(str(current.get("id") or ""), patch)
                 current = updated or {**current, **patch}
@@ -5667,7 +7503,7 @@ def api_get_subscribed_actresses() -> dict[str, object]:
 def api_get_actress_profile(actress_id: str) -> dict[str, object]:
     if not actress_id:
         raise HTTPException(status_code=400, detail="actress_id required")
-    profile = javdb.get_actress_profile(actress_id)
+    profile = cached_actress_profile(actress_id)
     if not profile:
         profile = {"id": actress_id, "name": "", "cover": ""}
     service = get_subscription_service()
@@ -5681,9 +7517,15 @@ def api_get_actress_profile(actress_id: str) -> dict[str, object]:
 
 @app.get("/api/subscriptions/actress/{actress_id}/avs")
 def api_get_actress_avs(actress_id: str) -> dict[str, object]:
-    """获取女优全部作品（javdb 女优页面）"""
+    """获取女优全部作品。"""
     try:
-        results = javdb.get_actress_avs(actress_id)
+        service = get_subscription_service()
+        actress = next((item for item in service.get_subscribed_actresses() if item.get("id") == actress_id), None)
+        if not actress:
+            actress = {"id": actress_id, "name": actress_id}
+        results = subscription_avs_for_actress(actress, limit=100)
+        if not results and is_access_ban_error(javdb.stats().get("last_error")):
+            return {"status": "error", "message": "JavDB 当前访问被限制，DMM 预售数据源也没有找到作品。请暂停抓取或更换代理后再试。", "results": []}
         return {"results": results}
     except Exception as e:
         print(f"[API] actress_avs error: {e}")
@@ -5695,10 +7537,16 @@ def api_get_av_actresses(url: str = "", profiles: bool = True) -> dict[str, obje
     """从番号详情页获取女优列表"""
     if not url:
         raise HTTPException(status_code=400, detail="url 参数不能为空")
-    if not allowed_external_url(url, JAVDB_HOSTS):
-        raise HTTPException(status_code=403, detail="只允许访问 javdb 详情页")
+    if not (allowed_external_url(url, JAVDB_HOSTS) or allowed_external_url(url, DMM_HOSTS)):
+        raise HTTPException(status_code=403, detail="只允许访问 javdb 或 DMM 详情页")
     try:
-        actresses = javdb.get_av_actresses(url, include_profiles=profiles)
+        if allowed_external_url(url, DMM_HOSTS):
+            actresses = cached_detail_for_url(url).get("actresses") or []
+        else:
+            detail = cached_detail_for_url(url)
+            actresses = detail.get("actors") or detail.get("actresses") or []
+            if not actresses:
+                actresses = javdb.get_av_actresses(url, include_profiles=profiles)
         return {"actresses": actresses}
     except Exception as e:
         print(f"[API] get_av_actresses error: {e}")
@@ -5709,24 +7557,24 @@ def api_get_av_actresses(url: str = "", profiles: bool = True) -> dict[str, obje
 def api_get_av_detail(url: str = "") -> dict[str, object]:
     if not url:
         raise HTTPException(status_code=400, detail="url 参数不能为空")
-    if not allowed_external_url(url, JAVDB_HOSTS):
-        raise HTTPException(status_code=403, detail="只允许访问 javdb 详情页")
+    if not (allowed_external_url(url, JAVDB_HOSTS) or allowed_external_url(url, DMM_HOSTS)):
+        raise HTTPException(status_code=403, detail="只允许访问 javdb 或 DMM 详情页")
     try:
-        return {"detail": javdb.get_av_detail(url)}
+        return {"detail": cached_detail_for_url(url)}
     except Exception as e:
         print(f"[API] get_av_detail error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/javdb/listing")
-def api_get_javdb_listing(url: str = "", force: bool = False, limit: int = 16) -> dict[str, object]:
+def api_get_javdb_listing(url: str = "", force: bool = False, limit: int = 16, name: str = "") -> dict[str, object]:
     if not url:
         raise HTTPException(status_code=400, detail="url 参数不能为空")
-    if not allowed_external_url(url, JAVDB_HOSTS):
-        raise HTTPException(status_code=403, detail="只允许访问 javdb 页面")
+    if not (allowed_external_url(url, JAVDB_HOSTS) or allowed_external_url(url, DMM_HOSTS)):
+        raise HTTPException(status_code=403, detail="只允许访问 javdb 或 DMM 页面")
     try:
         safe_limit = max(1, min(60, int(limit or 16)))
-        return {"results": javdb.get_listing(url, limit=safe_limit, force_refresh=force)}
+        return {"results": cached_listing(url, limit=safe_limit, force_refresh=force, maker_name=name)}
     except Exception as e:
         print(f"[API] get_javdb_listing error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -5734,7 +7582,74 @@ def api_get_javdb_listing(url: str = "", force: bool = False, limit: int = 16) -
 
 @app.get("/api/javdb/status")
 def api_get_javdb_status() -> dict[str, object]:
-    return {"status": "ok", "javdb": javdb.stats()}
+    return {
+        "status": "ok",
+        "javdb": javdb.stats(),
+        "dmm": dmm.stats(),
+        "javlibrary": javlibrary.stats(),
+        "metadata_cache": get_subscription_service().metadata_cache_stats(),
+        "asset_cache": get_subscription_service().asset_cache_stats(),
+    }
+
+
+@app.get("/api/subscriptions/metadata-cache/status")
+def api_subscription_metadata_cache_status(clean: bool = True) -> dict[str, object]:
+    service = get_subscription_service()
+    deleted = service.delete_expired_metadata_cache() if clean else 0
+    return {
+        "status": "ok",
+        "deleted_expired": deleted,
+        "metadata_cache": service.metadata_cache_stats(),
+        "asset_cache": service.asset_cache_stats(),
+        "javdb": javdb.stats(),
+        "dmm": dmm.stats(),
+        "javlibrary": javlibrary.stats(),
+    }
+
+
+@app.get("/api/subscriptions/asset-cache/status")
+def api_subscription_asset_cache_status() -> dict[str, object]:
+    settings_payload = get_subscription_service().get_settings()
+    return {
+        "status": "ok",
+        "asset_cache": get_subscription_service().asset_cache_stats(),
+        "max_mb": settings_payload.get("asset_cache_max_mb", 2048),
+    }
+
+
+@app.post("/api/subscriptions/asset-cache/maintenance")
+async def api_subscription_asset_cache_maintenance(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    max_mb = payload.get("max_mb") if isinstance(payload, dict) else None
+    max_bytes = None
+    if max_mb not in (None, ""):
+        max_bytes = max(0, int(float(max_mb) * 1024 * 1024))
+    return {"status": "ok", "result": maintain_asset_cache(max_bytes)}
+
+
+@app.post("/api/subscriptions/asset-cache/cleanup")
+async def api_subscription_asset_cache_cleanup(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    freeze = bool(payload.get("freeze", True))
+    max_mb = payload.get("max_mb", 0)
+    max_bytes = max(0, int(float(max_mb or 0) * 1024 * 1024))
+    freeze_result = freeze_released_asset_cache() if freeze else {"checked": 0, "frozen": 0}
+    cleanup_result = get_subscription_service().cleanup_asset_cache(max_bytes)
+    stats = get_subscription_service().asset_cache_stats()
+    return {
+        "status": "ok",
+        "result": {
+            "freeze": freeze_result,
+            "cleanup": cleanup_result,
+            "asset_cache": stats,
+            "max_bytes": max_bytes,
+        },
+    }
 
 
 @app.get("/api/subscriptions/settings")
@@ -5778,7 +7693,42 @@ async def api_update_system_settings(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="设置格式不正确")
-    return {"status": "ok", "settings": get_system_settings_service().update(payload)}
+    updated = get_system_settings_service().update(payload)
+    apply_system_proxy_settings()
+    return {"status": "ok", "settings": updated}
+
+
+@app.get("/api/system-proxy/status")
+def api_system_proxy_status() -> dict[str, object]:
+    return proxy_status_payload()
+
+
+@app.post("/api/system-proxy/test")
+async def api_system_proxy_test(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    test_url = str(payload.get("url") or "https://api.ipify.org?format=json").strip()
+    if not test_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="测试地址必须是 http 或 https")
+    apply_system_proxy_settings()
+    try:
+        with httpx.Client(timeout=12, follow_redirects=True, trust_env=True) as client:
+            resp = client.get(test_url)
+            resp.raise_for_status()
+            text = resp.text.strip()
+            return {
+                "status": "ok",
+                "url": test_url,
+                "status_code": resp.status_code,
+                "body": text[:500],
+                "proxy": proxy_status_payload(),
+            }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "url": test_url,
+            "message": str(exc),
+            "proxy": proxy_status_payload(),
+        }
 
 
 @app.get("/api/jellyfin/libraries")
@@ -5809,9 +7759,33 @@ async def api_download_mteam(request: Request) -> dict[str, object]:
         torrent_bytes, filename = download_mteam_torrent(torrent_id, settings_data)
         result = add_torrent_to_qbittorrent(torrent_bytes, filename, settings_data.get("qbittorrent", {}))
         app_log("info", "qbittorrent", "MTeam 资源处理完成", {"stage": "mteam_manual_download_done", "torrent_id": torrent_id, "filename": filename, "status": result.get("status"), "message": result.get("message")})
+        if str(result.get("status") or "") in {"ok", "exists", "sent"}:
+            send_notification_event("torrent_sent", {
+                "status": result.get("status") or "sent",
+                "title": title or torrent_id,
+                "detail": f"手动 MTeam 资源已推送到 qBittorrent：{result.get('message') or ''}",
+                "torrent_id": torrent_id,
+                "torrent_title": title,
+                "qb_hash": result.get("hash", ""),
+            })
+        else:
+            send_notification_event("task_failed", {
+                "status": result.get("status") or "failed",
+                "title": "手动 MTeam 下载失败",
+                "detail": str(result.get("message") or "qBittorrent 未接受种子"),
+                "torrent_id": torrent_id,
+                "torrent_title": title,
+            })
         return {"status": "ok", "message": result.get("message", "已发送到 qBittorrent")}
     except Exception as exc:
         app_log("error", "qbittorrent", "MTeam 资源下载失败", {"stage": "mteam_manual_download_error", "torrent_id": torrent_id, "error": str(exc)})
+        send_notification_event("task_failed", {
+            "status": "failed",
+            "title": "手动 MTeam 下载失败",
+            "detail": str(exc),
+            "torrent_id": torrent_id,
+            "torrent_title": title,
+        })
         return {"status": "error", "message": str(exc)}
 
 
@@ -5864,6 +7838,110 @@ def qbittorrent_options(config: dict[str, Any]) -> dict[str, object]:
         return {"status": "error", "message": str(exc), "categories": [], "tags": []}
 
 
+def notification_event_name(event_key: str) -> str:
+    event = next((item for item in NOTIFICATION_EVENTS if item.get("key") == event_key), None)
+    return str((event or {}).get("name") or event_key)
+
+
+def default_notification_template(event_key: str) -> dict[str, str]:
+    event_name = notification_event_name(event_key)
+    return {
+        "title": f"MovieMuse：{event_name}",
+        "message": "{event_name}\n状态：{status}\n详情：{detail}\n时间：{time}",
+    }
+
+
+def render_notification_template(template: str, data: dict[str, Any]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        value = data.get(key)
+        if value is None:
+            return match.group(0)
+        return str(value)
+
+    return re.sub(r"\{([a-zA-Z0-9_]+)\}", replace, str(template or ""))
+
+
+def notification_detail(data: dict[str, Any]) -> str:
+    detail = str(data.get("detail") or data.get("message") or "").strip()
+    if detail:
+        return detail
+    parts: list[str] = []
+    for key in ("av_id", "title", "actress", "torrent_title", "task_id", "path"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            parts.append(f"{key}: {value}")
+    return "；".join(parts) or "事件已处理"
+
+
+def send_notification_channel_message(channel_config: dict[str, Any], title: str, message: str) -> dict[str, object]:
+    channel_type = str(channel_config.get("type") or "").strip().lower()
+    config = channel_config.get("config") if isinstance(channel_config.get("config"), dict) else channel_config
+    if channel_type == "serverchan":
+        send_key = str(config.get("send_key") or "").strip()
+        if not send_key:
+            return {"status": "error", "message": "未配置 Server 酱 SendKey"}
+        try:
+            with httpx.Client(timeout=12, follow_redirects=True) as client:
+                resp = client.post(f"https://sctapi.ftqq.com/{send_key}.send", data={"title": title, "desp": message})
+                resp.raise_for_status()
+                return {"status": "ok", "message": "Server 酱通知已发送"}
+        except httpx.HTTPError as exc:
+            return {"status": "error", "message": f"Server 酱发送失败: {exc}"}
+    if channel_type == "gotify":
+        base_url = str(config.get("url") or "").strip().rstrip("/")
+        token = str(config.get("token") or "").strip()
+        if not base_url or not token:
+            return {"status": "error", "message": "未配置 Gotify 地址或 Token"}
+        try:
+            priority = int(config.get("priority") or 5)
+        except (TypeError, ValueError):
+            priority = 5
+        try:
+            with httpx.Client(timeout=12, follow_redirects=True) as client:
+                resp = client.post(
+                    f"{base_url}/message",
+                    params={"token": token},
+                    json={"title": title, "message": message, "priority": priority},
+                )
+                resp.raise_for_status()
+                return {"status": "ok", "message": "Gotify 通知已发送"}
+        except httpx.HTTPError as exc:
+            return {"status": "error", "message": f"Gotify 发送失败: {exc}"}
+    return {"status": "error", "message": "未知通知通道"}
+
+
+def send_notification_event(event_key: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings_data = get_system_settings_service().get()
+    notifications = settings_data.get("notifications", {}) if isinstance(settings_data.get("notifications"), dict) else {}
+    events = notifications.get("events") if isinstance(notifications.get("events"), dict) else {}
+    if events.get(event_key) is False:
+        return {"status": "skipped", "reason": "event_disabled", "event": event_key}
+    channels = [item for item in notifications.get("channels", []) if isinstance(item, dict) and item.get("enabled")]
+    if not channels:
+        return {"status": "skipped", "reason": "no_enabled_channels", "event": event_key}
+
+    event_name = notification_event_name(event_key)
+    payload = dict(data or {})
+    payload.setdefault("event_name", event_name)
+    payload.setdefault("title", event_name)
+    payload.setdefault("status", "ok")
+    payload.setdefault("detail", notification_detail(payload))
+    payload.setdefault("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    templates = notifications.get("templates") if isinstance(notifications.get("templates"), dict) else {}
+    template = templates.get(event_key) if isinstance(templates.get(event_key), dict) else default_notification_template(event_key)
+    title = render_notification_template(str(template.get("title") or ""), payload)
+    message = render_notification_template(str(template.get("message") or ""), payload)
+
+    results: list[dict[str, Any]] = []
+    for channel in channels:
+        result = send_notification_channel_message(channel, title, message)
+        results.append({"channel": channel.get("id") or channel.get("type"), **result})
+    ok = any(item.get("status") == "ok" for item in results)
+    app_log("info" if ok else "error", "notification", f"通知事件：{event_name}", {"event": event_key, "results": results, "payload": payload})
+    return {"status": "ok" if ok else "error", "event": event_key, "results": results}
+
+
 def send_test_notification(channel: str, config: dict[str, Any]) -> dict[str, object]:
     channels = config.get("channels", []) if isinstance(config, dict) else []
     if isinstance(channels, list):
@@ -5895,40 +7973,12 @@ def send_test_notification(channel: str, config: dict[str, Any]) -> dict[str, ob
 def send_test_notification_channel(channel_config: dict[str, Any]) -> dict[str, object]:
     title = "MovieMuse 通知测试"
     message = "这是一条测试通知，用于确认通知通道可以正常发送。"
-    channel_type = str(channel_config.get("type") or "").strip().lower()
-    config = channel_config.get("config") if isinstance(channel_config.get("config"), dict) else channel_config
-    if channel_type == "serverchan":
-        send_key = str(config.get("send_key") or "").strip()
-        if not send_key:
-            return {"status": "error", "message": "未配置 Server 酱 SendKey"}
-        try:
-            with httpx.Client(timeout=12, follow_redirects=True) as client:
-                resp = client.post(f"https://sctapi.ftqq.com/{send_key}.send", data={"title": title, "desp": message})
-                resp.raise_for_status()
-                return {"status": "ok", "message": "Server 酱测试通知已发送"}
-        except httpx.HTTPError as exc:
-            return {"status": "error", "message": f"Server 酱发送失败: {exc}"}
-    if channel_type == "gotify":
-        base_url = str(config.get("url") or "").strip().rstrip("/")
-        token = str(config.get("token") or "").strip()
-        if not base_url or not token:
-            return {"status": "error", "message": "未配置 Gotify 地址或 Token"}
-        try:
-            priority = int(config.get("priority") or 5)
-        except (TypeError, ValueError):
-            priority = 5
-        try:
-            with httpx.Client(timeout=12, follow_redirects=True) as client:
-                resp = client.post(
-                    f"{base_url}/message",
-                    params={"token": token},
-                    json={"title": title, "message": message, "priority": priority},
-                )
-                resp.raise_for_status()
-                return {"status": "ok", "message": "Gotify 测试通知已发送"}
-        except httpx.HTTPError as exc:
-            return {"status": "error", "message": f"Gotify 发送失败: {exc}"}
-    return {"status": "error", "message": "未知通知通道"}
+    result = send_notification_channel_message(channel_config, title, message)
+    if result.get("status") == "ok":
+        channel_type = str(channel_config.get("type") or "").strip().lower()
+        label = "Gotify" if channel_type == "gotify" else "Server 酱" if channel_type == "serverchan" else "通知"
+        return {"status": "ok", "message": f"{label} 测试通知已发送"}
+    return result
 
 
 def test_qbittorrent(config: dict[str, Any]) -> dict[str, object]:
@@ -5964,6 +8014,8 @@ def test_jellyfin(config: dict[str, Any]) -> dict[str, object]:
     api_key = str(config.get("api_key") or "").strip()
     if not base_url:
         return {"status": "error", "message": "未配置 Jellyfin 地址"}
+    if not api_key:
+        return {"status": "error", "message": "未配置 Jellyfin API Key"}
     headers = {"X-Emby-Token": api_key} if api_key else {}
     try:
         with httpx.Client(timeout=10, follow_redirects=True) as client:
@@ -5992,21 +8044,232 @@ def test_jellyfin(config: dict[str, Any]) -> dict[str, object]:
             message = f"{name} {version}{library_note}".strip()
             app_log("info", "jellyfin", "测试 Jellyfin 连接", {"message": message})
             return {"status": "ok", "message": message}
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        if status_code == 401:
+            message = "Jellyfin 地址可访问，但 API Key 未授权或已失效（401）。请在 Jellyfin 后台重新生成 API Key 后保存。"
+        else:
+            message = f"Jellyfin 连接失败: HTTP {status_code}"
+        app_log("error", "jellyfin", "测试 Jellyfin 连接失败", {"status_code": status_code, "error": str(exc)})
+        return {"status": "error", "message": message}
     except (httpx.HTTPError, ValueError) as exc:
         message = f"Jellyfin 连接失败: {exc}"
         app_log("error", "jellyfin", "测试 Jellyfin 连接失败", {"error": str(exc)})
         return {"status": "error", "message": message}
 
 
+def asset_kind_dir(kind: str) -> str:
+    return ASSET_KIND_DIRS.get(str(kind or "").strip().lower(), "images")
+
+
+def asset_file_extension(media_type: str, source_url: str = "") -> str:
+    content_type = str(media_type or "").split(";")[0].strip().lower()
+    if content_type == "image/png":
+        return ".png"
+    if content_type == "image/webp":
+        return ".webp"
+    if content_type in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+    if content_type == "video/mp4":
+        return ".mp4"
+    if content_type == "video/webm":
+        return ".webm"
+    if content_type == "video/ogg":
+        return ".ogg"
+    if content_type in {"video/quicktime", "video/mov"}:
+        return ".mov"
+    suffix = Path(urlparse(source_url).path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".webm", ".ogg", ".mov"}:
+        return ".jpg" if suffix == ".jpeg" else suffix
+    return ".jpg"
+
+
+def safe_asset_stem(value: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip().upper()).strip(".-_")
+    return (stem or hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16])[:96]
+
+
+def asset_file_from_record(data_dir: Path, asset: dict[str, Any]) -> Path | None:
+    local_path = str(asset.get("local_path") or "").strip()
+    if not local_path:
+        return None
+    target = (data_dir / local_path).resolve()
+    if not is_relative_to(target, data_dir.resolve()) or not target.exists() or not target.is_file():
+        return None
+    return target
+
+
+def asset_cache_headers(immutable: bool = False) -> dict[str, str]:
+    if immutable:
+        return {"Cache-Control": "public, max-age=31536000, immutable"}
+    return {"Cache-Control": "public, max-age=86400"}
+
+
+def image_source_rank(url: str) -> int:
+    path = urlparse(str(url or "")).path.lower()
+    name = Path(path).name
+    if name.endswith("pl.jpg") or name.endswith("pl.png") or name.endswith("pl.webp"):
+        return 40
+    if name.endswith("ps.jpg") or name.endswith("ps.png") or name.endswith("ps.webp"):
+        return 20
+    if any(token in name for token in ("large", "big", "cover")):
+        return 15
+    return 10
+
+
+def fetch_image_bytes(url: str) -> tuple[bytes, str]:
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            resp.raise_for_status()
+            media_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
+            if not media_type.lower().startswith("image/"):
+                raise HTTPException(status_code=415, detail="远端资源不是图片")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_bytes():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > ASSET_IMAGE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="图片超过本地缓存大小限制")
+                chunks.append(chunk)
+    return b"".join(chunks), media_type
+
+
+def fetch_media_bytes(url: str) -> tuple[bytes, str]:
+    with httpx.Client(timeout=45, follow_redirects=True) as client:
+        with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            resp.raise_for_status()
+            media_type = resp.headers.get("content-type", "video/mp4").split(";")[0].strip() or "video/mp4"
+            suffix = Path(urlparse(url).path).suffix.lower()
+            if not media_type.lower().startswith("video/") and suffix not in {".mp4", ".webm", ".ogg", ".mov"}:
+                raise HTTPException(status_code=415, detail="远端资源不是可持久化视频")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_bytes():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > ASSET_MEDIA_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
+                chunks.append(chunk)
+    return b"".join(chunks), media_type
+
+
+def serve_asset_record(data_dir: Path, asset: dict[str, Any]) -> FileResponse | None:
+    asset_path = asset_file_from_record(data_dir, asset)
+    if not asset_path:
+        return None
+    return FileResponse(
+        asset_path,
+        media_type=str(asset.get("media_type") or "image/jpeg"),
+        headers=asset_cache_headers(bool(asset.get("immutable"))),
+    )
+
+
+def persist_image_asset(url: str, entity_id: str, kind: str, immutable: bool) -> FileResponse:
+    if not allowed_external_url(url, IMAGE_PROXY_HOSTS):
+        raise HTTPException(status_code=403, detail="只允许代理指定域名图片")
+    _, _, data_dir = settings()
+    safe_kind = str(kind or "cover").strip().lower()
+    entity_id = canonical_av_id(entity_id) if safe_kind == "cover" else safe_asset_stem(entity_id)
+    if not entity_id:
+        raise HTTPException(status_code=400, detail="entity_id 参数不能为空")
+    content, media_type = fetch_image_bytes(url)
+    digest = hashlib.sha256(content).hexdigest()
+    target_dir = data_dir / "subscription-assets" / asset_kind_dir(safe_kind)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"{safe_asset_stem(entity_id)}{asset_file_extension(media_type, url)}"
+    tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+    tmp_path.write_bytes(content)
+    tmp_path.replace(target_path)
+    relative_path = str(target_path.relative_to(data_dir))
+    asset = get_subscription_service().set_asset_cache(
+        entity_id,
+        safe_kind,
+        url,
+        relative_path,
+        media_type,
+        digest,
+        len(content),
+        immutable=immutable,
+    )
+    app_log("info", "asset-cache", "封面资产已写入本地", {
+        "stage": "asset_cache_store",
+        "entity_id": entity_id,
+        "kind": safe_kind,
+        "bytes": len(content),
+        "immutable": immutable,
+    })
+    return FileResponse(
+        target_path,
+        media_type=asset.get("media_type") or media_type,
+        headers=asset_cache_headers(bool(asset.get("immutable"))),
+    )
+
+
+def persist_media_asset(url: str, entity_id: str, immutable: bool) -> FileResponse:
+    if not allowed_external_url(url, IMAGE_PROXY_HOSTS):
+        raise HTTPException(status_code=403, detail="只允许代理指定域名媒体")
+    _, _, data_dir = settings()
+    entity_id = canonical_av_id(entity_id) or safe_asset_stem(entity_id)
+    if not entity_id:
+        raise HTTPException(status_code=400, detail="entity_id 参数不能为空")
+    content, media_type = fetch_media_bytes(url)
+    digest = hashlib.sha256(content).hexdigest()
+    target_dir = data_dir / "subscription-assets" / asset_kind_dir("trailer")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"{safe_asset_stem(entity_id)}{asset_file_extension(media_type, url)}"
+    tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+    tmp_path.write_bytes(content)
+    tmp_path.replace(target_path)
+    relative_path = str(target_path.relative_to(data_dir))
+    asset = get_subscription_service().set_asset_cache(
+        entity_id,
+        "trailer",
+        url,
+        relative_path,
+        media_type,
+        digest,
+        len(content),
+        immutable=immutable,
+    )
+    app_log("info", "asset-cache", "预告资产已写入本地", {
+        "stage": "asset_cache_store",
+        "entity_id": entity_id,
+        "kind": "trailer",
+        "bytes": len(content),
+        "immutable": immutable,
+    })
+    return FileResponse(
+        target_path,
+        media_type=asset.get("media_type") or media_type,
+        headers=asset_cache_headers(bool(asset.get("immutable"))),
+    )
+
+
 @app.get("/api/proxy/image")
-def proxy_image(url: str) -> Response:
-    """代理图片请求"""
+def proxy_image(url: str = "", av_id: str = "", entity_id: str = "", kind: str = "image", immutable: bool = False) -> Response:
+    """代理图片请求；带 entity_id/kind 时会持久化为本地资产。"""
+    safe_kind = str(kind or "image").strip().lower()
+    normalized_av_id = canonical_av_id(av_id)
+    normalized_entity_id = normalized_av_id or (safe_asset_stem(entity_id) if entity_id else "")
+    _, _, data_dir = settings()
+    if normalized_entity_id:
+        asset = get_subscription_service().get_asset_cache(normalized_entity_id, safe_kind)
+        if asset:
+            local = serve_asset_record(data_dir, asset)
+            existing_url = str(asset.get("source_url") or "")
+            can_upgrade = bool(url) and image_source_rank(url) > image_source_rank(existing_url)
+            if local and (not url or existing_url == str(url or "") or (bool(asset.get("immutable")) and not can_upgrade)):
+                return local
     if not url:
         raise HTTPException(status_code=400, detail="url 参数不能为空")
     if not allowed_external_url(url, IMAGE_PROXY_HOSTS):
         raise HTTPException(status_code=403, detail="只允许代理指定域名图片")
     try:
-        _, _, data_dir = settings()
+        if normalized_entity_id and safe_kind in {"cover", "actor", "screenshot"}:
+            return persist_image_asset(url, normalized_entity_id, safe_kind, immutable)
         cache_dir = data_dir / "image-cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
@@ -6017,19 +8280,63 @@ def proxy_image(url: str) -> Response:
             media_type = "image/jpeg"
             if meta_file.exists():
                 media_type = meta_file.read_text(encoding="utf-8").strip() or media_type
-            return FileResponse(cache_file, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
-        with httpx.Client(timeout=15, follow_redirects=True) as client:
-            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            media_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
-            cache_file.write_bytes(resp.content)
-            meta_file.write_text(media_type, encoding="utf-8")
-            return Response(
-                content=resp.content,
-                media_type=media_type,
-                headers={"Cache-Control": "public, max-age=86400"},
-            )
+            return FileResponse(cache_file, media_type=media_type, headers=asset_cache_headers(False))
+        content, media_type = fetch_image_bytes(url)
+        cache_file.write_bytes(content)
+        meta_file.write_text(media_type, encoding="utf-8")
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers=asset_cache_headers(False),
+        )
     except httpx.HTTPStatusError as exc:
+        stale_asset = get_subscription_service().get_asset_cache(normalized_entity_id, safe_kind) if normalized_entity_id else None
+        if stale_asset:
+            local = serve_asset_record(data_dir, stale_asset)
+            if local:
+                return local
         raise HTTPException(status_code=exc.response.status_code, detail="图片获取失败") from exc
     except httpx.HTTPError as exc:
+        stale_asset = get_subscription_service().get_asset_cache(normalized_entity_id, safe_kind) if normalized_entity_id else None
+        if stale_asset:
+            local = serve_asset_record(data_dir, stale_asset)
+            if local:
+                return local
         raise HTTPException(status_code=502, detail=f"图片代理失败: {exc}") from exc
+
+
+@app.get("/api/proxy/media")
+def proxy_media(url: str = "", av_id: str = "", entity_id: str = "", immutable: bool = False) -> Response:
+    """代理可直接下载的预告视频，并持久化到本地资产缓存。"""
+    normalized_entity_id = canonical_av_id(av_id) or (safe_asset_stem(entity_id) if entity_id else "")
+    _, _, data_dir = settings()
+    if normalized_entity_id:
+        asset = get_subscription_service().get_asset_cache(normalized_entity_id, "trailer")
+        if asset:
+            local = serve_asset_record(data_dir, asset)
+            existing_url = str(asset.get("source_url") or "")
+            if local and (not url or existing_url == str(url or "") or bool(asset.get("immutable"))):
+                return local
+    if not url:
+        raise HTTPException(status_code=400, detail="url 参数不能为空")
+    if not allowed_external_url(url, IMAGE_PROXY_HOSTS):
+        raise HTTPException(status_code=403, detail="只允许代理指定域名媒体")
+    try:
+        if normalized_entity_id:
+            return persist_media_asset(url, normalized_entity_id, immutable)
+        content, media_type = fetch_media_bytes(url)
+        return Response(content=content, media_type=media_type, headers=asset_cache_headers(False))
+    except httpx.HTTPStatusError as exc:
+        stale_asset = get_subscription_service().get_asset_cache(normalized_entity_id, "trailer") if normalized_entity_id else None
+        if stale_asset:
+            local = serve_asset_record(data_dir, stale_asset)
+            if local:
+                return local
+        raise HTTPException(status_code=exc.response.status_code, detail="媒体获取失败") from exc
+    except httpx.HTTPError as exc:
+        stale_asset = get_subscription_service().get_asset_cache(normalized_entity_id, "trailer") if normalized_entity_id else None
+        if stale_asset:
+            local = serve_asset_record(data_dir, stale_asset)
+            if local:
+                return local
+        raise HTTPException(status_code=502, detail=f"媒体代理失败: {exc}") from exc

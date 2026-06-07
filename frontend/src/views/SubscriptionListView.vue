@@ -1,8 +1,11 @@
-<template>
+﻿<template>
   <section class="subscriptions-view" @click="closeActionMenu">
-    <PageHeader kicker="订阅管理" title="订阅" description="管理番号和女优订阅，按状态跟踪下载、完成与入库。">
+    <PageHeader kicker="订阅管理" title="订阅" description="管理番号和女优订阅，按状态跟踪下载、完成、入库和洗版。">
       <template #actions>
         <BaseButton type="button" @click="refetchAll">刷新</BaseButton>
+        <BaseButton type="button" :disabled="cleanupBusy" @click="cleanupDirtySubscriptions">
+          {{ cleanupBusy ? '清理中' : '清理脏订阅' }}
+        </BaseButton>
         <BaseButton variant="primary" type="button" :disabled="downloadingPending" @click="downloadPending">
           {{ downloadingPending ? '执行中' : '一键下载订阅中' }}
         </BaseButton>
@@ -35,9 +38,9 @@
           v-for="item in filteredAvs"
           :key="item.id"
           :item="item"
-          :cover-url="proxyImage(item.cover)"
+          :cover-url="proxyImage(item.cover, item)"
           :actors="actresses(item)"
-          :status-note="item.download_message || washMessage(item) || ''"
+          :status-note="displayStatusNote(item)"
           @detail="openDetail"
           @actor="openActress"
         >
@@ -85,7 +88,7 @@
             </div>
           </div>
           <button class="actress-cover" type="button" @click="openActress(item)">
-            <img v-if="actressCover(item)" :src="proxyImage(actressCover(item))" alt="" loading="lazy">
+            <img v-if="actressCover(item)" :src="actressCoverUrl(item)" alt="" loading="lazy">
             <span v-else>暂无封面</span>
           </button>
           <div class="actress-body">
@@ -175,6 +178,7 @@ import { useQuery } from '@tanstack/vue-query'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { api, postJson } from '../lib/api'
+import { imageProxyUrl } from '../lib/images'
 
 const mainTab = ref('av')
 const router = useRouter()
@@ -182,6 +186,7 @@ const avState = ref('pending')
 const busyId = ref('')
 const notice = ref('')
 const downloadingPending = ref(false)
+const cleanupBusy = ref(false)
 const configActress = ref(null)
 const detailItem = ref(null)
 const actionMenuId = ref('')
@@ -215,10 +220,31 @@ const actressItems = computed(() => actressQuery.data.value?.subscriptions || []
 const avStates = computed(() => [
   { key: 'pending', label: '订阅中', count: avItems.value.filter((item) => (item.status || 'pending') === 'pending').length },
   { key: 'done', label: '已完成', count: avItems.value.filter((item) => item.status === 'done').length },
-  { key: 'in_library', label: '已入库', count: avItems.value.filter((item) => item.status === 'in_library').length }
+  { key: 'in_library', label: '已入库', count: avItems.value.filter((item) => item.status === 'in_library').length },
+  { key: 'wash_active', label: '洗版中', count: avItems.value.filter((item) => washActive(item)).length },
+  { key: 'wash_completed', label: '洗版完成', count: avItems.value.filter((item) => washCompleted(item)).length }
 ])
 
-const filteredAvs = computed(() => avItems.value.filter((item) => (item.status || 'pending') === avState.value))
+const filteredAvs = computed(() => avItems.value.filter((item) => itemMatchesState(item, avState.value)))
+
+function washStatus(item) {
+  const wash = item?.wash && typeof item.wash === 'object' ? item.wash : null
+  return String(wash?.status || '').toLowerCase()
+}
+
+function washActive(item) {
+  return ['requested', 'downloading', 'error'].includes(washStatus(item))
+}
+
+function washCompleted(item) {
+  return washStatus(item) === 'completed'
+}
+
+function itemMatchesState(item, state) {
+  if (state === 'wash_active') return washActive(item)
+  if (state === 'wash_completed') return washCompleted(item)
+  return (item.status || 'pending') === state
+}
 
 watch(
   actressItems,
@@ -233,9 +259,12 @@ function refetchAll() {
   actressQuery.refetch()
 }
 
-function proxyImage(url) {
-  if (!url) return ''
-  return `/api/proxy/image?url=${encodeURIComponent(url)}`
+function proxyImage(url, item = null, options = {}) {
+  return imageProxyUrl(url, item, options)
+}
+
+function actorAssetId(item) {
+  return `actor-${item?.id || item?.javdb_id || item?.dmm_name || item?.name || 'unknown'}`
 }
 
 function actressProfile(item) {
@@ -257,7 +286,16 @@ function actressName(item) {
 
 function actressCover(item) {
   if (!item) return ''
-  return item.cover || item.cover_url || item.avatar || item.image || item.photo || actressProfile(item).cover || ''
+  return item.cover || item.cover_url || item.avatar || item.image || item.photo || actressProfile(item).cover || item.latest_cover || ''
+}
+
+function actressCoverUrl(item) {
+  const cover = actressCover(item)
+  if (!cover) return ''
+  if (cover === item?.latest_cover) {
+    return proxyImage(cover, { id: item.latest_av_id || item.id, cover }, { kind: 'cover', avId: item.latest_av_id || item.id })
+  }
+  return proxyImage(cover, null, { kind: 'actor', entityId: actorAssetId(item) })
 }
 
 async function hydrateActressProfiles(items) {
@@ -271,15 +309,6 @@ async function hydrateActressProfiles(items) {
     try {
       const payload = await api(`/api/subscriptions/actress/${encodeURIComponent(item.id)}/profile`)
       const profile = payload.profile || {}
-      if (!profile.cover) {
-        try {
-          const avPayload = await api(`/api/subscriptions/actress/${encodeURIComponent(item.id)}/avs`)
-          const firstCover = (avPayload.results || []).find((movie) => movie?.cover)?.cover || ''
-          if (firstCover) profile.cover = firstCover
-        } catch {
-          // Profile lookup already has the important fallback path.
-        }
-      }
       if (profile.name || profile.cover) {
         actressProfiles.value = {
           ...actressProfiles.value,
@@ -301,16 +330,35 @@ async function hydrateActressProfiles(items) {
 function actresses(item) {
   const raw = item.actresses || item.actress || []
   const list = Array.isArray(raw) ? raw : [raw]
-  return list.map((actor) => {
-    if (typeof actor === 'string') return { name: actor, id: '' }
+  return list.flatMap((actor) => {
+    if (typeof actor === 'string') return splitActorNames(actor).map((name) => ({ name, id: '' }))
     return { name: actor?.name || '', id: actor?.id || actor?.code || '' }
   }).filter((actor) => actor.name)
+}
+
+function splitActorNames(value) {
+  const text = String(value || '').trim()
+  if (!text) return []
+  const parts = text.split(/\s*[、,|]\s*|\s{2,}/).map((item) => item.trim()).filter(Boolean)
+  if (parts.length > 1) return parts
+  const spaced = text.split(/\s+/).map((item) => item.trim()).filter(Boolean)
+  if (spaced.length >= 2 && spaced.length <= 20 && spaced.every((item) => item.length >= 2 && item.length <= 16)) return spaced
+  return [text]
 }
 
 function washMessage(item) {
   const wash = item.wash && typeof item.wash === 'object' ? item.wash : null
   if (!wash?.download_message) return ''
   return wash.download_message
+}
+
+function displayStatusNote(item) {
+  const message = item?.download_message || washMessage(item) || ''
+  if (!message) return ''
+  if (String(message).includes('qBittorrent 已存在')) {
+    return `${message}，等待后处理确认文件路径`
+  }
+  return message
 }
 
 function toggleActionMenu(id) {
@@ -406,6 +454,29 @@ async function downloadPending() {
   }
 }
 
+async function cleanupDirtySubscriptions() {
+  cleanupBusy.value = true
+  notice.value = ''
+  try {
+    const preview = await postJson('/api/subscriptions/av/cleanup-dirty', { dry_run: true })
+    const count = preview.result?.candidate_count || 0
+    if (!count) {
+      notice.value = '没有需要清理的历史脏订阅'
+      return
+    }
+    const names = (preview.result?.candidates || []).slice(0, 5).map((item) => item.id).join(', ')
+    const ok = window.confirm(`将清理 ${count} 条历史脏订阅${names ? `：${names}` : ''}。继续吗？`)
+    if (!ok) return
+    const result = await postJson('/api/subscriptions/av/cleanup-dirty', { dry_run: false })
+    notice.value = `已清理 ${result.result?.removed_count || 0} 条历史脏订阅`
+    await avQuery.refetch()
+  } catch (error) {
+    notice.value = error.message || '清理历史脏订阅失败'
+  } finally {
+    cleanupBusy.value = false
+  }
+}
+
 function openConfig(item) {
   closeActionMenu()
   configActress.value = item
@@ -443,7 +514,11 @@ async function confirmSubscribeLatest() {
         include_vr: subscribeLatestForm.include_vr,
         poll_enabled: item.poll_enabled !== false,
         name: actressName(item),
-        cover: actressCover(item)
+        cover: item.cover || item.cover_url || actressProfile(item).cover || '',
+        latest_cover: item.latest_cover || '',
+        latest_av_id: item.latest_av_id || '',
+        latest_title: item.latest_title || '',
+        latest_date: item.latest_date || ''
       })
       await postJson(`/api/subscriptions/actress/${encodeURIComponent(item.id)}/subscribe-latest`)
     },
@@ -755,3 +830,5 @@ function removeActress(item) {
   gap: 10px;
 }
 </style>
+
+

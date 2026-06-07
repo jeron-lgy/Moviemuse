@@ -39,7 +39,6 @@
       </div>
 
       <div class="actions-row">
-        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveNotifications">保存</BaseButton>
         <div class="add-wrap">
           <BaseButton class="add-button" type="button" @click="showTypeMenu = !showTypeMenu">+</BaseButton>
           <div v-if="showTypeMenu" class="type-menu">
@@ -65,6 +64,13 @@
         </article>
       </div>
     </BaseCard>
+
+    <div v-if="embedded" class="embedded-actions">
+      <BaseButton type="button" @click="loadAll">刷新</BaseButton>
+      <BaseButton variant="primary" type="button" :disabled="saving" @click="saveNotifications">
+        {{ saving ? '保存中' : '保存' }}
+      </BaseButton>
+    </div>
 
     <TaskDialog v-if="editingChannel" :title="`配置 ${editingChannel.name}`" @close="editingChannel = null">
       <label class="enable-row">
@@ -429,6 +435,13 @@ p {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.embedded-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-start;
 }
 
 .add-wrap {
