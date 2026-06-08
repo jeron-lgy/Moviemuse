@@ -44,6 +44,7 @@
           <div v-if="showTypeMenu" class="type-menu">
             <button type="button" @click="createChannel('serverchan')">Server 酱</button>
             <button type="button" @click="createChannel('gotify')">Gotify</button>
+            <button type="button" @click="createChannel('wechat_work')">WeCom</button>
           </div>
         </div>
       </div>
@@ -100,10 +101,45 @@
             <input v-model.number="editingChannel.config.priority" type="number" min="0" max="10">
           </FormField>
         </template>
+
+        <template v-else-if="editingChannel.type === 'wechat_work'">
+          <FormField label="Corp ID">
+            <input v-model.trim="editingChannel.config.corp_id" placeholder="ww...">
+          </FormField>
+          <FormField label="Corp Secret">
+            <input v-model.trim="editingChannel.config.corp_secret" type="password">
+          </FormField>
+          <FormField label="Agent ID">
+            <input v-model.trim="editingChannel.config.agent_id">
+          </FormField>
+          <FormField label="Proxy">
+            <input v-model.trim="editingChannel.config.proxy" placeholder="http://host:port">
+          </FormField>
+          <FormField label="To User">
+            <input v-model.trim="editingChannel.config.touser" placeholder="@all or UserID|UserID">
+          </FormField>
+          <FormField label="Default Image URL" wide>
+            <input v-model.trim="editingChannel.config.default_image_url" placeholder="https://example.com/cover.jpg">
+          </FormField>
+          <FormField label="Callback Token">
+            <input v-model.trim="editingChannel.config.token" type="password">
+          </FormField>
+          <FormField label="Encoding AES Key" wide>
+            <input v-model.trim="editingChannel.config.aes_key" type="password">
+          </FormField>
+          <FormField label="Callback Path">
+            <input v-model.trim="editingChannel.config.callback_path" placeholder="/api/v1/message">
+          </FormField>
+          <label class="enable-row">
+            <input v-model="editingChannel.config.cover_enabled" type="checkbox">
+            <span>Cover push</span>
+          </label>
+        </template>
       </div>
 
       <template #actions>
         <BaseButton type="button" @click="testChannel(editingChannel)">测试</BaseButton>
+        <BaseButton v-if="editingChannel.type === 'wechat_work'" type="button" @click="createWechatMenu(editingChannel)">Create menu</BaseButton>
         <BaseButton type="button" @click="editingChannel = null">取消</BaseButton>
         <BaseButton variant="primary" type="button" @click="commitChannel">确认</BaseButton>
       </template>
@@ -147,7 +183,22 @@ defineProps({
 
 const channelTypes = {
   serverchan: { label: 'Server 酱', defaults: { send_key: '' } },
-  gotify: { label: 'Gotify', defaults: { url: '', token: '', priority: 5 } }
+  gotify: { label: 'Gotify', defaults: { url: '', token: '', priority: 5 } },
+  wechat_work: {
+    label: 'WeCom',
+    defaults: {
+      corp_id: '',
+      corp_secret: '',
+      agent_id: '',
+      proxy: '',
+      touser: '@all',
+      default_image_url: '',
+      cover_enabled: true,
+      token: '',
+      aes_key: '',
+      callback_path: '/api/v1/message'
+    }
+  }
 }
 
 const saving = ref(false)
@@ -228,6 +279,17 @@ async function testChannel(channel) {
     message.value = `测试结果：${result.status || 'ok'} ${result.message || ''}`.trim()
   } catch (error) {
     errorMessage.value = error.message || '测试通知失败'
+  }
+}
+
+async function createWechatMenu(channel) {
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const result = await postJson('/api/wechat/menu', { channel: normalizeChannel(channel) })
+    message.value = `Menu result: ${result.status || 'ok'} ${result.message || ''}`.trim()
+  } catch (error) {
+    errorMessage.value = error.message || 'Create WeCom menu failed'
   }
 }
 

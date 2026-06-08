@@ -10,10 +10,13 @@ import time
 import json
 import uuid
 import hashlib
+import base64
+import struct
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode, urlparse
+import xml.etree.ElementTree as ET
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -444,7 +447,14 @@ move_jobs_lock = threading.Lock()
 def frontend_index_response() -> FileResponse | None:
     frontend_index = FRONTEND_DIST / "index.html"
     if frontend_index.exists():
-        return FileResponse(frontend_index)
+        return FileResponse(
+            frontend_index,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
     return None
 
 
@@ -2444,6 +2454,14 @@ system_settings_service: SystemSettingsService | None = None
 app_log_service: AppLogService | None = None
 subscription_poll_thread: threading.Thread | None = None
 subscription_poll_stop = threading.Event()
+notification_dedupe_lock = threading.RLock()
+notification_dedupe: dict[str, float] = {}
+wechat_token_lock = threading.RLock()
+wechat_token_cache: dict[str, dict[str, Any]] = {}
+wechat_session_lock = threading.RLock()
+wechat_sessions: dict[str, dict[str, Any]] = {}
+wechat_action_dedupe_lock = threading.RLock()
+wechat_action_dedupe: dict[str, float] = {}
 IMAGE_PROXY_HOSTS = ("javbus.com", "javdb.com", "jdbstatic.com", "dmm.co.jp", "libredmm.com", "javlibrary.com")
 JAVDB_HOSTS = ("javdb.com",)
 DMM_HOSTS = ("dmm.co.jp",)
@@ -2686,6 +2704,71 @@ def app_log(level: str, source: str, message: str, data: dict[str, Any] | None =
         get_app_log_service().write(level, source, message, data)
     except Exception as exc:
         print(f"[LogService] write failed: {exc}", flush=True)
+    try:
+        notifier = globals().get("notify_from_app_log")
+        if callable(notifier):
+            notifier(level, source, message, data or {})
+    except Exception as exc:
+        print(f"[NotificationLogHook] failed: {exc}", flush=True)
+
+
+def notify_from_app_log(level: str, source: str, message: str, data: dict[str, Any]) -> None:
+    if source == "notification":
+        return
+    sender = globals().get("send_notification_event")
+    if not callable(sender):
+        return
+    stage = str(data.get("stage") or "")
+    av_id = str(data.get("av_id") or "")
+    title = str(data.get("title") or data.get("mteam_torrent_title") or av_id or message)
+    if message in {"自动订阅新增番号", "女优一键订阅新增番号"} or stage == "actress_subscribe_latest_added":
+        sender("av_subscribed", {
+            "status": data.get("status") or "subscribed",
+            "title": title,
+            "detail": f"已订阅 {av_id}：{title}".strip(),
+            "av_id": av_id,
+            "actress": data.get("actress") or data.get("name") or "",
+        })
+    elif stage == "download_done":
+        status = str(data.get("status") or "")
+        event_key = "torrent_sent" if status in {"ok", "exists", "sent"} else "task_failed"
+        sender(event_key, {
+            "status": status or "done",
+            "title": title,
+            "detail": str(data.get("message") or message),
+            "av_id": av_id,
+            "torrent_id": data.get("torrent_id", ""),
+        })
+    elif stage in {"mteam_search_empty", "download_error", "download_qb_hash_conflict", "mteam_missing_id"}:
+        sender("task_failed", {
+            "status": str(data.get("status") or "failed"),
+            "title": f"{message}：{av_id}" if av_id else message,
+            "detail": str(data.get("error") or data.get("message") or message),
+            "av_id": av_id,
+            "torrent_id": data.get("torrent_id", ""),
+        })
+    elif stage == "jellyfin_refresh_done" and int(data.get("changed") or 0) > 0:
+        sender("jellyfin_in_library", {
+            "status": "in_library",
+            "title": "Jellyfin 入库状态更新",
+            "detail": f"{data.get('changed')} 个订阅已确认入库",
+        })
+    elif message == "Jellyfin 查重命中，标记已入库":
+        sender("jellyfin_in_library", {
+            "status": "in_library",
+            "title": av_id or "Jellyfin 已入库",
+            "detail": f"{av_id} 已在 Jellyfin 媒体库中",
+            "av_id": av_id,
+            "path": data.get("path", ""),
+        })
+    elif level == "error" and source in {"subscription", "download", "mteam", "qbittorrent", "task", "wash", "postprocess"}:
+        sender("task_failed", {
+            "status": "failed",
+            "title": message,
+            "detail": str(data.get("error") or data.get("message") or message),
+            "av_id": av_id,
+            "task_id": data.get("task_id", ""),
+        })
 
 
 javdb.set_logger(app_log)
@@ -2756,6 +2839,15 @@ def configured_max_coactors() -> int:
 
 
 def resolve_av_actors_for_limit(av: dict[str, Any]) -> list[dict[str, str]]:
+    detail = cached_av_detail(av)
+    if isinstance(detail, dict):
+        actors = normalize_actor_items(detail.get("actors") or detail.get("actresses") or detail.get("actress"))
+        if actors:
+            return actors
+        nested = detail.get("detail") if isinstance(detail.get("detail"), dict) else {}
+        actors = normalize_actor_items(nested.get("actors") or nested.get("actresses") or nested.get("actress"))
+        if actors:
+            return actors
     detail_actors = []
     if av.get("url") and allowed_external_url(str(av.get("url") or ""), JAVDB_HOSTS):
         detail_actors = javdb.get_av_actresses(str(av.get("url") or ""), include_profiles=False)
@@ -2782,6 +2874,75 @@ def canonical_av_id(value: object) -> str:
     return f"{match.group(1)}-{match.group(2)}"
 
 
+def normalized_source_name(value: object) -> str:
+    source = str(value or "").strip().lower()
+    aliases = {
+        "fanza": "dmm",
+        "dmm/fanza": "dmm",
+        "javlibrary+flaresolverr": "javlibrary",
+    }
+    return aliases.get(source, source)
+
+
+def source_chain_for_item(item: dict[str, Any]) -> list[str]:
+    chain: list[str] = []
+    raw_chain = item.get("source_chain")
+    if isinstance(raw_chain, list):
+        for value in raw_chain:
+            source = normalized_source_name(value)
+            if source and source not in chain:
+                chain.append(source)
+    source = normalized_source_name(item.get("source"))
+    if source and source not in chain:
+        chain.append(source)
+    return chain
+
+
+def append_source_chain(item: dict[str, Any], *sources: object) -> dict[str, Any]:
+    result = dict(item)
+    chain = source_chain_for_item(result)
+    for value in sources:
+        source = normalized_source_name(value)
+        if source and source not in chain:
+            chain.append(source)
+    if chain:
+        result["source_chain"] = chain
+    return result
+
+
+def explain_match(item: dict[str, Any], *, default_reason: str = "", default_confidence: str = "medium") -> dict[str, Any]:
+    result = append_source_chain(item)
+    reason = str(result.get("match_reason") or "").strip()
+    confidence = str(result.get("confidence") or "").strip()
+    source = normalized_source_name(result.get("source"))
+    scope = str(result.get("source_scope") or "").strip().lower()
+    if not reason:
+        if result.get("_cache_hit"):
+            reason = "sqlite_cache"
+        elif scope == "label":
+            reason = "primary_label"
+        elif str(result.get("source_actor_match") or "").strip():
+            reason = "actress_seed"
+        elif default_reason:
+            reason = default_reason
+        elif source:
+            reason = f"{source}_result"
+    if not confidence:
+        if reason in {"primary_label", "actress_seed", "exact_av_id", "sqlite_cache", "dmm_actress_search", "actress_dmm_match"}:
+            confidence = "high"
+        elif source in {"dmm", "javlibrary"}:
+            confidence = "medium"
+        else:
+            confidence = default_confidence
+    elif reason in {"primary_label", "actress_seed", "exact_av_id", "sqlite_cache", "dmm_actress_search", "actress_dmm_match"} and confidence in {"low", "medium"}:
+        confidence = "high"
+    if reason:
+        result["match_reason"] = reason
+    if confidence:
+        result["confidence"] = confidence
+    return result
+
+
 def merge_av_sources(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for source in sources:
@@ -2794,6 +2955,7 @@ def merge_av_sources(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             item = dict(raw)
             item["id"] = av_id
+            item = append_source_chain(item)
             if original_id and original_id != av_id:
                 item.setdefault("source_id", original_id)
             existing = merged.get(av_id)
@@ -2802,8 +2964,12 @@ def merge_av_sources(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             combined = dict(existing)
             for key, value in item.items():
+                if key == "source_chain":
+                    continue
                 if value not in ("", None, [], {}):
                     combined[key] = value
+            for value in source_chain_for_item(existing) + source_chain_for_item(item):
+                combined = append_source_chain(combined, value)
             if isinstance(existing.get("detail"), dict) and isinstance(item.get("detail"), dict):
                 combined["detail"] = {**existing["detail"], **item["detail"]}
             elif isinstance(existing.get("detail"), dict) and not combined.get("detail"):
@@ -2822,8 +2988,27 @@ def metadata_item_released(item: dict[str, Any]) -> bool:
         return False
 
 
+def normalize_cover_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if host.endswith("pics.dmm.co.jp"):
+        return re.sub(r"(?i)(p)[st](\.(?:jpg|jpeg|png|webp)(?:\?.*)?)$", r"\1l\2", value)
+    return value
+
+
+def normalize_image_fields(item: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(item)
+    for key in ("cover", "cover_url", "latest_cover", "poster", "image", "photo", "avatar"):
+        if payload.get(key):
+            payload[key] = normalize_cover_url(str(payload.get(key) or "").strip())
+    return payload
+
+
 def image_proxy_url(source_url: str, av_id: str = "", kind: str = "image", *, immutable: bool = False) -> str:
-    url = str(source_url or "").strip()
+    url = normalize_cover_url(source_url) if kind == "cover" else str(source_url or "").strip()
     if not url:
         return ""
     if url.startswith(("/api/proxy/image", "data:")):
@@ -2841,11 +3026,12 @@ def image_proxy_url(source_url: str, av_id: str = "", kind: str = "image", *, im
 
 
 def public_metadata_item(item: dict[str, Any]) -> dict[str, Any]:
-    payload = {key: value for key, value in dict(item).items() if not str(key).startswith("_")}
+    payload = normalize_image_fields({key: value for key, value in dict(item).items() if not str(key).startswith("_")})
     av_id = canonical_av_id(payload.get("id"))
-    cover = str(payload.get("cover") or "").strip()
+    cover = normalize_cover_url(str(payload.get("cover") or "").strip())
     if av_id and cover:
         payload["id"] = av_id
+        payload["cover"] = cover
         payload["cover_proxy"] = image_proxy_url(cover, av_id, "cover", immutable=metadata_item_released(payload))
     return payload
 
@@ -2890,12 +3076,12 @@ def cached_av_summary(av_id: str) -> dict[str, Any]:
 def hydrate_av_with_cached_summary(item: dict[str, Any]) -> dict[str, Any]:
     av_id = canonical_av_id(item.get("id"))
     if not av_id:
-        return item
+        return normalize_image_fields(item)
     cached = cached_av_summary(av_id)
     if not cached:
-        return item
+        return normalize_image_fields(item)
     result = dict(item)
-    for field in ("date", "release_date", "duration", "rating", "maker", "label", "director"):
+    for field in ("date", "release_date", "duration", "rating", "maker", "label", "director", "source", "source_chain", "source_scope", "match_reason", "confidence"):
         if not result.get(field) and cached.get(field):
             result[field] = cached.get(field)
     if not result.get("title") or result.get("title") == "Product":
@@ -2906,7 +3092,7 @@ def hydrate_av_with_cached_summary(item: dict[str, Any]) -> dict[str, Any]:
         result["actresses"] = cached.get("actresses")
     if cached.get("cover_proxy"):
         result["cover_proxy"] = cached.get("cover_proxy")
-    return result
+    return normalize_image_fields(result)
 
 
 def detail_cache_keys(payload: dict[str, Any] | str) -> list[str]:
@@ -2996,6 +3182,108 @@ def actress_identity_key(item: dict[str, Any]) -> str:
     return str(item.get("id") or "").strip().lower()
 
 
+def actor_identity_cache_key(value: object) -> str:
+    normalized = normalized_person_name(value)
+    return f"name:{normalized}" if normalized else ""
+
+
+def actor_identity_payload(item: dict[str, Any], *, match_reason: str = "", confidence: str = "") -> dict[str, Any]:
+    item = normalize_image_fields(item)
+    name = str(item.get("name") or item.get("dmm_name") or item.get("id") or "").strip()
+    if not name or bad_actress_name(name):
+        return {}
+    payload = {
+        "id": str(item.get("id") or name).strip(),
+        "display_name": name,
+        "name": name,
+        "aliases": sorted(person_name_aliases(name) | person_name_aliases(item.get("dmm_name"))),
+        "source_chain": source_chain_for_item(item),
+        "source": normalized_source_name(item.get("source")),
+        "javdb_id": str(item.get("javdb_id") or (item.get("id") if normalized_source_name(item.get("source")) == "javdb" else "") or "").strip(),
+        "dmm_name": str(item.get("dmm_name") or "").strip(),
+        "dmm_url": str(item.get("dmm_url") or "").strip(),
+        "javlibrary_star_id": str(item.get("javlibrary_star_id") or item.get("star_id") or "").strip(),
+        "cover": str(item.get("cover") or "").strip(),
+        "latest_cover": str(item.get("latest_cover") or "").strip(),
+        "latest_av_id": str(item.get("latest_av_id") or "").strip(),
+        "latest_title": str(item.get("latest_title") or "").strip(),
+        "latest_date": str(item.get("latest_date") or "").strip(),
+        "match_reason": match_reason or str(item.get("match_reason") or "").strip() or "identity_observed",
+        "confidence": confidence or str(item.get("confidence") or "").strip() or "medium",
+        "updated_at": time.time(),
+    }
+    return {key: value for key, value in payload.items() if value not in ("", [], {}, None)}
+
+
+def remember_actor_identity(item: dict[str, Any], *, match_reason: str = "", confidence: str = "") -> dict[str, Any]:
+    payload = actor_identity_payload(item, match_reason=match_reason, confidence=confidence)
+    if not payload:
+        return {}
+    keys = set()
+    for value in [payload.get("display_name"), payload.get("name"), payload.get("dmm_name"), payload.get("id")]:
+        key = actor_identity_cache_key(value)
+        if key:
+            keys.add(key)
+    if payload.get("javdb_id"):
+        keys.add(f"javdb:{str(payload['javdb_id']).strip().lower()}")
+    if payload.get("javlibrary_star_id"):
+        keys.add(f"javlibrary:{str(payload['javlibrary_star_id']).strip().lower()}")
+    if payload.get("dmm_url"):
+        keys.add(f"dmm_url:{hashlib.sha256(str(payload['dmm_url']).encode('utf-8')).hexdigest()}")
+    for key in keys:
+        cache_set("actor_identity", key, payload, METADATA_DETAIL_TTL)
+    return payload
+
+
+def cached_actor_identity(query: object) -> dict[str, Any]:
+    keys: list[str] = []
+    key = actor_identity_cache_key(query)
+    if key:
+        keys.append(key)
+    raw = str(query or "").strip()
+    if raw:
+        keys.append(f"javdb:{raw.lower()}")
+        keys.append(f"javlibrary:{raw.lower()}")
+    for cache_key in keys:
+        cached = cache_get("actor_identity", cache_key, allow_stale=True)
+        if isinstance(cached, dict) and cached:
+            return normalize_image_fields(cached)
+    return {}
+
+
+def maker_identity_key(value: object) -> str:
+    key = str(value or "").strip().lower()
+    return f"name:{key}" if key else ""
+
+
+def remember_maker_identity(maker_name: str) -> dict[str, Any]:
+    name = str(maker_name or "").strip()
+    if not name:
+        return {}
+    key = str(name).strip().lower()
+    payload = {
+        "id": key,
+        "display_name": name,
+        "name": name,
+        "dmm_listing_urls": dmm_listing_urls_for_maker(name),
+        "dmm_primary_labels": list(dmm_primary_label_aliases(name)),
+        "javlibrary_urls": javlibrary_urls_for_maker(name),
+        "javdb_url": next(
+            (str(item.get("url") or "") for item in get_subscription_service().get_settings().get("pinned_makers") or []
+             if isinstance(item, dict) and str(item.get("name") or "").strip().lower() == key),
+            "",
+        ),
+        "match_reason": "maker_config",
+        "confidence": "high" if dmm_primary_label_aliases(name) or javlibrary_urls_for_maker(name) else "medium",
+        "updated_at": time.time(),
+    }
+    payload = {k: v for k, v in payload.items() if v not in ("", [], {}, None)}
+    cache_key = maker_identity_key(name)
+    if cache_key:
+        cache_set("maker_identity", cache_key, payload, METADATA_DETAIL_TTL)
+    return payload
+
+
 def merge_actress_sources(javdb_results: list[dict[str, Any]], dmm_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for raw in javdb_results:
@@ -3003,19 +3291,24 @@ def merge_actress_sources(javdb_results: list[dict[str, Any]], dmm_results: list
             continue
         item = public_metadata_item(dict(raw))
         item["source"] = str(item.get("source") or "javdb")
+        item = append_source_chain(item, item["source"])
         if item["source"] == "javdb":
             item["javdb_id"] = str(item.get("id") or "").strip()
+        item = explain_match(item, default_reason="actress_search", default_confidence="medium")
         key = actress_identity_key(item)
         if key:
             merged[key] = item
+            remember_actor_identity(item, match_reason=str(item.get("match_reason") or ""), confidence=str(item.get("confidence") or ""))
     for raw in dmm_results:
         if not isinstance(raw, dict):
             continue
         item = public_metadata_item(dict(raw))
         item["source"] = "dmm"
+        item = append_source_chain(item, "dmm")
         item["dmm_name"] = str(item.get("dmm_name") or item.get("name") or item.get("id") or "").strip()
         if item.get("url") and allowed_external_url(str(item.get("url") or ""), DMM_HOSTS):
             item["dmm_url"] = item.get("url")
+        item = explain_match(item, default_reason="dmm_actress_search", default_confidence="high")
         key = actress_identity_key(item)
         if not key:
             continue
@@ -3024,6 +3317,7 @@ def merge_actress_sources(javdb_results: list[dict[str, Any]], dmm_results: list
             combined = dict(existing)
             existing_source = str(existing.get("source") or "").strip()
             combined["source"] = existing_source if "dmm" in existing_source else f"{existing_source}+dmm".strip("+")
+            combined = append_source_chain(combined, *source_chain_for_item(existing), *source_chain_for_item(item))
             combined["dmm_name"] = item.get("dmm_name") or item.get("name") or combined.get("dmm_name", "")
             combined["dmm_url"] = item.get("dmm_url") or combined.get("dmm_url", "")
             combined["latest"] = item.get("latest") or combined.get("latest")
@@ -3033,9 +3327,11 @@ def merge_actress_sources(javdb_results: list[dict[str, Any]], dmm_results: list
             combined["latest_date"] = item.get("latest_date") or combined.get("latest_date", "")
             if not combined.get("cover"):
                 combined["cover"] = item.get("cover", "")
+            combined = explain_match(combined, default_reason="merged_actress_identity", default_confidence="high")
             merged[key] = combined
         else:
             merged[key] = item
+        remember_actor_identity(merged[key], match_reason=str(merged[key].get("match_reason") or ""), confidence=str(merged[key].get("confidence") or ""))
     return list(merged.values())
 
 
@@ -3390,10 +3686,15 @@ def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, i
     javdb_id = actress_javdb_lookup_id(actress)
     lookup_name = actress_lookup_name(actress)
     dmm_url = actress_dmm_lookup_url(actress)
-    cache_key = metadata_cache_key("v7", "actress_avs", actress_id, javdb_id, lookup_name, dmm_url)
+    cache_key = metadata_cache_key("v8", "actress_avs", actress_id, javdb_id, lookup_name, dmm_url)
     cached = cache_get("actress_avs", cache_key) if cache_key else None
     if isinstance(cached, list):
-        cached = filter_avs_by_actor_limit([item for item in cached if isinstance(item, dict)], context="actress_avs_cache")
+        cached = [
+            public_metadata_item(explain_match({**item, "_cache_hit": True}, default_reason="sqlite_cache", default_confidence="high"))
+            for item in cached
+            if isinstance(item, dict)
+        ]
+        cached = filter_avs_by_actor_limit(cached, context="actress_avs_cache")
         remember_av_summaries(cached)
         app_log("info", "metadata-cache", "女优作品列表命中 SQLite 缓存", {
             "stage": "actress_avs_sqlite_cache_hit",
@@ -3442,7 +3743,25 @@ def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, i
                 "javdb_id": javdb_id,
                 "error": str(exc),
             })
-    merged = filter_avs_by_actor_limit(merge_av_sources(javdb_results, javlibrary_results, dmm_results), context="actress_avs")
+    dmm_results = [
+        explain_match(append_source_chain(item, "dmm"), default_reason="actress_dmm_match", default_confidence="high")
+        for item in dmm_results
+        if isinstance(item, dict)
+    ]
+    javlibrary_results = [
+        explain_match(append_source_chain(item, "javlibrary"), default_reason="actress_seed", default_confidence="high")
+        for item in javlibrary_results
+        if isinstance(item, dict)
+    ]
+    javdb_results = [
+        explain_match(append_source_chain(item, "javdb"), default_reason="actress_javdb_fallback", default_confidence="medium")
+        for item in javdb_results
+        if isinstance(item, dict)
+    ]
+    merged = filter_avs_by_actor_limit(
+        [public_metadata_item(explain_match(item, default_reason="actress_merged", default_confidence="medium")) for item in merge_av_sources(javdb_results, javlibrary_results, dmm_results)],
+        context="actress_avs",
+    )
     remember_av_summaries(merged)
     if cache_key and merged:
         cache_set("actress_avs", cache_key, [public_metadata_item(item) for item in merged], METADATA_ACTRESS_AVS_TTL)
@@ -3551,7 +3870,20 @@ def fetch_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
             javdb_avs = javdb.search_av(query)
         except Exception as exc:
             app_log("warning", "subscription", "JavDB 番号搜索失败", {"stage": "av_search_javdb_error", "query": query, "error": str(exc)})
-    results = filter_avs_by_actor_limit(merge_av_sources(dmm_avs, javdb_avs), context="av_search")
+    dmm_avs = [
+        explain_match(append_source_chain(item, "dmm"), default_reason="exact_av_id", default_confidence="high")
+        for item in dmm_avs
+        if isinstance(item, dict)
+    ]
+    javdb_avs = [
+        explain_match(append_source_chain(item, "javdb"), default_reason="javdb_av_fallback", default_confidence="medium")
+        for item in javdb_avs
+        if isinstance(item, dict)
+    ]
+    results = filter_avs_by_actor_limit(
+        [explain_match(item, default_reason="av_search", default_confidence="medium") for item in merge_av_sources(dmm_avs, javdb_avs)],
+        context="av_search",
+    )
     remember_av_summaries(results)
     return [public_metadata_item(item) for item in results]
 
@@ -3559,14 +3891,19 @@ def fetch_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
 def cached_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
     query = str(q or "").strip()
     safe_type = "actress" if search_type == "actress" else "av"
-    key = metadata_cache_key("v6", safe_type, query)
+    key = metadata_cache_key("v8", safe_type, query)
     result = cached_metadata(
         "subscription_search",
         key,
         METADATA_SEARCH_TTL,
         lambda: fetch_subscription_search(query, safe_type),
     )
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+    return [
+        explain_match(normalize_image_fields(item), default_reason=f"{safe_type}_search", default_confidence="medium") if isinstance(item, dict) else item
+        for item in result
+    ]
 
 
 def cached_actress_profile(actress_id: str) -> dict[str, Any]:
@@ -3584,6 +3921,9 @@ def cached_actress_identity(query: str) -> dict[str, Any]:
     value = str(query or "").strip()
     if not value:
         return {}
+    local_identity = cached_actor_identity(value)
+    if local_identity:
+        return explain_match(local_identity, default_reason="actor_identity_cache", default_confidence="high")
     candidates = cached_subscription_search(value, "actress")
     if not candidates:
         return {}
@@ -3671,8 +4011,7 @@ def prioritize_dmm_maker_labels(items: list[dict[str, Any]], maker_name: str, li
             preferred.append({**item, "source_scope": "label"})
         else:
             fallback.append({**item, "source_scope": "maker"})
-    combined = preferred if len(preferred) >= limit else preferred + fallback
-    return combined
+    return preferred or fallback
 
 
 def sort_maker_listing_items(items: list[dict[str, Any]], maker_name: str) -> list[dict[str, Any]]:
@@ -3716,6 +4055,8 @@ def enrich_dmm_maker_items(items: list[dict[str, Any]], maker_name: str, limit: 
 
 
 def fetch_listing_sources(page_url: str, maker_name: str, safe_limit: int, *, force_refresh: bool) -> list[dict[str, Any]]:
+    if maker_name:
+        remember_maker_identity(maker_name)
     javdb_results: list[dict[str, Any]] = []
     dmm_results: list[dict[str, Any]] = []
     javlibrary_results: list[dict[str, Any]] = []
@@ -3766,7 +4107,25 @@ def fetch_listing_sources(page_url: str, maker_name: str, safe_limit: int, *, fo
                 "url": page_url,
                 "error": str(exc),
             })
-    results = [hydrate_av_with_cached_summary(item) for item in merge_av_sources(javdb_results, javlibrary_results, dmm_results)]
+    dmm_results = [
+        explain_match(append_source_chain(item, "dmm"), default_reason="primary_label", default_confidence="high")
+        for item in dmm_results
+        if isinstance(item, dict)
+    ]
+    javlibrary_results = [
+        explain_match(append_source_chain(item, "javlibrary"), default_reason="primary_label", default_confidence="high")
+        for item in javlibrary_results
+        if isinstance(item, dict)
+    ]
+    javdb_results = [
+        explain_match(append_source_chain(item, "javdb"), default_reason="javdb_maker_fallback", default_confidence="low")
+        for item in javdb_results
+        if isinstance(item, dict)
+    ]
+    results = [
+        public_metadata_item(explain_match(hydrate_av_with_cached_summary(item), default_reason="maker_listing", default_confidence="medium"))
+        for item in merge_av_sources(javdb_results, javlibrary_results, dmm_results)
+    ]
     results = filter_avs_by_actor_limit(results, context="maker_listing")
     results = sort_maker_listing_items(results, maker_name)
     app_log("info", "maker", "厂牌发售数据源合并完成", {
@@ -3786,7 +4145,7 @@ def cached_listing(page_url: str, limit: int = 60, *, force_refresh: bool = Fals
         return []
     safe_limit = max(1, min(60, int(limit or 60)))
     resolved_maker_name = maker_name_for_listing_url(url, maker_name)
-    key = hashlib.sha256(f"v15|{url}|{resolved_maker_name}".encode("utf-8")).hexdigest()
+    key = hashlib.sha256(f"v18|{url}|{resolved_maker_name}".encode("utf-8")).hexdigest()
     if force_refresh:
         results = fetch_listing_sources(url, resolved_maker_name, safe_limit, force_refresh=True)
         if results:
@@ -3795,7 +4154,11 @@ def cached_listing(page_url: str, limit: int = 60, *, force_refresh: bool = Fals
         return results[:safe_limit]
     cached = cache_get("listing", key)
     if isinstance(cached, list) and len(cached) >= safe_limit:
-        result = cached
+        result = [
+            public_metadata_item(explain_match({**item, "_cache_hit": True}, default_reason="sqlite_cache", default_confidence="high"))
+            for item in cached
+            if isinstance(item, dict)
+        ]
         app_log("info", "metadata-cache", "厂牌发售命中 SQLite 缓存", {
             "stage": "listing_sqlite_cache_hit",
             "maker": resolved_maker_name,
@@ -3893,6 +4256,34 @@ def av_within_global_actor_limit(av: dict[str, Any], *, max_coactors: int | None
     return actor_count_from_summary(av) <= safe_max
 
 
+def actor_limit_verification(av: dict[str, Any], *, max_coactors: int | None = None, context: str = "") -> dict[str, Any]:
+    safe_max = max(1, min(GLOBAL_MAX_COACTORS, int(max_coactors or configured_max_coactors())))
+    payload = prepare_subscription_av_payload(av)
+    actors = resolve_av_actors_for_limit(payload)
+    actor_count = actor_count_for_limit(payload, actors)
+    if actors:
+        payload["actresses"] = actors
+    ok = actor_count <= safe_max
+    result = {
+        "ok": ok,
+        "payload": payload,
+        "actors": actors,
+        "actor_count": actor_count,
+        "max_coactors": safe_max,
+        "reason": "" if ok else f"共演人数 {actor_count} 超过限制 {safe_max}",
+    }
+    if not ok:
+        app_log("info", "subscription", "最终动作前跳过超过共演人数限制的番号", {
+            "stage": "actor_limit_final_skip",
+            "context": context,
+            "av_id": payload.get("id", av.get("id", "")),
+            "actor_count": actor_count,
+            "max_coactors": safe_max,
+            "title": payload.get("title", ""),
+        })
+    return result
+
+
 def filter_avs_by_actor_limit(items: list[dict[str, Any]], *, context: str = "", max_coactors: int | None = None) -> list[dict[str, Any]]:
     safe_max = max(1, min(GLOBAL_MAX_COACTORS, int(max_coactors or configured_max_coactors())))
     result: list[dict[str, Any]] = []
@@ -3917,7 +4308,12 @@ def filter_avs_by_actor_limit(items: list[dict[str, Any]], *, context: str = "",
 
 
 def subscribed_avs_with_global_filter(context: str = "subscribed_av") -> list[dict[str, Any]]:
-    return filter_avs_by_actor_limit(get_subscription_service().get_subscribed_av(), context=context)
+    items = filter_avs_by_actor_limit(get_subscription_service().get_subscribed_av(), context=context)
+    return [
+        public_metadata_item(explain_match(hydrate_av_with_cached_summary(item), default_reason="subscription_list", default_confidence="medium"))
+        for item in items
+        if isinstance(item, dict)
+    ]
 
 
 def dirty_subscription_candidates() -> list[dict[str, Any]]:
@@ -3992,9 +4388,12 @@ def poll_subscriptions_once() -> dict[str, Any]:
                     app_log("info", "subscription", "跳过超过共演人数限制的番号", {"av_id": av_id, "actor_count": actor_count, "max_coactors": max_coactors})
                     continue
                 payload = prepare_subscription_av_payload(av)
-                if not av_within_global_actor_limit(payload, max_coactors=max_coactors):
-                    app_log("info", "subscription", "详情补全后跳过超过共演人数限制的番号", {"av_id": av_id, "max_coactors": max_coactors})
+                verification = actor_limit_verification(payload, max_coactors=max_coactors, context="actress_poll")
+                if not verification["ok"]:
+                    app_log("info", "subscription", "详情补全后跳过超过共演人数限制的番号", {"av_id": av_id, "max_coactors": max_coactors, "actor_count": verification["actor_count"]})
                     continue
+                payload = verification["payload"]
+                actors = verification["actors"] or actors
                 payload["auto_subscribed"] = True
                 payload["source_actress_id"] = actress_id
                 payload["source_actress_name"] = actress.get("name", "")
@@ -4027,7 +4426,7 @@ def poll_subscriptions_once() -> dict[str, Any]:
     return {"checked": len(actresses), "added": added, "errors": errors}
 
 
-def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool = False) -> dict[str, Any]:
+def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool = False, download: bool = True) -> dict[str, Any]:
     service = get_subscription_service()
     max_coactors = configured_max_coactors()
     actress_id = str(actress.get("id") or "")
@@ -4042,6 +4441,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
         "actress_id": actress_id,
         "since_date": since_date,
         "future_only": future_only,
+        "download": download,
         "include_vr": bool(actress.get("include_vr", False)),
     })
     try:
@@ -4081,9 +4481,12 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                 skipped.append({"id": av_id, "reason": f"共演人数 {actor_count} 超过限制"})
                 continue
             payload = prepare_subscription_av_payload(av)
-            if not av_within_global_actor_limit(payload, max_coactors=max_coactors):
-                skipped.append({"id": av_id, "reason": f"详情补全后共演人数超过 {max_coactors}"})
+            verification = actor_limit_verification(payload, max_coactors=max_coactors, context="actress_subscribe_latest")
+            if not verification["ok"]:
+                skipped.append({"id": av_id, "reason": verification["reason"] or f"详情补全后共演人数超过 {max_coactors}"})
                 continue
+            payload = verification["payload"]
+            actors = verification["actors"] or actors
             payload["auto_subscribed"] = True
             payload["source_actress_id"] = actress_id
             payload["source_actress_name"] = actress.get("name", "")
@@ -4099,24 +4502,26 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                 "release_date": release_date,
                 "status": saved.get("status"),
             })
-            send_notification_event("av_subscribed", {
-                "status": saved.get("status") or "subscribed",
-                "title": str(saved.get("title") or av_id),
-                "detail": f"已订阅 {av_id}：{saved.get('title') or ''}".strip(),
-                "av_id": av_id,
-                "actress": actress.get("name", ""),
-                "release_date": release_date,
-            })
-            if saved.get("status") != "in_library":
+            if download:
+                send_notification_event("av_subscribed", {
+                    "status": saved.get("status") or "subscribed",
+                    "title": str(saved.get("title") or av_id),
+                    "detail": f"已订阅 {av_id}：{saved.get('title') or ''}".strip(),
+                    "av_id": av_id,
+                    "actress": actress.get("name", ""),
+                    "release_date": release_date,
+                })
+            if download and saved.get("status") != "in_library":
                 download_av_from_mteam(saved)
             else:
-                send_notification_event("jellyfin_in_library", {
-                    "status": "in_library",
-                    "title": str(saved.get("title") or av_id),
-                    "detail": f"{av_id} 已在 Jellyfin 媒体库中",
-                    "av_id": av_id,
-                    "path": saved.get("jellyfin_path", ""),
-                })
+                if saved.get("status") == "in_library":
+                    send_notification_event("jellyfin_in_library", {
+                        "status": "in_library",
+                        "title": str(saved.get("title") or av_id),
+                        "detail": f"{av_id} 已在 Jellyfin 媒体库中",
+                        "av_id": av_id,
+                        "path": saved.get("jellyfin_path", ""),
+                    })
         except Exception as exc:
             errors.append(f"{av_id}: {exc}")
             send_notification_event("task_failed", {
@@ -4610,6 +5015,20 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         result.update({"status": "skipped", "message": "Jellyfin 已入库，跳过下载"})
         app_log("info", "download", "跳过下载：Jellyfin 已入库", {"stage": "download_skip_library", "av_id": av_id})
         return result
+    verification = actor_limit_verification(av, context="mteam_download")
+    if not verification["ok"]:
+        message = str(verification.get("reason") or f"超过全局 {GLOBAL_MAX_COACTORS} 人共演限制，跳过下载")
+        result.update({"status": "skipped", "message": message})
+        if save_to_subscription:
+            get_subscription_service().update_av_download(av_id, {"download_status": "skipped", "download_message": message})
+        app_log("info", "download", "跳过下载：超过共演人数限制", {
+            "stage": "download_skip_actor_limit",
+            "av_id": av_id,
+            "actor_count": verification.get("actor_count"),
+            "max_coactors": verification.get("max_coactors"),
+        })
+        return result
+    av = verification["payload"]
 
     settings_data = get_system_settings_service().get()
     service = get_subscription_service()
@@ -7130,6 +7549,69 @@ async def api_test_notification_payload(request: Request) -> dict[str, object]:
     return result
 
 
+@app.post("/api/wechat/menu")
+async def api_create_wechat_menu(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    channel = payload.get("channel") if isinstance(payload, dict) else None
+    if isinstance(channel, dict):
+        config = channel.get("config") if isinstance(channel.get("config"), dict) else channel
+    else:
+        saved_channel = first_wechat_work_channel()
+        if not saved_channel:
+            raise HTTPException(status_code=400, detail="未找到已启用的企业微信通知通道")
+        config = saved_channel.get("config") if isinstance(saved_channel.get("config"), dict) else {}
+    if not wechat_work_configured(config):
+        raise HTTPException(status_code=400, detail="未配置企业微信 CorpID、Secret 或应用 ID")
+    return create_wechat_work_menu(config)
+
+
+@app.get("/api/v1/message")
+def api_wechat_verify(
+    msg_signature: str = "",
+    timestamp: str = "",
+    nonce: str = "",
+    echostr: str = "",
+) -> Response:
+    channel = first_wechat_work_channel(callback=True)
+    if not channel:
+        raise HTTPException(status_code=400, detail="未配置已启用的企业微信回调通道")
+    config = channel.get("config") if isinstance(channel.get("config"), dict) else {}
+    token = str(config.get("token") or "")
+    if wechat_signature(token, timestamp, nonce, echostr) != msg_signature:
+        raise HTTPException(status_code=403, detail="企业微信回调签名校验失败")
+    plain = wechat_decrypt_message(config, echostr)
+    return Response(plain, media_type="text/plain")
+
+
+@app.post("/api/v1/message")
+async def api_wechat_message(
+    request: Request,
+    msg_signature: str = "",
+    timestamp: str = "",
+    nonce: str = "",
+) -> Response:
+    channel = first_wechat_work_channel(callback=True)
+    if not channel:
+        raise HTTPException(status_code=400, detail="未配置已启用的企业微信回调通道")
+    config = channel.get("config") if isinstance(channel.get("config"), dict) else {}
+    body = (await request.body()).decode("utf-8", errors="ignore")
+    try:
+        encrypted = parse_xml_payload(body).get("Encrypt", "")
+        if not encrypted:
+            raise RuntimeError("企业微信回调缺少 Encrypt")
+        if wechat_signature(str(config.get("token") or ""), timestamp, nonce, encrypted) != msg_signature:
+            raise RuntimeError("企业微信回调签名校验失败")
+        payload = parse_xml_payload(wechat_decrypt_message(config, encrypted))
+        reply = process_wechat_callback_message(config, payload)
+        user_id = payload.get("FromUserName") or str(config.get("touser") or "")
+        if str(reply or "").strip():
+            send_wechat_work_text(config, user_id, reply)
+        app_log("info", "wechat", "企业微信消息已处理", {"user_id": user_id, "msg_type": payload.get("MsgType", ""), "reply": reply[:160]})
+    except Exception as exc:
+        app_log("error", "wechat", "企业微信消息处理失败", {"error": str(exc)})
+    return Response("success", media_type="text/plain")
+
+
 @app.get("/api/subscriptions/search")
 def api_search_subscriptions(q: str = "", type: str = "av", include_mteam: bool = False) -> dict[str, object]:
     """搜索番号或女优。"""
@@ -7157,8 +7639,10 @@ async def api_subscribe_av(request: Request) -> dict[str, object]:
     payload["id"] = canonical_av_id(payload.get("id"))
     app_log("info", "subscription", "开始订阅番号", {"stage": "subscribe_start", "av_id": payload.get("id")})
     payload = prepare_subscription_av_payload(payload)
-    if not av_within_global_actor_limit(payload):
-        raise HTTPException(status_code=400, detail=f"该番号超过全局 {GLOBAL_MAX_COACTORS} 人共演限制，已自动过滤")
+    verification = actor_limit_verification(payload, context="manual_subscribe")
+    if not verification["ok"]:
+        raise HTTPException(status_code=400, detail=verification["reason"] or f"该番号超过全局 {GLOBAL_MAX_COACTORS} 人共演限制，已自动过滤")
+    payload = verification["payload"]
     apply_jellyfin_status(payload)
     service = get_subscription_service()
     result = service.subscribe_av(payload)
@@ -7318,7 +7802,7 @@ def latest_actress_work_summary(actress: dict[str, Any] | str) -> dict[str, str]
         app_log("warning", "subscription", "女优作品封面兜底失败", {"actress_id": payload.get("id", ""), "error": str(exc)})
         return {}
     for item in works:
-        cover = str(item.get("cover") or "").strip()
+        cover = normalize_cover_url(str(item.get("cover") or "").strip())
         if cover:
             return {
                 "latest_cover": cover,
@@ -7344,7 +7828,7 @@ def av_cover_used_as_actress_cover(value: object) -> bool:
 
 
 def enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    result = dict(payload)
+    result = normalize_image_fields(payload)
     if av_cover_used_as_actress_cover(result.get("cover")):
         result.setdefault("latest_cover", result.get("cover"))
         result["cover"] = ""
@@ -7371,8 +7855,16 @@ def enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
             result["dmm_url"] = identity.get("dmm_url")
         if identity.get("source"):
             result["source"] = identity.get("source")
+        if identity.get("source_chain"):
+            result["source_chain"] = identity.get("source_chain")
+        if identity.get("match_reason"):
+            result.setdefault("match_reason", identity.get("match_reason"))
+        if identity.get("confidence"):
+            result.setdefault("confidence", identity.get("confidence"))
+        if identity.get("javlibrary_star_id"):
+            result["javlibrary_star_id"] = identity.get("javlibrary_star_id")
         if not result.get("cover") and identity.get("source") != "dmm" and identity.get("cover"):
-            result["cover"] = identity.get("cover")
+            result["cover"] = normalize_cover_url(str(identity.get("cover") or ""))
         if bad_actress_name(result.get("name")) and identity.get("name"):
             result["name"] = identity.get("name")
 
@@ -7385,7 +7877,7 @@ def enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     profile_id = str(profile.get("id") or "").strip()
     profile_name = str(profile.get("name") or "").strip()
-    profile_cover = str(profile.get("cover") or "").strip()
+    profile_cover = normalize_cover_url(str(profile.get("cover") or "").strip())
 
     if profile_id and profile_id != actress_ref and re.fullmatch(r"[A-Za-z0-9]+", profile_id):
         result["id"] = profile_id
@@ -7403,6 +7895,8 @@ def enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
         result["dmm_name"] = result.get("name")
     if not result.get("dmm_url") and str(result.get("url") or "").strip() and allowed_external_url(str(result.get("url") or ""), DMM_HOSTS):
         result["dmm_url"] = str(result.get("url") or "").strip()
+    result = explain_match(normalize_image_fields(result), default_reason="actor_identity_enriched", default_confidence="medium")
+    remember_actor_identity(result, match_reason=str(result.get("match_reason") or ""), confidence=str(result.get("confidence") or ""))
     return result
 
 
@@ -7447,6 +7941,7 @@ async def api_subscribe_actress(request: Request) -> dict[str, object]:
     service = get_subscription_service()
     payload = enriched_actress_payload(payload)
     result = service.subscribe_actress(payload)
+    remember_actor_identity(result, match_reason=str(result.get("match_reason") or "subscribed_actor"), confidence=str(result.get("confidence") or "medium"))
     app_log("info", "subscription", "订阅女优", {"actress_id": result.get("id"), "name": result.get("name"), "since_date": result.get("since_date")})
     latest = subscribe_latest_for_actress(result, future_only=True)
     app_log("info", "subscription", "订阅女优并扫描未发售番号完成", {
@@ -7851,6 +8346,12 @@ def default_notification_template(event_key: str) -> dict[str, str]:
     }
 
 
+def notification_template_looks_broken(template: dict[str, Any]) -> bool:
+    text = f"{template.get('title') or ''}\n{template.get('message') or ''}"
+    broken_markers = ("锛", "鐘", "歿", "亄", "閫", "绯", "�")
+    return any(marker in text for marker in broken_markers)
+
+
 def render_notification_template(template: str, data: dict[str, Any]) -> str:
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
@@ -7864,7 +8365,7 @@ def render_notification_template(template: str, data: dict[str, Any]) -> str:
 
 def notification_detail(data: dict[str, Any]) -> str:
     detail = str(data.get("detail") or data.get("message") or "").strip()
-    if detail:
+    if detail and not notification_text_looks_broken(detail):
         return detail
     parts: list[str] = []
     for key in ("av_id", "title", "actress", "torrent_title", "task_id", "path"):
@@ -7872,6 +8373,746 @@ def notification_detail(data: dict[str, Any]) -> str:
         if value:
             parts.append(f"{key}: {value}")
     return "；".join(parts) or "事件已处理"
+
+
+def notification_text_looks_broken(value: object) -> bool:
+    text = str(value or "")
+    if text.count("?") >= 3:
+        return True
+    broken_markers = ("锛", "歿", "鐘", "閫", "绯荤", "娑堟", "浠诲", "灏侀")
+    return any(marker in text for marker in broken_markers)
+
+
+def notification_safe_text(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text or notification_text_looks_broken(text):
+        return fallback
+    return text
+
+
+def notification_dedupe_key(event_key: str, data: dict[str, Any]) -> str:
+    identity = (
+        data.get("av_id")
+        or data.get("torrent_id")
+        or data.get("task_id")
+        or data.get("path")
+        or data.get("detail")
+        or data.get("title")
+        or ""
+    )
+    return f"{event_key}:{str(identity)[:180]}:{data.get('status') or ''}"
+
+
+def notification_recently_sent(event_key: str, data: dict[str, Any], window_seconds: int = 90) -> bool:
+    key = notification_dedupe_key(event_key, data)
+    now = time.time()
+    with notification_dedupe_lock:
+        expired = [item for item, ts in notification_dedupe.items() if now - ts > window_seconds]
+        for item in expired:
+            notification_dedupe.pop(item, None)
+        previous = notification_dedupe.get(key)
+        if previous and now - previous <= window_seconds:
+            return True
+        notification_dedupe[key] = now
+    return False
+
+
+def wechat_http_client(config: dict[str, Any], timeout: float = 12) -> httpx.Client:
+    kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True}
+    http_proxy = str(config.get("http_proxy") or "").strip()
+    if http_proxy:
+        kwargs["proxy"] = http_proxy
+    return httpx.Client(**kwargs)
+
+
+def wechat_api_url(config: dict[str, Any], path: str) -> str:
+    api_base = str(config.get("proxy") or "").strip().rstrip("/")
+    if api_base:
+        return f"{api_base}{path}"
+    return f"https://qyapi.weixin.qq.com{path}"
+
+
+def wechat_access_token(config: dict[str, Any]) -> str:
+    corp_id = str(config.get("corp_id") or "").strip()
+    corp_secret = str(config.get("corp_secret") or "").strip()
+    if not corp_id or not corp_secret:
+        raise RuntimeError("未配置企业微信 CorpID 或 Secret")
+    cache_key = hashlib.sha256(f"{corp_id}:{corp_secret}".encode("utf-8")).hexdigest()
+    now = time.time()
+    with wechat_token_lock:
+        cached = wechat_token_cache.get(cache_key)
+        if cached and str(cached.get("token") or "") and float(cached.get("expires_at") or 0) > now + 120:
+            return str(cached["token"])
+    with wechat_http_client(config) as client:
+        resp = client.get(wechat_api_url(config, "/cgi-bin/gettoken"), params={"corpid": corp_id, "corpsecret": corp_secret})
+        resp.raise_for_status()
+        payload = resp.json()
+    if int(payload.get("errcode") or 0) != 0:
+        raise RuntimeError(str(payload.get("errmsg") or payload))
+    token = str(payload.get("access_token") or "")
+    expires_in = int(payload.get("expires_in") or 7200)
+    with wechat_token_lock:
+        wechat_token_cache[cache_key] = {"token": token, "expires_at": now + expires_in}
+    return token
+
+
+def send_wechat_work_payload(config: dict[str, Any], payload: dict[str, Any]) -> dict[str, object]:
+    token = wechat_access_token(config)
+    with wechat_http_client(config) as client:
+        resp = client.post(
+            wechat_api_url(config, "/cgi-bin/message/send"),
+            params={"access_token": token},
+            json=payload,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    if int(result.get("errcode") or 0) != 0:
+        return {"status": "error", "message": str(result.get("errmsg") or result)}
+    return {"status": "ok", "message": "企业微信通知已发送", "detail": result}
+
+
+def wechat_work_message_payload(config: dict[str, Any], title: str, message: str) -> dict[str, Any]:
+    agent_id = int(str(config.get("agent_id") or "0") or 0)
+    touser = str(config.get("touser") or "@all").strip() or "@all"
+    image_url = str(config.get("default_image_url") or "").strip()
+    if bool(config.get("cover_enabled", True)) and image_url:
+        return {
+            "touser": touser,
+            "msgtype": "news",
+            "agentid": agent_id,
+            "news": {
+                "articles": [
+                    {
+                        "title": title[:128],
+                        "description": message[:512],
+                        "url": str(config.get("article_url") or image_url),
+                        "picurl": image_url,
+                    }
+                ]
+            },
+            "safe": 0,
+            "enable_id_trans": 0,
+            "enable_duplicate_check": 0,
+        }
+    return {
+        "touser": touser,
+        "msgtype": "text",
+        "agentid": agent_id,
+        "text": {"content": f"{title}\n\n{message}"[:2048]},
+        "safe": 0,
+        "enable_id_trans": 0,
+        "enable_duplicate_check": 0,
+    }
+
+
+def send_wechat_work_text(config: dict[str, Any], touser: str, content: str) -> dict[str, object]:
+    payload = {
+        "touser": str(touser or "").strip() or str(config.get("touser") or "@all"),
+        "msgtype": "text",
+        "agentid": int(str(config.get("agent_id") or "0") or 0),
+        "text": {"content": content[:2048]},
+        "safe": 0,
+    }
+    return send_wechat_work_payload(config, payload)
+
+
+def wechat_work_configured(config: dict[str, Any], *, callback: bool = False) -> bool:
+    required = ("corp_id", "corp_secret", "agent_id")
+    if callback:
+        required = (*required, "token", "aes_key")
+    return all(str(config.get(key) or "").strip() for key in required)
+
+
+def wechat_work_channels(enabled_only: bool = True) -> list[dict[str, Any]]:
+    notifications = get_system_settings_service().get().get("notifications", {})
+    channels = notifications.get("channels") if isinstance(notifications, dict) else []
+    result: list[dict[str, Any]] = []
+    for channel in channels if isinstance(channels, list) else []:
+        if not isinstance(channel, dict) or str(channel.get("type") or "") != "wechat_work":
+            continue
+        if enabled_only and not channel.get("enabled"):
+            continue
+        result.append(channel)
+    return result
+
+
+def first_wechat_work_channel(*, callback: bool = False) -> dict[str, Any] | None:
+    for channel in wechat_work_channels(enabled_only=True):
+        config = channel.get("config") if isinstance(channel.get("config"), dict) else {}
+        if wechat_work_configured(config, callback=callback):
+            return channel
+    return None
+
+
+def create_wechat_work_menu(config: dict[str, Any]) -> dict[str, object]:
+    token = wechat_access_token(config)
+    agent_id = str(config.get("agent_id") or "").strip()
+    menu = {
+        "button": [
+            {"type": "click", "name": "下载", "key": "MM_REFRESH_SUBSCRIPTIONS"},
+            {"type": "click", "name": "最新", "key": "MM_REFRESH_ACTRESS"},
+            {"type": "click", "name": "帮助", "key": "MM_HELP"},
+        ]
+    }
+    with wechat_http_client(config) as client:
+        resp = client.post(
+            wechat_api_url(config, "/cgi-bin/menu/create"),
+            params={"access_token": token, "agentid": agent_id},
+            json=menu,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    if int(result.get("errcode") or 0) != 0:
+        return {"status": "error", "message": str(result.get("errmsg") or result)}
+    return {"status": "ok", "message": "企业微信应用菜单已创建", "menu": menu}
+
+
+def wechat_signature(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
+    raw = "".join(sorted([token, timestamp, nonce, encrypt]))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def wechat_aes_key(aes_key: str) -> bytes:
+    key = str(aes_key or "").strip()
+    if len(key) != 43:
+        raise RuntimeError("企业微信 EncodingAESKey 必须为 43 位")
+    return base64.b64decode(key + "=")
+
+
+def wechat_decrypt_message(config: dict[str, Any], encrypt: str) -> str:
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except Exception as exc:
+        raise RuntimeError("缺少 cryptography 依赖，无法解密企业微信回调") from exc
+    key = wechat_aes_key(str(config.get("aes_key") or ""))
+    cipher = Cipher(algorithms.AES(key), modes.CBC(key[:16]))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(base64.b64decode(encrypt)) + decryptor.finalize()
+    pad = padded[-1]
+    if pad < 1 or pad > 32:
+        raise RuntimeError("企业微信回调解密 padding 无效")
+    plain = padded[:-pad]
+    if len(plain) < 20:
+        raise RuntimeError("企业微信回调解密内容无效")
+    msg_len = struct.unpack("!I", plain[16:20])[0]
+    xml_bytes = plain[20:20 + msg_len]
+    receive_id = plain[20 + msg_len:].decode("utf-8", errors="ignore")
+    corp_id = str(config.get("corp_id") or "")
+    if corp_id and receive_id and receive_id != corp_id:
+        raise RuntimeError("企业微信回调 CorpID 不匹配")
+    return xml_bytes.decode("utf-8")
+
+
+def parse_xml_payload(xml_text: str) -> dict[str, str]:
+    root = ET.fromstring(xml_text)
+    return {child.tag: str(child.text or "") for child in root}
+
+
+def wechat_session_key(user_id: str) -> str:
+    return str(user_id or "").strip() or "unknown"
+
+
+def update_wechat_session(user_id: str, **values: Any) -> None:
+    key = wechat_session_key(user_id)
+    with wechat_session_lock:
+        session = wechat_sessions.setdefault(key, {})
+        session.update(values)
+        session["updated_at"] = time.time()
+
+
+def get_wechat_session(user_id: str) -> dict[str, Any]:
+    key = wechat_session_key(user_id)
+    with wechat_session_lock:
+        session = dict(wechat_sessions.get(key) or {})
+    if session and time.time() - float(session.get("updated_at") or 0) < 3600:
+        return session
+    return {}
+
+
+def summarize_search_result(item: dict[str, Any], kind: str) -> str:
+    if kind == "actress":
+        return (
+            f"找到女优：{item.get('name') or item.get('id')}\n"
+            f"最新番号：{item.get('latest_av_id') or item.get('latest', {}).get('id') or '-'}\n"
+            f"最新标题：{item.get('latest_title') or item.get('latest', {}).get('title') or '-'}\n\n"
+            "点击菜单“刷新女优最新”可订阅该女优并刷新未发售番号。"
+        )
+    return (
+        f"找到番号：{item.get('id')}\n"
+        f"标题：{item.get('title') or '-'}\n"
+        f"日期：{item.get('date') or item.get('release_date') or '-'}\n\n"
+        "发送番号会搜索 MTeam；回复数字可选择种子下载。也可以直接回复：订阅 番号"
+    )
+
+
+def wechat_download_stats(download_result: dict[str, Any] | None, subscription: dict[str, Any] | None = None) -> dict[str, int]:
+    result = download_result if isinstance(download_result, dict) else {}
+    subscription = subscription if isinstance(subscription, dict) else {}
+    status = str(result.get("status") or "")
+    pushed = 1 if status in {"ok", "exists", "sent"} else 0
+    completed = 1 if str(subscription.get("status") or "") in {"done", "in_library"} else 0
+    predownload = 1 if str(subscription.get("subscription_mode") or "") == "predownload" and pushed else 0
+    return {"pushed": pushed, "completed": completed, "predownload": predownload}
+
+
+def format_wechat_subscription_stats(stats: dict[str, int], *, prefix: str = "订阅下载任务完成") -> str:
+    return (
+        f"{prefix}\n"
+        f"推送番号下载：{int(stats.get('pushed') or 0)} 个\n"
+        f"完成订阅：{int(stats.get('completed') or 0)} 个\n"
+        f"完成预下载：{int(stats.get('predownload') or 0)} 个"
+    )
+
+
+def merge_wechat_stats(items: list[dict[str, int]]) -> dict[str, int]:
+    return {
+        "pushed": sum(int(item.get("pushed") or 0) for item in items),
+        "completed": sum(int(item.get("completed") or 0) for item in items),
+        "predownload": sum(int(item.get("predownload") or 0) for item in items),
+    }
+
+
+def reserve_wechat_action(user_id: str, action: str, ttl: float = 30) -> bool:
+    key = f"{wechat_session_key(user_id)}:{action}"
+    now = time.time()
+    with wechat_action_dedupe_lock:
+        for old_key, old_ts in list(wechat_action_dedupe.items()):
+            if now - old_ts > 300:
+                wechat_action_dedupe.pop(old_key, None)
+        last = float(wechat_action_dedupe.get(key) or 0)
+        if now - last < ttl:
+            return False
+        wechat_action_dedupe[key] = now
+        return True
+
+
+def run_wechat_background_reply(config: dict[str, Any], user_id: str, action: str, build_reply: Callable[[], str]) -> bool:
+    if not reserve_wechat_action(user_id, action):
+        return False
+
+    def worker() -> None:
+        try:
+            reply = build_reply()
+        except Exception as exc:
+            reply = f"操作失败：{exc}"
+            app_log("error", "wechat", "企业微信后台操作失败", {"user_id": user_id, "action": action, "error": str(exc)})
+        if not str(reply or "").strip():
+            return
+        try:
+            send_wechat_work_text(config, user_id, reply)
+        except Exception as exc:
+            app_log("error", "wechat", "企业微信后台结果推送失败", {"user_id": user_id, "action": action, "error": str(exc)})
+
+    threading.Thread(target=worker, name=f"wechat-action-{action}", daemon=True).start()
+    return True
+
+
+def wechat_numeric_choice(text: str) -> int | None:
+    match = re.fullmatch(r"(?:下载|选择)?\s*(\d{1,2})", str(text or "").strip(), re.I)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def likely_av_id_query(text: str) -> str:
+    normalized = canonical_av_id(text)
+    if re.fullmatch(r"[A-Z]{2,}-\d{2,}[A-Z]?", normalized):
+        return normalized
+    return ""
+
+
+def mteam_candidate_score(query: str, item: dict[str, Any]) -> float:
+    title = str(item.get("title") or "").lower()
+    haystack = mteam_item_text(item)
+    normalized = canonical_av_id(query).lower()
+    score = 0.0
+    if normalized and normalized in title:
+        score += 100
+    if contains_any(haystack, ("免费", "免費", "free", "freeleech")):
+        score += 20
+    if contains_any(haystack, ("中字", "中文", "字幕", "chinese", "chs", "cht", "sub")):
+        score += 10
+    if contains_any(haystack, ("uhd", "4k", "2160", "2160p")):
+        score += 4
+    score += min(mteam_size_mb(item.get("size")) / 1024, 20)
+    return score
+
+
+def sorted_mteam_candidates(query: str, torrents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    indexed = [(index, item) for index, item in enumerate(torrents) if isinstance(item, dict)]
+    indexed.sort(key=lambda pair: (-mteam_candidate_score(query, pair[1]), pair[0]))
+    return [item for _, item in indexed]
+
+
+def compact_wechat_text(value: Any, limit: int = 72) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def format_wechat_mteam_size(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str) and re.search(r"[kmgt]b$", value.strip(), re.I):
+        return value.strip()
+    size_mb = mteam_size_mb(value)
+    if not size_mb:
+        return str(value)
+    if size_mb >= 1024 * 1024:
+        return f"{size_mb / 1024 / 1024:.1f} TB"
+    if size_mb >= 1024:
+        return f"{size_mb / 1024:.1f} GB"
+    return f"{size_mb:.0f} MB"
+
+
+def format_wechat_mteam_candidates(query: str, torrents: list[dict[str, Any]], *, limit: int = 8) -> str:
+    visible = torrents[:limit]
+    if not visible:
+        return f"MTeam 没有找到资源：{query}"
+    lines = [
+        f"MTeam 搜索结果：{query}",
+        "回复数字选择种子下载，例如：1",
+    ]
+    for index, item in enumerate(visible, 1):
+        title = compact_wechat_text(item.get("title") or item.get("id") or "未命名种子")
+        meta: list[str] = []
+        size_text = format_wechat_mteam_size(item.get("size"))
+        if size_text:
+            meta.append(size_text)
+        labels = item.get("labels")
+        if isinstance(labels, list) and labels:
+            meta.append("/".join(compact_wechat_text(label, 10) for label in labels[:3]))
+        if item.get("discount"):
+            meta.append(compact_wechat_text(item.get("discount"), 12))
+        meta_text = f"（{' | '.join(meta)}）" if meta else ""
+        lines.append(f"{index}. {title}{meta_text}")
+    if len(torrents) > len(visible):
+        lines.append(f"仅显示前 {len(visible)} 个，共 {len(torrents)} 个。")
+    return "\n".join(lines)
+
+
+def wechat_search_mteam_candidates(user_id: str, query: str) -> str:
+    settings_data = get_system_settings_service().get()
+    result = search_mteam(query, settings_data, limit=12)
+    torrents = sorted_mteam_candidates(query, result.get("results") or [])
+    update_wechat_session(
+        user_id,
+        last_query=query,
+        mteam_query=query,
+        mteam_candidates=torrents[:8],
+        mteam_pending_query="",
+    )
+    if not torrents:
+        message = str(result.get("message") or "")
+        return f"MTeam 没有找到资源：{query}" + (f"\n{message}" if message else "")
+    return format_wechat_mteam_candidates(query, torrents)
+
+
+def schedule_wechat_mteam_search(config: dict[str, Any], user_id: str, query: str) -> None:
+    def worker() -> None:
+        try:
+            reply = wechat_search_mteam_candidates(user_id, query)
+        except Exception as exc:
+            reply = f"MTeam 搜索失败：{query}\n{exc}"
+            update_wechat_session(user_id, mteam_pending_query="", mteam_candidates=[])
+            app_log("error", "wechat", "企业微信 MTeam 搜索失败", {"query": query, "user_id": user_id, "error": str(exc)})
+        try:
+            send_wechat_work_text(config, user_id, reply)
+        except Exception as exc:
+            app_log("error", "wechat", "企业微信 MTeam 搜索结果推送失败", {"query": query, "user_id": user_id, "error": str(exc)})
+
+    threading.Thread(target=worker, name=f"wechat-mteam-search-{query}", daemon=True).start()
+
+
+def wechat_download_mteam_candidate(user_id: str, choice: int) -> str:
+    session = get_wechat_session(user_id)
+    pending_query = str(session.get("mteam_pending_query") or "").strip()
+    candidates = session.get("mteam_candidates") if isinstance(session.get("mteam_candidates"), list) else []
+    if pending_query and not candidates:
+        return f"MTeam 正在搜索：{pending_query}\n结果出来后再回复数字选择。"
+    if not candidates:
+        return "当前没有可选择的 MTeam 结果。请先发送番号搜索，例如：SNOS-250"
+    if choice < 1 or choice > len(candidates):
+        return f"数字超出范围，请回复 1 到 {len(candidates)}。"
+    torrent = candidates[choice - 1] if isinstance(candidates[choice - 1], dict) else {}
+    torrent_id = str(torrent.get("id") or "").strip()
+    title = str(torrent.get("title") or torrent_id or "").strip()
+    query = str(session.get("mteam_query") or "").strip()
+    if not torrent_id:
+        return f"第 {choice} 个结果缺少 MTeam 种子 ID，不能直接下载。请换一个编号。"
+    settings_data = get_system_settings_service().get()
+    app_log("info", "wechat", "企业微信选择 MTeam 种子下载", {
+        "stage": "wechat_mteam_choice_download_start",
+        "user_id": user_id,
+        "query": query,
+        "choice": choice,
+        "torrent_id": torrent_id,
+        "title": title,
+    })
+    try:
+        torrent_bytes, filename = download_mteam_torrent(torrent_id, settings_data)
+        qb_result = add_torrent_to_qbittorrent(torrent_bytes, filename, settings_data.get("qbittorrent", {}))
+        status = str(qb_result.get("status") or "ok")
+        accepted = status in {"ok", "exists", "sent"}
+        update_wechat_session(user_id, mteam_candidates=[], mteam_selected=torrent)
+        app_log("info" if accepted else "error", "wechat", "企业微信选择 MTeam 种子处理完成", {
+            "stage": "wechat_mteam_choice_download_done",
+            "user_id": user_id,
+            "query": query,
+            "choice": choice,
+            "torrent_id": torrent_id,
+            "status": status,
+            "message": qb_result.get("message", ""),
+        })
+        prefix = "已推送到 qBittorrent" if accepted else "qBittorrent 未接受种子"
+        return (
+            f"已选择：{choice}. {compact_wechat_text(title, 90)}\n"
+            f"{prefix}\n"
+            f"状态：{status}\n"
+            f"详情：{qb_result.get('message') or ''}"
+        ).strip()
+    except Exception as exc:
+        app_log("error", "wechat", "企业微信选择 MTeam 种子下载失败", {
+            "stage": "wechat_mteam_choice_download_error",
+            "user_id": user_id,
+            "query": query,
+            "choice": choice,
+            "torrent_id": torrent_id,
+            "error": str(exc),
+        })
+        return f"下载失败：{compact_wechat_text(title, 90)}\n{exc}"
+
+
+def wechat_subscribe_av_result(query: str) -> dict[str, Any]:
+    results = cached_subscription_search(query, "av")
+    if not results:
+        return {"status": "not_found", "message": f"没有找到番号：{query}", "stats": {"pushed": 0, "completed": 0, "predownload": 0}}
+    av = prepare_subscription_av_payload(results[0])
+    verification = actor_limit_verification(av, context="wechat_subscribe")
+    if not verification["ok"]:
+        return {"status": "skipped", "message": f"{av.get('id') or query} {verification['reason'] or '超过共演人数限制'}，已跳过。", "stats": {"pushed": 0, "completed": 0, "predownload": 0}}
+    av = verification["payload"]
+    apply_jellyfin_status(av)
+    saved = get_subscription_service().subscribe_av(av)
+    download_result = {"status": "skipped", "message": ""}
+    if saved.get("status") != "in_library":
+        download_result = download_av_from_mteam(saved)
+    stats = wechat_download_stats(download_result, saved)
+    return {
+        "status": "ok",
+        "subscription": saved,
+        "download": download_result,
+        "stats": stats,
+        "message": (
+        f"已订阅：{saved.get('id')}\n"
+        f"标题：{saved.get('title') or '-'}\n"
+        f"状态：{saved.get('status') or '-'}\n"
+        f"下载：{download_result.get('status')} {download_result.get('message') or ''}".strip()
+        ),
+    }
+
+
+def wechat_subscribe_av(query: str) -> str:
+    result = wechat_subscribe_av_result(query)
+    return f"{format_wechat_subscription_stats(result.get('stats') or {})}\n{result.get('message') or ''}".strip()
+
+
+def wechat_refresh_actress_result(query: str) -> dict[str, Any]:
+    service = get_subscription_service()
+    actress = next(
+        (
+            item for item in service.get_subscribed_actresses()
+            if str(item.get("id") or "").lower() == query.lower() or str(item.get("name") or "").lower() == query.lower()
+        ),
+        None,
+    )
+    if not actress:
+        results = cached_subscription_search(query, "actress")
+        if not results:
+            return {"status": "not_found", "message": f"没有找到女优：{query}", "stats": {"pushed": 0, "completed": 0, "predownload": 0}}
+        actress = service.subscribe_actress(enriched_actress_payload(results[0]))
+    result = subscribe_latest_for_actress(actress, future_only=True, download=False)
+    stats_items: list[dict[str, int]] = []
+    for item in result.get("added") or []:
+        if not isinstance(item, dict):
+            continue
+        av_id = str(item.get("id") or "")
+        latest = next((row for row in service.get_subscribed_av() if row.get("id") == av_id), item)
+        download_result = {
+            "status": latest.get("download_status") or ("skipped" if latest.get("status") == "in_library" else ""),
+            "message": latest.get("download_message") or "",
+        }
+        stats_items.append(wechat_download_stats(download_result, latest))
+    stats = merge_wechat_stats(stats_items)
+    return {
+        "status": "ok",
+        "actress": actress,
+        "result": result,
+        "stats": stats,
+        "message": (
+        f"女优最新轮询完成\n"
+        f"已刷新：{actress.get('name') or actress.get('id')}\n"
+        f"新增订阅：{len(result.get('added') or [])}\n"
+        f"跳过：{len(result.get('skipped') or [])}\n"
+        f"错误：{len(result.get('errors') or [])}"
+        ),
+    }
+
+
+def wechat_refresh_actress(query: str) -> str:
+    result = wechat_refresh_actress_result(query)
+    return str(result.get("message") or "").strip()
+
+
+def wechat_refresh_subscriptions_result() -> dict[str, Any]:
+    result = download_pending_subscriptions()
+    stats_items: list[dict[str, int]] = []
+    service = get_subscription_service()
+    for row in result.get("results") or []:
+        if not isinstance(row, dict):
+            continue
+        av_id = str(row.get("av_id") or "")
+        subscription = next((item for item in service.get_subscribed_av() if item.get("id") == av_id), {})
+        stats_items.append(wechat_download_stats(row, subscription))
+    stats = merge_wechat_stats(stats_items)
+    return {
+        "status": "ok",
+        "stats": stats,
+        "result": result,
+        "message": (
+            f"检查订阅番号：{result.get('checked') or 0}\n"
+            f"推送下载：{result.get('sent') or 0}\n"
+            f"结果数：{len(result.get('results') or [])}"
+        ),
+    }
+
+
+def wechat_refresh_subscriptions() -> str:
+    result = wechat_refresh_subscriptions_result()
+    return f"{format_wechat_subscription_stats(result.get('stats') or {})}\n{result.get('message') or ''}".strip()
+
+
+def wechat_refresh_all_actresses_result() -> dict[str, Any]:
+    service = get_subscription_service()
+    actresses = [item for item in service.get_subscribed_actresses() if item.get("poll_enabled", True)]
+    stats_items: list[dict[str, int]] = []
+    refreshed = 0
+    added = 0
+    skipped = 0
+    errors: list[str] = []
+    for actress in actresses:
+        try:
+            result = subscribe_latest_for_actress(actress, future_only=True, download=False)
+            refreshed += 1
+            added += len(result.get("added") or [])
+            skipped += len(result.get("skipped") or [])
+            errors.extend(str(item) for item in result.get("errors") or [])
+            for item in result.get("added") or []:
+                if not isinstance(item, dict):
+                    continue
+                av_id = str(item.get("id") or "")
+                latest = next((row for row in service.get_subscribed_av() if row.get("id") == av_id), item)
+                download_result = {
+                    "status": latest.get("download_status") or ("skipped" if latest.get("status") == "in_library" else ""),
+                    "message": latest.get("download_message") or "",
+                }
+                stats_items.append(wechat_download_stats(download_result, latest))
+        except Exception as exc:
+            errors.append(f"{actress.get('name') or actress.get('id')}: {exc}")
+    stats = merge_wechat_stats(stats_items)
+    return {
+        "status": "ok",
+        "stats": stats,
+        "message": (
+            f"女优最新轮询完成\n"
+            f"已刷新订阅女优：{refreshed}/{len(actresses)}\n"
+            f"新增订阅：{added}\n"
+            f"跳过：{skipped}\n"
+            f"错误：{len(errors)}"
+        ),
+    }
+
+
+def handle_wechat_text_message(config: dict[str, Any], user_id: str, content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return "请输入番号或女优名。"
+    choice = wechat_numeric_choice(text)
+    if choice is not None:
+        return wechat_download_mteam_candidate(user_id, choice)
+    subscribe_match = re.match(r"^(订阅|subscribe)\s+(.+)$", text, re.I)
+    if subscribe_match:
+        return wechat_subscribe_av(subscribe_match.group(2).strip())
+    refresh_match = re.match(r"^(刷新|refresh)\s+(.+)$", text, re.I)
+    if refresh_match:
+        return wechat_refresh_actress(refresh_match.group(2).strip())
+    av_query = likely_av_id_query(text)
+    if av_query:
+        session = get_wechat_session(user_id)
+        if str(session.get("mteam_pending_query") or "") == av_query:
+            return f"MTeam 正在搜索：{av_query}\n结果出来后会推送编号列表。"
+        update_wechat_session(user_id, last_query=av_query, mteam_pending_query=av_query, mteam_candidates=[])
+        schedule_wechat_mteam_search(dict(config), user_id, av_query)
+        return f"正在搜索 MTeam：{av_query}\n结果出来后会推送编号列表，回复数字即可选择下载。"
+    av_results = cached_subscription_search(text, "av")
+    if av_results:
+        update_wechat_session(user_id, last_av=av_results[0], last_query=text)
+        return summarize_search_result(av_results[0], "av")
+    actress_results = cached_subscription_search(text, "actress")
+    if actress_results:
+        update_wechat_session(user_id, last_actress=actress_results[0], last_query=text)
+        return summarize_search_result(actress_results[0], "actress")
+    return f"没有找到：{text}\n可以发送番号、女优名，或发送“订阅 番号”“刷新 女优名”。"
+
+
+def handle_wechat_menu_event(config: dict[str, Any], user_id: str, event_key: str) -> str:
+    session = get_wechat_session(user_id)
+    if event_key == "MM_REFRESH_SUBSCRIPTIONS":
+        run_wechat_background_reply(
+            dict(config),
+            user_id,
+            "refresh_subscriptions",
+            lambda: f"{format_wechat_subscription_stats((result := wechat_refresh_subscriptions_result()).get('stats') or {})}\n{result.get('message') or ''}".strip(),
+        )
+        return ""
+    if event_key == "MM_SUBSCRIBE_LAST":
+        av = session.get("last_av") if isinstance(session.get("last_av"), dict) else {}
+        av_id = str(av.get("id") or session.get("last_query") or "").strip()
+        if not av_id:
+            return "请先发送一个番号搜索，再点击“一键订阅”。"
+        result = wechat_subscribe_av_result(av_id)
+        return f"{format_wechat_subscription_stats(result.get('stats') or {})}\n{result.get('message') or ''}".strip()
+    if event_key == "MM_REFRESH_ACTRESS":
+        actress = session.get("last_actress") if isinstance(session.get("last_actress"), dict) else {}
+        query = str(actress.get("id") or actress.get("name") or "").strip()
+        action = f"refresh_actress:{query or 'all'}"
+        if query:
+            run_wechat_background_reply(
+                dict(config),
+                user_id,
+                action,
+                lambda: str((result := wechat_refresh_actress_result(query)).get("message") or "").strip(),
+            )
+            return ""
+        run_wechat_background_reply(
+            dict(config),
+            user_id,
+            action,
+            lambda: str((result := wechat_refresh_all_actresses_result()).get("message") or "").strip(),
+        )
+        return ""
+    return "用法：发送番号搜索 MTeam，回复数字选择下载；菜单“下载”检查已订阅番号的 MTeam 资源；菜单“最新”轮询已订阅女优的新番号。"
+
+
+def process_wechat_callback_message(config: dict[str, Any], payload: dict[str, str]) -> str:
+    user_id = payload.get("FromUserName") or ""
+    msg_type = payload.get("MsgType") or ""
+    if msg_type == "text":
+        return handle_wechat_text_message(config, user_id, payload.get("Content") or "")
+    if msg_type == "event":
+        return handle_wechat_menu_event(config, user_id, payload.get("EventKey") or payload.get("Event") or "")
+    return "已收到。请发送番号搜索 MTeam，或发送女优名进行搜索。"
 
 
 def send_notification_channel_message(channel_config: dict[str, Any], title: str, message: str) -> dict[str, object]:
@@ -7908,6 +9149,13 @@ def send_notification_channel_message(channel_config: dict[str, Any], title: str
                 return {"status": "ok", "message": "Gotify 通知已发送"}
         except httpx.HTTPError as exc:
             return {"status": "error", "message": f"Gotify 发送失败: {exc}"}
+    if channel_type == "wechat_work":
+        if not wechat_work_configured(config):
+            return {"status": "error", "message": "未配置企业微信 CorpID、Secret 或应用 ID"}
+        try:
+            return send_wechat_work_payload(config, wechat_work_message_payload(config, title, message))
+        except Exception as exc:
+            return {"status": "error", "message": f"企业微信发送失败: {exc}"}
     return {"status": "error", "message": "未知通知通道"}
 
 
@@ -7928,8 +9176,14 @@ def send_notification_event(event_key: str, data: dict[str, Any] | None = None) 
     payload.setdefault("status", "ok")
     payload.setdefault("detail", notification_detail(payload))
     payload.setdefault("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    payload["title"] = notification_safe_text(payload.get("title"), event_name)
+    payload["detail"] = notification_safe_text(payload.get("detail"), notification_detail({**payload, "detail": ""}))
+    if notification_recently_sent(event_key, payload):
+        return {"status": "skipped", "reason": "deduped", "event": event_key}
     templates = notifications.get("templates") if isinstance(notifications.get("templates"), dict) else {}
     template = templates.get(event_key) if isinstance(templates.get(event_key), dict) else default_notification_template(event_key)
+    if notification_template_looks_broken(template):
+        template = default_notification_template(event_key)
     title = render_notification_template(str(template.get("title") or ""), payload)
     message = render_notification_template(str(template.get("message") or ""), payload)
 

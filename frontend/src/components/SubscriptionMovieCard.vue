@@ -28,7 +28,7 @@
         </button>
       </div>
 
-      <p v-if="statusNote" class="status-note">{{ statusNote }}</p>
+      <p v-if="displayNote" class="status-note">{{ displayNote }}</p>
 
       <div class="card-actions">
         <slot name="actions" />
@@ -80,6 +80,25 @@ const title = computed(() => props.item.title || props.item.name || props.item.i
 
 const cardClasses = computed(() => ['subscription-movie-card', props.variant ? `is-${props.variant}` : ''])
 const posterClasses = computed(() => ['poster', props.posterFit === 'cover' ? 'is-cover' : 'is-contain'])
+const displayNote = computed(() => props.statusNote || sourceNote(props.item))
+
+function sourceNote(item) {
+  const chain = Array.isArray(item?.source_chain) && item.source_chain.length
+    ? item.source_chain.join(' + ')
+    : (item?.source || '')
+  const reasonMap = {
+    primary_label: '主厂牌匹配',
+    actress_seed: '女优锚点匹配',
+    exact_av_id: '番号精确匹配',
+    sqlite_cache: '本地缓存',
+    javdb_maker_fallback: 'JavDB 兜底',
+    javdb_av_fallback: 'JavDB 兜底'
+  }
+  const reason = reasonMap[item?.match_reason] || item?.match_reason || ''
+  const confidence = item?.confidence ? ` · ${item.confidence}` : ''
+  if (!chain && !reason) return ''
+  return [chain, reason].filter(Boolean).join(' · ') + confidence
+}
 
 function emitDetail() {
   emit('detail', props.item)

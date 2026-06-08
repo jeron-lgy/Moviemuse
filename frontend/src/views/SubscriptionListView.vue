@@ -88,7 +88,7 @@
             </div>
           </div>
           <button class="actress-cover" type="button" @click="openActress(item)">
-            <img v-if="actressCover(item)" :src="actressCoverUrl(item)" alt="" loading="lazy">
+            <img v-if="actressCover(item)" :class="{ 'is-work-cover': isLatestWorkCover(item) }" :src="actressCoverUrl(item)" alt="" loading="lazy">
             <span v-else>暂无封面</span>
           </button>
           <div class="actress-body">
@@ -292,10 +292,15 @@ function actressCover(item) {
 function actressCoverUrl(item) {
   const cover = actressCover(item)
   if (!cover) return ''
-  if (cover === item?.latest_cover) {
+  if (isLatestWorkCover(item)) {
     return proxyImage(cover, { id: item.latest_av_id || item.id, cover }, { kind: 'cover', avId: item.latest_av_id || item.id })
   }
   return proxyImage(cover, null, { kind: 'actor', entityId: actorAssetId(item) })
+}
+
+function isLatestWorkCover(item) {
+  const cover = actressCover(item)
+  return !!cover && cover === item?.latest_cover
 }
 
 async function hydrateActressProfiles(items) {
@@ -678,6 +683,12 @@ function removeActress(item) {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.actress-cover img.is-work-cover {
+  padding: 10px;
+  object-fit: contain;
+  background: #f7f7f8;
 }
 
 .actress-body p {

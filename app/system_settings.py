@@ -17,6 +17,21 @@ NOTIFICATION_CHANNEL_DEFAULTS: dict[str, dict[str, Any]] = {
         "name": "Gotify",
         "config": {"url": "", "token": "", "priority": 5},
     },
+    "wechat_work": {
+        "name": "企业微信",
+        "config": {
+            "corp_id": "",
+            "corp_secret": "",
+            "agent_id": "",
+            "proxy": "",
+            "touser": "@all",
+            "default_image_url": "",
+            "cover_enabled": True,
+            "token": "",
+            "aes_key": "",
+            "callback_path": "/api/v1/message",
+        },
+    },
 }
 
 
@@ -177,7 +192,7 @@ def normalize_notification_channels(raw: Any) -> list[dict[str, Any]]:
 
 def legacy_notification_channels(raw: dict[str, Any]) -> list[dict[str, Any]]:
     channels: list[dict[str, Any]] = []
-    for channel_type in ("serverchan", "gotify"):
+    for channel_type in ("serverchan", "gotify", "wechat_work"):
         config = raw.get(channel_type)
         if not isinstance(config, dict):
             continue
@@ -212,6 +227,14 @@ def normalize_notification_channel(item: dict[str, Any], index: int) -> dict[str
             merged_config["priority"] = max(0, min(10, int(merged_config.get("priority") or 5)))
         except (TypeError, ValueError):
             merged_config["priority"] = 5
+    if channel_type == "wechat_work":
+        merged_config["cover_enabled"] = bool(merged_config.get("cover_enabled", True))
+        for key in ("corp_id", "corp_secret", "agent_id", "proxy", "touser", "default_image_url", "token", "aes_key", "callback_path"):
+            merged_config[key] = str(merged_config.get(key) or "").strip()
+        if not merged_config["touser"]:
+            merged_config["touser"] = "@all"
+        if not merged_config["callback_path"]:
+            merged_config["callback_path"] = "/api/v1/message"
     raw_id = str(item.get("id") or "").strip()
     channel_id = slug_id(raw_id) if raw_id else f"{channel_type}-{index + 1}"
     name = str(item.get("name") or "").strip() or defaults["name"]

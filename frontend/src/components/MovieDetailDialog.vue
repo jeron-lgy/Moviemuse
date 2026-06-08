@@ -1,13 +1,13 @@
-<template>
+﻿<template>
   <Teleport to="body">
     <div class="movie-detail-mask" @click.self="emit('close')">
       <section class="movie-detail-panel" role="dialog" aria-modal="true" :aria-label="dialogTitle">
-        <button class="detail-close" type="button" aria-label="关闭详情" @click="emit('close')">x</button>
+        <button class="detail-close" type="button" aria-label="鍏抽棴璇︽儏" @click="emit('close')">x</button>
 
         <div class="detail-hero">
           <div class="detail-cover">
             <img v-if="coverUrl" :src="proxyImage(coverUrl, mergedItem)" alt="" />
-            <span v-else>暂无封面</span>
+            <span v-else>鏆傛棤灏侀潰</span>
           </div>
 
           <div class="detail-summary">
@@ -16,43 +16,43 @@
 
             <div class="detail-actions">
               <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', mergedItem)">
-                订阅番号
+                璁㈤槄鐣彿
               </BaseButton>
               <BaseButton v-if="primaryActor" type="button" :disabled="busyActor === actorKey(primaryActor)" @click.stop="openActorSubscribe(primaryActor)">
-                订阅女优
+                璁㈤槄濂充紭
               </BaseButton>
-              <BaseButton v-else-if="actors.length > 1" type="button" :disabled="busyActor === '__all__'" @click.stop="subscribeAllActors">
-                订阅全部女优
+              <BaseButton v-else-if="actors.length > 1 &amp;&amp; actors.length <= 2" type="button" :disabled="busyActor === '__all__'" @click.stop="subscribeAllActors">
+                璁㈤槄鍏ㄩ儴濂充紭
               </BaseButton>
               <BaseButton v-if="detailUrl" as="a" :href="detailUrl" target="_blank" rel="noreferrer">
-                打开 JavDB
+                鎵撳紑 JavDB
               </BaseButton>
             </div>
 
             <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
-            <NoticeBanner v-else-if="loading">正在读取 JavDB 详情...</NoticeBanner>
+            <NoticeBanner v-else-if="loading">姝ｅ湪璇诲彇 JavDB 璇︽儏...</NoticeBanner>
 
             <div class="info-grid">
               <div>
-                <span>发售日期</span>
+                <span>鍙戝敭鏃ユ湡</span>
                 <strong>{{ releaseDate }}</strong>
               </div>
               <div>
-                <span>时长</span>
+                <span>鏃堕暱</span>
                 <strong>{{ displayValue(detail.duration) }}</strong>
               </div>
               <div>
-                <span>评分</span>
+                <span>璇勫垎</span>
                 <strong>{{ displayValue(detail.rating) }}</strong>
               </div>
               <div>
-                <span>导演</span>
+                <span>瀵兼紨</span>
                 <div class="chip-row" v-if="directors.length">
                   <button v-for="link in directors" :key="link.url || link.name" type="button" @click="openExternal(link)">
                     {{ link.name }}
                   </button>
                 </div>
-                <strong v-else>未知</strong>
+                <strong v-else>鏈煡</strong>
               </div>
               <div>
                 <span>发行商</span>
@@ -61,10 +61,10 @@
                     {{ link.name }}
                   </button>
                 </div>
-                <strong v-else>未知</strong>
+                <strong v-else>鏈煡</strong>
               </div>
               <div>
-                <span>演员</span>
+                <span>婕斿憳</span>
                 <div class="actor-row" v-if="actors.length">
                   <span v-for="actor in actors" :key="actorKey(actor)" class="actor-pill">
                     <button class="actor-name-button" type="button" @click="emit('actor', actor)">{{ actor.name }}</button>
@@ -74,11 +74,11 @@
                       :disabled="busyActor === actorKey(actor)"
                       @click.stop="openActorSubscribe(actor)"
                     >
-                      订阅女优
+                      璁㈤槄濂充紭
                     </button>
                   </span>
                 </div>
-                <strong v-else>未知</strong>
+                <strong v-else>鏈煡</strong>
               </div>
             </div>
 
@@ -92,15 +92,15 @@
 
         <section class="detail-section">
           <div class="section-head">
-            <h3>预告</h3>
+            <h3>棰勫憡</h3>
           </div>
           <video v-if="detail.trailer" controls :src="proxyMedia(detail.trailer, mergedItem)"></video>
-          <BaseCard v-else class="empty-media">JavDB 当前没有提供预告</BaseCard>
+          <BaseCard v-else class="empty-media">JavDB 褰撳墠娌℃湁鎻愪緵棰勫憡</BaseCard>
         </section>
 
         <section class="detail-section">
           <div class="section-head">
-            <h3>剧照</h3>
+            <h3>鍓х収</h3>
             <span>{{ screenshots.length }} 张</span>
           </div>
           <div v-if="screenshots.length" class="screenshot-grid">
@@ -108,12 +108,12 @@
               <img :src="proxyImage(shot, null, { kind: 'screenshot', entityId: `${movieCode}-${index + 1}` })" alt="" loading="lazy" />
             </a>
           </div>
-          <BaseCard v-else class="empty-media">暂无剧照</BaseCard>
+          <BaseCard v-else class="empty-media">鏆傛棤鍓х収</BaseCard>
         </section>
 
         <section class="detail-section">
           <div class="section-head">
-            <h3>猜你喜欢</h3>
+            <h3>鐚滀綘鍠滄</h3>
             <span>{{ recommendations.length }} 条</span>
           </div>
           <div v-if="recommendations.length" class="recommend-grid">
@@ -126,29 +126,29 @@
               @detail="emit('recommend', $event)"
             >
               <template #actions>
-                <BaseButton type="button" @click.stop="emit('recommend', movie)">详情</BaseButton>
-                <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', movie)">订阅</BaseButton>
+                <BaseButton type="button" @click.stop="emit('recommend', movie)">璇︽儏</BaseButton>
+                <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', movie)">璁㈤槄</BaseButton>
               </template>
             </SubscriptionMovieCard>
           </div>
-          <BaseCard v-else class="empty-media">暂无推荐</BaseCard>
+          <BaseCard v-else class="empty-media">鏆傛棤鎺ㄨ崘</BaseCard>
         </section>
 
         <div v-if="actorSubscribeTarget" class="actor-subscribe-mask" @click.self="closeActorSubscribe">
           <BaseCard as="form" class="actor-subscribe-dialog" @submit.prevent="confirmActorSubscribe">
             <button class="modal-close" type="button" @click="closeActorSubscribe">x</button>
-            <h3>订阅 {{ actorSubscribeTarget.name }}</h3>
+            <h3>璁㈤槄 {{ actorSubscribeTarget.name }}</h3>
             <p>默认只订阅今天之后新增的作品，不订阅 VR。</p>
             <label>
-              限制日期
+              闄愬埗鏃ユ湡
               <input v-model="actorSubscribeForm.since_date" type="date">
             </label>
             <label class="check-row">
-              <span>订阅 VR</span>
+              <span>璁㈤槄 VR</span>
               <input v-model="actorSubscribeForm.include_vr" type="checkbox">
             </label>
             <div class="modal-actions">
-              <BaseButton type="button" @click="closeActorSubscribe">取消</BaseButton>
+              <BaseButton type="button" @click="closeActorSubscribe">鍙栨秷</BaseButton>
               <BaseButton variant="primary" type="submit" :disabled="busyActor === actorKey(actorSubscribeTarget)">
                 {{ busyActor === actorKey(actorSubscribeTarget) ? '订阅中' : '确认订阅' }}
               </BaseButton>
@@ -188,10 +188,10 @@ const actorSubscribeForm = reactive({
 
 const detailUrl = computed(() => detail.value.url || props.item.url || '')
 const coverUrl = computed(() => detail.value.cover || props.item.cover || '')
-const movieCode = computed(() => detail.value.id || props.item.id || props.item.code || '未知番号')
+const movieCode = computed(() => detail.value.id || props.item.id || props.item.code || '鏈煡鐣彿')
 const movieTitle = computed(() => detail.value.title || props.item.title || props.item.name || movieCode.value)
-const dialogTitle = computed(() => `${movieCode.value} 详情`)
-const releaseDate = computed(() => detail.value.release_date || detail.value.date || props.item.date || props.item.release_date || '未知')
+const dialogTitle = computed(() => `${movieCode.value} 璇︽儏`)
+const releaseDate = computed(() => detail.value.release_date || detail.value.date || props.item.date || props.item.release_date || '鏈煡')
 const mergedItem = computed(() => ({ ...props.item, ...detail.value, id: movieCode.value }))
 const actors = computed(() => normalizePeople(detail.value.actors?.length ? detail.value.actors : (detail.value.actresses?.length ? detail.value.actresses : (props.item.actresses || props.item.actress || []))))
 const primaryActor = computed(() => actors.value.length === 1 ? actors.value[0] : null)
@@ -216,7 +216,7 @@ async function loadDetail() {
     const payload = await api(`/api/subscriptions/av/detail?url=${encodeURIComponent(props.item.url)}`)
     detail.value = payload.detail || {}
   } catch (error) {
-    errorMessage.value = error.message || '读取详情失败'
+    errorMessage.value = error.message || '璇诲彇璇︽儏澶辫触'
   } finally {
     loading.value = false
   }
@@ -231,7 +231,7 @@ function proxyMedia(url, item = null, options = {}) {
 }
 
 function displayValue(value) {
-  return value || '未知'
+  return value || '鏈煡'
 }
 
 function normalizePeople(value) {
@@ -254,7 +254,7 @@ function normalizePeople(value) {
 function splitActorNames(value) {
   const text = String(value || '').trim()
   if (!text) return []
-  const parts = text.split(/\s*[、,|]\s*|\s{2,}/).map((item) => item.trim()).filter(Boolean)
+  const parts = text.split(/\s*[銆?|]\s*|\s{2,}/).map((item) => item.trim()).filter(Boolean)
   if (parts.length > 1) return parts
   const spaced = text.split(/\s+/).map((item) => item.trim()).filter(Boolean)
   if (spaced.length >= 2 && spaced.length <= 20 && spaced.every((item) => item.length >= 2 && item.length <= 16)) return spaced
@@ -313,7 +313,7 @@ async function subscribeActress(actor) {
     await postJson('/api/subscriptions/actress', actorPayload(actor))
     closeActorSubscribe()
   } catch (error) {
-    errorMessage.value = error.message || '订阅女优失败'
+    errorMessage.value = error.message || '璁㈤槄濂充紭澶辫触'
   } finally {
     busyActor.value = ''
   }
@@ -328,7 +328,7 @@ async function subscribeAllActors() {
     }
     closeActorSubscribe()
   } catch (error) {
-    errorMessage.value = error.message || '订阅女优失败'
+    errorMessage.value = error.message || '璁㈤槄濂充紭澶辫触'
   } finally {
     busyActor.value = ''
   }
@@ -662,3 +662,4 @@ video {
   }
 }
 </style>
+

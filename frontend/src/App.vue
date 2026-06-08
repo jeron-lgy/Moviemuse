@@ -347,7 +347,9 @@ watch(
   .mm-sidebar {
     position: relative;
     top: 0;
+    min-width: 0;
     min-height: auto;
+    overflow: hidden;
     padding: 16px;
   }
 
@@ -362,6 +364,8 @@ watch(
   .mm-nav {
     grid-auto-flow: column;
     grid-auto-columns: max-content;
+    width: 100%;
+    min-width: 0;
     overflow-x: auto;
     padding-bottom: 2px;
   }

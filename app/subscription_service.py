@@ -575,6 +575,13 @@ class SubscriptionService:
                 "date": av.get("date", av.get("release_date", existing.get("date", ""))),
                 "actresses": av.get("actresses", av.get("actress", existing.get("actresses", []))),
                 "url": av.get("url", existing.get("url", "")),
+                "source": av.get("source", existing.get("source", "")),
+                "source_chain": av.get("source_chain", existing.get("source_chain", [])),
+                "source_scope": av.get("source_scope", existing.get("source_scope", "")),
+                "match_reason": av.get("match_reason", existing.get("match_reason", "")),
+                "confidence": av.get("confidence", existing.get("confidence", "")),
+                "maker": av.get("maker", existing.get("maker", "")),
+                "label": av.get("label", existing.get("label", "")),
                 "status": av.get("status", existing.get("status", "pending")),
                 "library_status": av.get("library_status", existing.get("library_status", "")),
                 "jellyfin_item_id": av.get("jellyfin_item_id", existing.get("jellyfin_item_id", "")),
@@ -737,9 +744,13 @@ class SubscriptionService:
                 "latest_title": actress.get("latest_title", existing.get("latest_title", "")),
                 "latest_date": actress.get("latest_date", existing.get("latest_date", "")),
                 "source": actress.get("source", existing.get("source", "")),
+                "source_chain": actress.get("source_chain", existing.get("source_chain", [])),
+                "match_reason": actress.get("match_reason", existing.get("match_reason", "")),
+                "confidence": actress.get("confidence", existing.get("confidence", "")),
                 "javdb_id": actress.get("javdb_id", existing.get("javdb_id", "")),
                 "dmm_name": actress.get("dmm_name", existing.get("dmm_name", "")),
                 "dmm_url": actress.get("dmm_url", existing.get("dmm_url", "")),
+                "javlibrary_star_id": actress.get("javlibrary_star_id", existing.get("javlibrary_star_id", "")),
                 "since_date": since_date,
                 "poll_enabled": bool(actress.get("poll_enabled", existing.get("poll_enabled", True))),
                 "include_vr": bool(actress.get("include_vr", existing.get("include_vr", False))),
@@ -766,7 +777,7 @@ class SubscriptionService:
             item = self.data["actress"].get(actress_id)
             if not item:
                 return None
-            for key in ("name", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date", "source", "javdb_id", "dmm_name", "dmm_url"):
+            for key in ("name", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date", "source", "source_chain", "match_reason", "confidence", "javdb_id", "dmm_name", "dmm_url", "javlibrary_star_id"):
                 if key not in payload:
                     continue
                 value = payload.get(key)

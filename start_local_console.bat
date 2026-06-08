@@ -3,7 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 
-if "%HOST%"=="" set "HOST=127.0.0.1"
+if "%HOST%"=="" set "HOST=0.0.0.0"
 if "%PORT%"=="" set "PORT=18180"
 if "%MEDIA_DIRS%"=="" set "MEDIA_DIRS=%CD%\sample-media"
 if "%TRASH_DIR%"=="" set "TRASH_DIR=%CD%\trash"
