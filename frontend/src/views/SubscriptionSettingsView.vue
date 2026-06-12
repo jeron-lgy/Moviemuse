@@ -43,7 +43,8 @@
           <input v-model.trim="system.mteam.api_url">
         </FormField>
         <FormField label="API Key">
-          <input v-model.trim="system.mteam.api_key" type="password">
+          <SecretInput v-model.trim="system.mteam.api_key" autocomplete="off">
+          </SecretInput>
         </FormField>
       </div>
       <div class="panel-footer">
@@ -66,11 +67,16 @@
         <FormField label="地址">
           <input v-model.trim="system.qbittorrent.url" placeholder="http://host:8080">
         </FormField>
+        <FormField label="API Key" hint="qB 5.2+ 可用；失败时会自动尝试账号密码。">
+          <SecretInput v-model.trim="system.qbittorrent.api_key" autocomplete="off" placeholder="可选">
+          </SecretInput>
+        </FormField>
         <FormField label="用户名">
           <input v-model.trim="system.qbittorrent.username">
         </FormField>
         <FormField label="密码">
-          <input v-model.trim="system.qbittorrent.password" type="password">
+          <SecretInput v-model.trim="system.qbittorrent.password" autocomplete="off">
+          </SecretInput>
         </FormField>
         <FormField label="下载路径">
           <input v-model.trim="system.qbittorrent.save_path">
@@ -108,7 +114,8 @@
           <input v-model.trim="system.jellyfin.url" placeholder="http://host:8096">
         </FormField>
         <FormField label="密钥">
-          <input v-model.trim="system.jellyfin.api_key" type="password">
+          <SecretInput v-model.trim="system.jellyfin.api_key" autocomplete="off">
+          </SecretInput>
         </FormField>
         <FormField label="用户">
           <input v-model.trim="system.jellyfin.username">
@@ -151,6 +158,9 @@
         <FormField label="最大共演人数">
           <input v-model.number="subscription.max_coactors" type="number" min="1" max="2">
         </FormField>
+        <FormField label="启用 JavDB 实时抓取">
+          <input v-model="subscription.javdb_source_enabled" type="checkbox">
+        </FormField>
         <FormField label="洗版启用">
           <input v-model="subscription.wash.enabled" type="checkbox">
         </FormField>
@@ -184,6 +194,12 @@
         <div v-for="(maker, index) in subscription.pinned_makers" :key="`${maker.name}-${index}`" class="maker-row">
           <input v-model.trim="maker.name" placeholder="厂牌">
           <input v-model.trim="maker.url" placeholder="JavDB 链接">
+          <select v-model="maker.preferred_listing_source" title="发售首选源">
+            <option value="javlibrary">JavLibrary</option>
+            <option value="dmm">DMM/FANZA</option>
+            <option value="javdb">JavDB</option>
+            <option value="auto">自动</option>
+          </select>
           <BaseButton type="button" @click="removeMaker(index)">删除</BaseButton>
         </div>
       </div>
@@ -192,6 +208,101 @@
         <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
           {{ saving ? '保存中' : '保存' }}
         </BaseButton>
+      </div>
+    </BaseCard>
+
+    <BaseCard v-else-if="activeTab === 'identities'" class="setting-panel">
+      <div class="panel-head">
+        <div>
+          <h2>身份锚点</h2>
+          <p>把 JavDB、DMM/FANZA、JavLibrary 和本地订阅里的同一女优锁定到同一个身份，订阅轮询会优先使用人工锚点。</p>
+        </div>
+        <div class="panel-actions">
+          <BaseButton type="button" :disabled="loadingIdentities" @click="loadActorIdentities">
+            {{ loadingIdentities ? '读取中' : '刷新身份' }}
+          </BaseButton>
+          <BaseButton type="button" @click="resetIdentityForm">新建锚点</BaseButton>
+        </div>
+      </div>
+      <div class="identity-tools">
+        <input v-model.trim="identityQuery" placeholder="搜索女优名、别名、JavDB ID、JavLibrary ID" @keyup.enter="loadActorIdentities">
+        <BaseButton type="button" :disabled="loadingIdentities" @click="loadActorIdentities">搜索</BaseButton>
+      </div>
+      <div class="identity-layout">
+        <div class="identity-list">
+          <div v-if="loadingIdentities" class="empty-line">正在读取身份缓存...</div>
+          <div v-else-if="!actorIdentities.length" class="empty-line">暂无身份缓存。</div>
+          <template v-else>
+            <button
+              v-for="item in actorIdentities"
+              :key="item.canonical_id"
+              type="button"
+              class="identity-row"
+              :class="{ active: identityForm.canonical_id === item.canonical_id }"
+              @click="editIdentity(item)"
+            >
+              <input
+                type="checkbox"
+                :checked="mergeSourceIds.includes(item.canonical_id)"
+                @click.stop="toggleMergeSource(item)"
+              >
+              <span>
+                <strong>{{ item.display_name || item.name || item.id }}</strong>
+                <em>{{ identitySourceLabel(item) }}</em>
+              </span>
+              <small>{{ item.latest_av_id || item.javdb_id || item.javlibrary_star_id || '未绑定外部 ID' }}</small>
+            </button>
+          </template>
+        </div>
+
+        <div class="identity-editor">
+          <div class="form-grid">
+            <FormField label="主显示名">
+              <input v-model.trim="identityForm.display_name" placeholder="涼森れむ">
+            </FormField>
+            <FormField label="首选数据源">
+              <select v-model="identityForm.preferred_source">
+                <option value="">自动</option>
+                <option value="dmm">DMM/FANZA</option>
+                <option value="javdb">JavDB</option>
+                <option value="javlibrary">JavLibrary</option>
+              </select>
+            </FormField>
+            <FormField label="JavDB ID">
+              <input v-model.trim="identityForm.javdb_id" placeholder="例如 aeqfy 或 JavDB 演员 ID">
+            </FormField>
+            <FormField label="DMM 名称">
+              <input v-model.trim="identityForm.dmm_name" placeholder="DMM/FANZA 女优名">
+            </FormField>
+            <FormField label="DMM 女优页" wide>
+              <input v-model.trim="identityForm.dmm_url" placeholder="https://www.dmm.co.jp/mono/dvd/-/list/=/article=actress/id=.../sort=date/">
+            </FormField>
+            <FormField label="JavLibrary Star ID">
+              <input v-model.trim="identityForm.javlibrary_star_id" placeholder="例如 aeqfy">
+            </FormField>
+            <FormField label="锁定人工锚点">
+              <input v-model="identityForm.locked" type="checkbox">
+            </FormField>
+            <FormField label="别名" wide>
+              <textarea v-model="identityAliasText" placeholder="每行一个别名，或用逗号分隔"></textarea>
+            </FormField>
+          </div>
+          <div v-if="identityForm.canonical_id" class="identity-meta">
+            <span>canonical_id: {{ identityForm.canonical_id }}</span>
+            <span>来源: {{ identityForm.manual ? '人工' : '自动/订阅' }}</span>
+          </div>
+          <div class="panel-footer">
+            <BaseButton variant="primary" type="button" :disabled="savingIdentity" @click="saveActorIdentity">
+              {{ savingIdentity ? '保存中' : '保存锚点' }}
+            </BaseButton>
+            <BaseButton type="button" :disabled="savingIdentity || mergeSourceIds.length < 1" @click="mergeActorIdentity">
+              合并所选
+            </BaseButton>
+            <BaseButton type="button" :disabled="savingIdentity || !identityForm.manual" @click="deleteActorIdentity">
+              删除人工锚点
+            </BaseButton>
+          </div>
+        </div>
       </div>
     </BaseCard>
 
@@ -204,10 +315,15 @@
         <BaseButton type="button" :disabled="testingProxy" @click="testSystemProxy">
           {{ testingProxy ? '测试中' : '测试代理' }}
         </BaseButton>
+        <BaseButton type="button" :disabled="testingFlareSolverr" @click="testFlareSolverr">
+          {{ testingFlareSolverr ? '测试中' : '测试 FlareSolverr' }}
+        </BaseButton>
       </div>
       <div class="proxy-status" v-if="proxyStatus">
         <span>当前有效代理</span>
         <strong>{{ proxyStatus.effective_proxy || '未检测到代理' }}</strong>
+        <span>FlareSolverr</span>
+        <strong>{{ proxyStatus.flaresolverr_url || '未配置' }}</strong>
       </div>
       <div class="form-grid">
         <FormField label="启用自定义代理">
@@ -224,6 +340,9 @@
         </FormField>
         <FormField label="NO_PROXY" wide>
           <input v-model.trim="system.network.no_proxy" placeholder="localhost,127.0.0.1">
+        </FormField>
+        <FormField label="FlareSolverr URL" wide>
+          <input v-model.trim="system.network.flaresolverr_url" placeholder="http://host.docker.internal:8281/v1">
         </FormField>
       </div>
       <div class="panel-footer">
@@ -301,7 +420,7 @@ import { reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, postJson } from '../lib/api'
 import NotificationsView from './NotificationsView.vue'
-import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader } from '../components/ui'
+import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
 
 const tabs = [
   { key: 'mteam', label: 'MTeam' },
@@ -309,6 +428,7 @@ const tabs = [
   { key: 'jellyfin', label: 'Jellyfin' },
   { key: 'strategy', label: '订阅与洗版' },
   { key: 'makers', label: '常驻厂牌' },
+  { key: 'identities', label: '身份锚点' },
   { key: 'network', label: '系统代理' },
   { key: 'notifications', label: '通知' }
 ]
@@ -316,11 +436,11 @@ tabs.splice(Math.max(0, tabs.length - 1), 0, { key: 'cache', label: '缓存维�
 const tabKeys = new Set(tabs.map((tab) => tab.key))
 
 const defaultMakers = [
-  { name: 'S1 NO.1 STYLE', url: 'https://javdb.com/makers/7R?f=download' },
-  { name: 'PRESTIGE', url: 'https://javdb.com/makers/6M?f=download' },
-  { name: 'IDEA POCKET', url: 'https://javdb.com/makers/ZXX?f=download' },
-  { name: 'Madonna', url: 'https://javdb.com/makers/zKW?f=download' },
-  { name: 'SOD Create', url: 'https://javdb.com/makers/q6?f=download' }
+  { name: 'S1 NO.1 STYLE', url: 'https://javdb.com/makers/7R?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'PRESTIGE', url: 'https://javdb.com/makers/6M?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'IDEA POCKET', url: 'https://javdb.com/makers/ZXX?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'Madonna', url: 'https://javdb.com/makers/zKW?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'SOD Create', url: 'https://javdb.com/makers/q6?f=download', preferred_listing_source: 'javlibrary' }
 ]
 
 const route = useRoute()
@@ -330,6 +450,7 @@ const loading = ref(false)
 const saving = ref(false)
 const loadingLibraries = ref(false)
 const testingProxy = ref(false)
+const testingFlareSolverr = ref(false)
 const message = ref('')
 const errorMessage = ref('')
 const jellyfinLibraries = ref([])
@@ -341,17 +462,45 @@ const maintainingAssetCache = ref(false)
 const assetCache = ref({})
 const assetMaintenanceResult = ref(null)
 const assetMaxMb = ref(2048)
+const loadingIdentities = ref(false)
+const savingIdentity = ref(false)
+const identityQuery = ref('')
+const actorIdentities = ref([])
+const mergeSourceIds = ref([])
+const identityAliasText = ref('')
+
+const emptyIdentityForm = () => ({
+  canonical_id: '',
+  id: '',
+  display_name: '',
+  name: '',
+  aliases: [],
+  preferred_source: '',
+  javdb_id: '',
+  dmm_name: '',
+  dmm_url: '',
+  javlibrary_star_id: '',
+  cover: '',
+  latest_cover: '',
+  latest_av_id: '',
+  latest_title: '',
+  latest_date: '',
+  locked: true,
+  manual: true
+})
+const identityForm = reactive(emptyIdentityForm())
 
 const system = reactive({
   mteam: { site_url: '', mode: 'rss', rss_url: '', api_url: '', api_key: '', enabled: false },
-  qbittorrent: { url: '', username: '', password: '', save_path: '', category: '', tags: '' },
+  qbittorrent: { url: '', api_key: '', username: '', password: '', save_path: '', category: '', tags: '' },
   jellyfin: { url: '', api_key: '', username: '', library_id: '', library_name: '', dedupe_enabled: true },
-  network: { proxy_enabled: false, http_proxy: '', https_proxy: '', no_proxy: 'localhost,127.0.0.1', apply_to_javdb: true }
+  network: { proxy_enabled: false, http_proxy: '', https_proxy: '', no_proxy: 'localhost,127.0.0.1', apply_to_javdb: true, flaresolverr_url: '' }
 })
 
 const subscription = reactive({
   poll_enabled: true,
   max_coactors: 2,
+  javdb_source_enabled: false,
   asset_cron: '15 3 * * *',
   asset_cache_max_mb: 2048,
   wash: { enabled: true, expire_days: 90, check_chinese: true, check_4k: true },
@@ -404,15 +553,21 @@ async function loadAll() {
     Object.assign(system.network, systemPayload.settings?.network || {})
     await loadProxyStatus()
     await loadAssetCache()
+    await loadActorIdentities()
     selectedJellyfinLibrary.value = system.jellyfin.library_id || ''
     Object.assign(subscription, {
       poll_enabled: subPayload.settings?.poll_enabled ?? true,
       max_coactors: subPayload.settings?.max_coactors ?? 2,
+      javdb_source_enabled: !!subPayload.settings?.javdb_source_enabled,
       asset_cron: subPayload.settings?.asset_cron || '15 3 * * *',
       asset_cache_max_mb: subPayload.settings?.asset_cache_max_mb ?? 2048,
       wash: { ...subscription.wash, ...(subPayload.settings?.wash || {}) },
       pinned_makers: Array.isArray(subPayload.settings?.pinned_makers) && subPayload.settings.pinned_makers.length
-        ? subPayload.settings.pinned_makers.map((item) => ({ name: item.name || '', url: item.url || '' }))
+        ? subPayload.settings.pinned_makers.map((item) => ({
+          name: item.name || '',
+          url: item.url || '',
+          preferred_listing_source: item.preferred_listing_source || 'javlibrary'
+        }))
         : [...defaultMakers]
     })
     assetMaxMb.value = subscription.asset_cache_max_mb
@@ -436,12 +591,17 @@ async function saveSubscriptionSettings() {
   await postJson('/api/subscriptions/settings', {
     poll_enabled: subscription.poll_enabled,
     max_coactors: subscription.max_coactors,
+    javdb_source_enabled: subscription.javdb_source_enabled,
     asset_cron: subscription.asset_cron,
     asset_cache_max_mb: assetMaxMb.value,
     wash: { ...subscription.wash },
     pinned_makers: subscription.pinned_makers
       .filter((item) => item.name || item.url)
-      .map((item) => ({ name: item.name, url: item.url }))
+      .map((item) => ({
+        name: item.name,
+        url: item.url,
+        preferred_listing_source: item.preferred_listing_source || 'javlibrary'
+      }))
   })
 }
 
@@ -502,6 +662,26 @@ async function testSystemProxy() {
     errorMessage.value = err.message || '代理测试失败'
   } finally {
     testingProxy.value = false
+  }
+}
+
+async function testFlareSolverr() {
+  testingFlareSolverr.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    await saveSystemSettings()
+    const result = await postJson('/api/system-flaresolverr/test', {})
+    proxyStatus.value = result.proxy || null
+    if (result.status === 'ok') {
+      message.value = result.message || 'FlareSolverr 可用'
+    } else {
+      errorMessage.value = result.message || 'FlareSolverr 测试失败'
+    }
+  } catch (err) {
+    errorMessage.value = err.message || 'FlareSolverr 测试失败'
+  } finally {
+    testingFlareSolverr.value = false
   }
 }
 
@@ -603,11 +783,129 @@ function syncJellyfinLibrary() {
 }
 
 function addMaker() {
-  subscription.pinned_makers.push({ name: '', url: '' })
+  subscription.pinned_makers.push({ name: '', url: '', preferred_listing_source: 'javlibrary' })
 }
 
 function removeMaker(index) {
   subscription.pinned_makers.splice(index, 1)
+}
+
+function splitAliases(value) {
+  return String(value || '')
+    .split(/[\n,，、]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function resetIdentityForm() {
+  Object.assign(identityForm, emptyIdentityForm())
+  identityAliasText.value = ''
+  mergeSourceIds.value = []
+}
+
+function editIdentity(item) {
+  Object.assign(identityForm, emptyIdentityForm(), item || {}, {
+    locked: item?.manual ? !!item.locked : true,
+    manual: !!item?.manual
+  })
+  identityAliasText.value = Array.isArray(item?.aliases) ? item.aliases.join('\n') : ''
+}
+
+function identityPayload() {
+  const aliases = splitAliases(identityAliasText.value)
+  return {
+    ...identityForm,
+    aliases,
+    name: identityForm.display_name || identityForm.name || identityForm.dmm_name || identityForm.id,
+    locked: !!identityForm.locked
+  }
+}
+
+function identitySourceLabel(item) {
+  const parts = []
+  if (item.manual) parts.push('人工')
+  else parts.push(item.origin === 'subscription' ? '订阅' : '自动')
+  if (item.locked) parts.push('锁定')
+  if (item.source_chain?.length) parts.push(item.source_chain.join('+'))
+  return parts.join(' · ')
+}
+
+function toggleMergeSource(item) {
+  const id = item?.canonical_id
+  if (!id) return
+  if (mergeSourceIds.value.includes(id)) {
+    mergeSourceIds.value = mergeSourceIds.value.filter((value) => value !== id)
+  } else {
+    mergeSourceIds.value = [...mergeSourceIds.value, id]
+  }
+}
+
+async function loadActorIdentities() {
+  loadingIdentities.value = true
+  try {
+    const params = new URLSearchParams({ limit: '500' })
+    if (identityQuery.value) params.set('q', identityQuery.value)
+    const payload = await api(`/api/subscriptions/actor-identities?${params.toString()}`)
+    actorIdentities.value = Array.isArray(payload.identities) ? payload.identities : []
+  } catch (err) {
+    errorMessage.value = err.message || '读取身份锚点失败'
+  } finally {
+    loadingIdentities.value = false
+  }
+}
+
+async function saveActorIdentity() {
+  savingIdentity.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await postJson('/api/subscriptions/actor-identities', identityPayload())
+    editIdentity(payload.identity || {})
+    await loadActorIdentities()
+    message.value = '身份锚点已保存'
+  } catch (err) {
+    errorMessage.value = err.message || '保存身份锚点失败'
+  } finally {
+    savingIdentity.value = false
+  }
+}
+
+async function mergeActorIdentity() {
+  savingIdentity.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await postJson('/api/subscriptions/actor-identities/merge', {
+      target: identityPayload(),
+      source_ids: mergeSourceIds.value
+    })
+    editIdentity(payload.identity || {})
+    await loadActorIdentities()
+    message.value = '身份锚点已合并'
+  } catch (err) {
+    errorMessage.value = err.message || '合并身份锚点失败'
+  } finally {
+    savingIdentity.value = false
+  }
+}
+
+async function deleteActorIdentity() {
+  if (!identityForm.canonical_id) return
+  const ok = window.confirm('只删除人工锚点，自动缓存仍会保留。继续吗？')
+  if (!ok) return
+  savingIdentity.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    await api(`/api/subscriptions/actor-identities/${encodeURIComponent(identityForm.canonical_id)}`, { method: 'DELETE' })
+    resetIdentityForm()
+    await loadActorIdentities()
+    message.value = '人工身份锚点已删除'
+  } catch (err) {
+    errorMessage.value = err.message || '删除身份锚点失败'
+  } finally {
+    savingIdentity.value = false
+  }
 }
 </script>
 
@@ -615,6 +913,7 @@ function removeMaker(index) {
 .settings-view {
   display: grid;
   gap: 18px;
+  --mm-input-radius: 14px;
 }
 
 .setting-tabs {
@@ -750,12 +1049,103 @@ function removeMaker(index) {
 }
 
 .maker-row {
-  grid-template-columns: minmax(160px, 240px) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr) minmax(130px, 160px) auto;
   align-items: end;
 }
 
+.identity-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.identity-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.identity-list {
+  display: grid;
+  gap: 8px;
+  max-height: 620px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.identity-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--mm-border);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--mm-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.identity-row.active {
+  border-color: rgba(255, 56, 92, .5);
+  background: #fff5f7;
+}
+
+.identity-row input {
+  width: 18px;
+  min-height: 18px;
+  margin-top: 3px;
+}
+
+.identity-row span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.identity-row strong,
+.identity-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identity-row em,
+.identity-row small,
+.identity-meta {
+  color: var(--mm-muted);
+  font-size: var(--mm-font-size-sm);
+  font-style: normal;
+}
+
+.identity-row small {
+  grid-column: 2;
+}
+
+.identity-editor {
+  display: grid;
+  gap: 14px;
+}
+
+.identity-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.empty-line {
+  padding: 24px;
+  border: 1px solid var(--mm-border);
+  border-radius: 12px;
+  color: var(--mm-muted);
+  text-align: center;
+}
+
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-height: 44px;
   padding: 0 14px;
@@ -764,6 +1154,12 @@ select {
   background: #fff;
   color: var(--mm-text);
   font: inherit;
+}
+
+textarea {
+  min-height: 112px;
+  padding: 12px 14px;
+  resize: vertical;
 }
 
 input[type="checkbox"] {
@@ -776,6 +1172,8 @@ input[type="checkbox"] {
   .panel-head,
   .form-grid,
   .maker-row,
+  .identity-tools,
+  .identity-layout,
   .cache-summary {
     grid-template-columns: 1fr;
     display: grid;

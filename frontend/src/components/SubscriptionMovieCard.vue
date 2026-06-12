@@ -201,10 +201,11 @@ function emitDetail() {
 }
 
 .code-line strong {
-  overflow: hidden;
+  flex: none;
+  overflow: visible;
   color: var(--mm-primary);
   font-weight: var(--mm-font-weight-semibold);
-  text-overflow: ellipsis;
+  text-overflow: clip;
   white-space: nowrap;
 }
 

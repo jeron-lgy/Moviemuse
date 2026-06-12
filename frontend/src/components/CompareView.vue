@@ -233,13 +233,17 @@ onMounted(loadSettings)
 
 <style scoped>
 .compare-shell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   min-height: 100vh;
-  padding: 32px max(22px, calc((100vw - 1520px) / 2));
+  padding: 44px 24px 64px;
   color: var(--mm-text);
   background: #fff;
 }
 
 .compare-head {
+  width: min(100%, 980px);
   margin-bottom: 24px;
 }
 
@@ -257,6 +261,10 @@ onMounted(loadSettings)
   line-height: 1.7;
 }
 
+.compare-head p {
+  max-width: 560px;
+}
+
 .back-link {
   color: var(--mm-primary);
   font-weight: 600;
@@ -265,6 +273,7 @@ onMounted(loadSettings)
 
 .setup-grid {
   display: grid;
+  width: min(100%, 980px);
   gap: 16px;
 }
 
@@ -368,6 +377,7 @@ input {
 }
 
 .result-panel {
+  width: min(100%, 980px);
   margin-top: 16px;
 }
 

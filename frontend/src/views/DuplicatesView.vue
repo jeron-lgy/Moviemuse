@@ -3,7 +3,7 @@
     <PageHeader
       kicker="媒体扫描"
       title="重复视频"
-      description="扫描媒体目录，按重复组筛选低优先级版本，并把缺字幕的视频发送到字幕队列。"
+      description="扫描重复视频，批量移动或发送字幕。"
     >
       <template #actions>
         <BaseButton type="button" :disabled="loading" @click="loadScan">刷新</BaseButton>
@@ -20,7 +20,7 @@
       <div class="status-head">
         <div>
           <h2>状态栏</h2>
-          <p>{{ scan.current_path || '等待下一次扫描任务。' }}</p>
+          <p>{{ scan.current_path || '等待扫描。' }}</p>
         </div>
         <span class="mm-pill">{{ formatStatus(scan.status) }}</span>
       </div>
@@ -41,7 +41,7 @@
         <div class="panel-head">
           <div>
             <h2>扫描目录</h2>
-            <p>选择要纳入重复扫描的媒体目录。</p>
+            <p>选择扫描范围。</p>
           </div>
           <span class="mm-pill">{{ selectedPaths.length }} 个目录</span>
         </div>
@@ -59,43 +59,26 @@
           <div class="panel-head">
             <div>
               <h2>批量操作菜单</h2>
-              <p>自动策略可以反复开关，手动勾选会叠加到当前选择。</p>
+              <p>批量勾选后再执行。</p>
             </div>
             <span class="mm-pill">{{ selectedActionCount }} 个已选</span>
           </div>
 
-          <div class="rule-grid">
-            <button
+          <div class="batch-actions">
+            <BaseButton
               type="button"
-              class="rule-card"
-              :class="{ active: autoRules.move }"
-              @click="autoRules.move = !autoRules.move"
+              :variant="autoRules.move ? 'danger' : ''"
+              @click="toggleBatch('move')"
             >
-              <span>自动移动</span>
-              <strong>{{ moveSelection.length }}</strong>
-              <em>重复组中已有 4K、字幕或无码版本时，选中低优先级版本。</em>
-            </button>
-            <button
+              批量重复
+            </BaseButton>
+            <BaseButton
               type="button"
-              class="rule-card"
-              :class="{ active: autoRules.subtitle }"
-              @click="autoRules.subtitle = !autoRules.subtitle"
+              :variant="autoRules.subtitle ? 'primary' : ''"
+              @click="toggleBatch('subtitle')"
             >
-              <span>自动字幕</span>
-              <strong>{{ subtitleSelection.length }}</strong>
-              <em>选中无字幕且不是无码版本的视频。</em>
-            </button>
-          </div>
-
-          <div class="action-bar">
-            <div>
-              <strong>{{ moveSelection.length }}</strong>
-              <span>待移动</span>
-            </div>
-            <div>
-              <strong>{{ subtitleSelection.length }}</strong>
-              <span>待字幕</span>
-            </div>
+              批量字幕
+            </BaseButton>
             <BaseButton
               variant="danger"
               type="button"
@@ -119,12 +102,26 @@
           <div class="panel-head groups-head">
             <div>
               <h2>重复组数据</h2>
-              <p>每个视频都可以手动选择移动或字幕；移动优先于字幕，避免同一文件重复处理。</p>
+              <p>移动优先于字幕。</p>
             </div>
             <div class="head-tools">
               <BaseButton type="button" size="sm" :disabled="!groups.length" @click="clearManualSelection">清空手动选择</BaseButton>
               <span class="mm-pill">{{ groups.length }} 组</span>
             </div>
+          </div>
+          <div class="selection-summary">
+            <article>
+              <span>待移动</span>
+              <strong>{{ moveSelection.length }}</strong>
+            </article>
+            <article>
+              <span>待字幕</span>
+              <strong>{{ subtitleSelection.length }}</strong>
+            </article>
+            <article>
+              <span>已选择</span>
+              <strong>{{ selectedActionCount }}</strong>
+            </article>
           </div>
 
           <div v-if="groups.length" class="group-list">
@@ -310,6 +307,14 @@ function setManualAction(path, action, checked) {
   }
 }
 
+function toggleBatch(action) {
+  if (action === 'move') {
+    autoRules.move = !autoRules.move
+    return
+  }
+  autoRules.subtitle = !autoRules.subtitle
+}
+
 function clearManualSelection() {
   manualMove.clear()
   manualSubtitle.clear()
@@ -461,7 +466,7 @@ function formatStatus(status) {
 .group-title span,
 .file-main span,
 .file-meta,
-.action-bar span {
+.selection-summary span {
   color: var(--mm-muted);
 }
 
@@ -558,68 +563,17 @@ function formatStatus(status) {
   white-space: nowrap;
 }
 
-.rule-grid {
+.rules-card {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 18px;
+  align-content: start;
+  gap: 18px;
 }
 
-.rule-card {
-  display: grid;
-  min-height: 138px;
-  gap: 8px;
-  padding: 16px;
-  border: 1px solid var(--mm-border);
-  border-radius: 8px;
-  background: #fff;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
-}
-
-.rule-card.active {
-  border-color: var(--mm-primary);
-  background: var(--mm-primary-soft);
-  box-shadow: inset 0 0 0 1px var(--mm-primary);
-}
-
-.rule-card span {
-  color: var(--mm-muted);
-  font-weight: 550;
-}
-
-.rule-card strong {
-  font-size: 34px;
-  font-weight: 650;
-}
-
-.rule-card em {
-  color: var(--mm-muted);
-  font-size: 12px;
-  font-style: normal;
-  line-height: 1.5;
-}
-
-.action-bar {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(76px, 1fr)) auto auto;
+.batch-actions {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--mm-border);
-}
-
-.action-bar div {
-  display: grid;
-  gap: 3px;
-}
-
-.action-bar strong {
-  font-size: 24px;
-  font-weight: 650;
 }
 
 .groups-card {
@@ -635,6 +589,36 @@ function formatStatus(status) {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.selection-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.selection-summary article {
+  display: grid;
+  gap: 6px;
+  min-height: 78px;
+  align-content: center;
+  padding: 14px 16px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: var(--mm-surface);
+}
+
+.selection-summary span {
+  color: var(--mm-muted);
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.selection-summary strong {
+  font-size: 26px;
+  font-weight: 650;
+  line-height: 1.1;
 }
 
 .status-head .mm-pill,
@@ -822,8 +806,8 @@ function formatStatus(status) {
   .group-title,
   .groups-head,
   .head-tools,
-  .rule-grid,
-  .action-bar {
+  .batch-actions,
+  .selection-summary {
     display: grid;
     grid-template-columns: 1fr;
     justify-content: stretch;

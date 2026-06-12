@@ -82,6 +82,11 @@ textarea {
   font: inherit;
 }
 
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--mm-primary);
+}
+
 .mm-button {
   display: inline-flex;
   align-items: center;

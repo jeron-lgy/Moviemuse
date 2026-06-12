@@ -33,13 +33,14 @@ DEFAULT_WASH_SETTINGS = {
     "max_size_gb": 80,
 }
 DEFAULT_PINNED_MAKERS = [
-    {"name": "S1 NO.1 STYLE", "url": "https://javdb.com/makers/7R?f=download"},
-    {"name": "PRESTIGE", "url": "https://javdb.com/makers/6M?f=download"},
-    {"name": "IDEA POCKET", "url": "https://javdb.com/makers/ZXX?f=download"},
-    {"name": "Madonna", "url": "https://javdb.com/makers/zKW?f=download"},
-    {"name": "SOD Create", "url": "https://javdb.com/makers/q6?f=download"},
+    {"name": "S1 NO.1 STYLE", "url": "https://javdb.com/makers/7R?f=download", "preferred_listing_source": "javlibrary"},
+    {"name": "PRESTIGE", "url": "https://javdb.com/makers/6M?f=download", "preferred_listing_source": "javlibrary"},
+    {"name": "IDEA POCKET", "url": "https://javdb.com/makers/ZXX?f=download", "preferred_listing_source": "javlibrary"},
+    {"name": "Madonna", "url": "https://javdb.com/makers/zKW?f=download", "preferred_listing_source": "javlibrary"},
+    {"name": "SOD Create", "url": "https://javdb.com/makers/q6?f=download", "preferred_listing_source": "javlibrary"},
 ]
 DEFAULT_PINNED_MAKER_URLS = {item["name"].lower(): item["url"] for item in DEFAULT_PINNED_MAKERS}
+DEFAULT_PINNED_MAKER_SOURCES = {item["name"].lower(): item.get("preferred_listing_source", "auto") for item in DEFAULT_PINNED_MAKERS}
 
 
 class SubscriptionService:
@@ -185,6 +186,7 @@ class SubscriptionService:
         data["settings"].setdefault("asset_cron", DEFAULT_ASSET_CRON)
         data["settings"].setdefault("asset_cache_max_mb", 2048)
         data["settings"].setdefault("max_coactors", DEFAULT_MAX_COACTORS)
+        data["settings"].setdefault("javdb_source_enabled", False)
         data["settings"].setdefault("poll_enabled", True)
         data["settings"].setdefault("last_poll_at", 0)
         data["settings"].setdefault("last_poll_minute", "")
@@ -295,6 +297,21 @@ class SubscriptionService:
                 )
         except Exception:
             return
+
+    def delete_metadata_cache(self, namespace: str, cache_key: str) -> bool:
+        ns = str(namespace or "").strip()
+        key = str(cache_key or "").strip()
+        if not ns or not key:
+            return False
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM subscription_metadata_cache WHERE namespace = ? AND cache_key = ?",
+                    (ns, key),
+                )
+                return bool(cur.rowcount)
+        except Exception:
+            return False
 
     def delete_expired_metadata_cache(self) -> int:
         now = time.time()
@@ -555,6 +572,8 @@ class SubscriptionService:
                 except (TypeError, ValueError):
                     count = DEFAULT_MAX_COACTORS
                 settings["max_coactors"] = max(1, min(DEFAULT_MAX_COACTORS, count))
+            if "javdb_source_enabled" in payload:
+                settings["javdb_source_enabled"] = bool(payload.get("javdb_source_enabled"))
             if "wash" in payload:
                 settings["wash"] = normalize_wash_settings(payload.get("wash"))
             self._save()
@@ -713,7 +732,11 @@ class SubscriptionService:
 
     def get_subscribed_av(self) -> list[dict[str, Any]]:
         with self._lock:
-            return list(self.data["av"].values())
+            return sorted(
+                self.data["av"].values(),
+                key=lambda item: float(item.get("subscribed_at") or 0),
+                reverse=True,
+            )
 
     def is_av_subscribed(self, av_id: str) -> bool:
         with self._lock:
@@ -802,7 +825,11 @@ class SubscriptionService:
 
     def get_subscribed_actresses(self) -> list[dict[str, Any]]:
         with self._lock:
-            return list(self.data["actress"].values())
+            return sorted(
+                self.data["actress"].values(),
+                key=lambda item: float(item.get("subscribed_at") or 0),
+                reverse=True,
+            )
 
     def is_actress_subscribed(self, actress_id: str) -> bool:
         with self._lock:
@@ -825,7 +852,7 @@ class SubscriptionService:
                 settings["last_poll_minute"] = minute_key
             self._save()
 
-    def mark_task_poll(self, task_id: str, minute_key: str | None = None, result: dict[str, Any] | None = None) -> None:
+    def mark_task_poll(self, task_id: str, minute_key: str | None = None, result: dict[str, Any] | None = None, status: str = "ok") -> None:
         keys = {
             "actress_poll": ("last_poll_at", "last_poll_minute"),
             "av_download": ("last_av_poll_at", "last_av_poll_minute"),
@@ -850,7 +877,7 @@ class SubscriptionService:
                 results[task_id] = {
                     "task_id": task_id,
                     "ran_at": settings[at_key],
-                    "status": "ok",
+                    "status": status if status in {"ok", "failed"} else "ok",
                     "result": result,
                 }
             self._save()
@@ -903,19 +930,25 @@ def normalize_pinned_makers(value: Any) -> list[dict[str, str]]:
         if isinstance(row, dict):
             name = str(row.get("name") or "").strip()
             url = str(row.get("url") or "").strip()
+            preferred_listing_source = str(row.get("preferred_listing_source") or row.get("preferred_source") or "").strip().lower()
         else:
             name = str(row or "").strip()
             url = ""
+            preferred_listing_source = ""
         if not name or name.lower() in seen:
             continue
         default_url = DEFAULT_PINNED_MAKER_URLS.get(name.lower(), "")
+        default_source = DEFAULT_PINNED_MAKER_SOURCES.get(name.lower(), "auto")
         legacy_search_url = f"https://javdb.com/search?q={quote_plus(name)}&f=all"
         if not url or url == legacy_search_url:
             url = default_url or legacy_search_url
+        if preferred_listing_source not in {"auto", "javlibrary", "dmm", "javdb"}:
+            preferred_listing_source = default_source
         seen.add(name.lower())
         result.append({
             "name": name,
             "url": url,
+            "preferred_listing_source": preferred_listing_source,
         })
     if result:
         return result[:20]

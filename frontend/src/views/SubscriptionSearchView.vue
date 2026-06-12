@@ -109,6 +109,7 @@
 
 <script setup>
 import { computed, ref, watch } from 'vue'
+import { useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
@@ -119,6 +120,7 @@ import { imageProxyUrl } from '../lib/images'
 
 const route = useRoute()
 const router = useRouter()
+const queryClient = useQueryClient()
 const keyword = ref(String(route.query.q || ''))
 const searchType = ref(String(route.query.type || 'av'))
 const loading = ref(false)
@@ -260,7 +262,7 @@ async function confirmActressSubscribe() {
   const item = actressSubscribeItem.value
   submitting.value = true
   try {
-    await postJson('/api/subscriptions/actress', {
+    const payload = await postJson('/api/subscriptions/actress', {
       id: item.id,
       name: item.name || item.title,
       cover: actressCover(item),
@@ -272,6 +274,7 @@ async function confirmActressSubscribe() {
       poll_enabled: true,
       include_vr: actressSubscribeForm.value.include_vr
     })
+    updateSubscriptionCache('actress', payload.subscription)
     errorMessage.value = `${item.name || item.title} 已订阅`
     actressSubscribeItem.value = null
   } catch (error) {
@@ -285,11 +288,12 @@ async function confirmSubscribe(filters) {
   if (!subscribeItem.value) return
   submitting.value = true
   try {
-    await postJson('/api/subscriptions/av', {
+    const payload = await postJson('/api/subscriptions/av', {
       ...subscribeItem.value,
       filters: { ...filters },
       subscription_mode: filters.subscription_mode
     })
+    updateSubscriptionCache('av', payload.subscription)
     errorMessage.value = `${subscribeItem.value.id} 已加入订阅`
     subscribeItem.value = null
   } catch (error) {
@@ -297,6 +301,17 @@ async function confirmSubscribe(filters) {
   } finally {
     submitting.value = false
   }
+}
+
+function updateSubscriptionCache(type, item) {
+  if (!item?.id) return
+  const key = ['subscriptions', type]
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    const next = [item, ...rows.filter((row) => row?.id !== item.id)]
+    return { ...(current || {}), subscriptions: next }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
 }
 
 async function downloadMteam(item) {

@@ -1,6 +1,10 @@
 <template>
   <section class="makers-view">
-    <PageHeader kicker="订阅管理" :title="activeMaker?.name || '厂牌发售'" description="首屏读取厂牌最近 14 条作品，JavDB 与 DMM/FANZA 统一走本地缓存。">
+    <PageHeader
+      kicker="订阅管理"
+      :title="activeMaker?.name || '厂牌发售'"
+      description="首屏读取厂牌最近 14 条作品，JavDB 与 DMM/FANZA 统一走本地缓存。"
+    >
       <template #actions>
         <BaseButton variant="primary" type="button" :disabled="loading" @click="refreshCurrent">
           {{ loading ? '刷新中' : '刷新当前厂牌' }}
@@ -8,7 +12,7 @@
       </template>
     </PageHeader>
 
-    <BaseCard class="maker-toolbar" >
+    <BaseCard class="maker-toolbar">
       <div class="maker-tabs">
         <button
           v-for="maker in makers"
@@ -22,22 +26,26 @@
         <button class="add-maker" type="button" @click="showMakerDialog = true">+</button>
       </div>
       <form class="maker-search" @submit.prevent="searchByUrl">
-        <input v-model.trim="manualUrl" type="url" placeholder="厂牌：javdb 链接，例如 https://javdb.com/makers/7R?f=download">
-        <BaseButton  type="submit" :disabled="!manualUrl">读取</BaseButton>
+        <input
+          v-model.trim="manualUrl"
+          type="url"
+          placeholder="厂牌：JavDB 链接，例如 https://javdb.com/makers/7R?f=download"
+        >
+        <BaseButton type="submit" :disabled="!manualUrl">读取</BaseButton>
       </form>
-      <p>数据源：JavDB listing + DMM/FANZA，本地 SQLite 缓存；演员信息在详情页补齐后复用。</p>
+      <p>数据源：{{ activeMaker?.preferred_listing_source === 'javlibrary' ? 'JavLibrary 最新列表 + DMM/FANZA 资料补全' : '按常驻厂牌首选源调度' }}，本地 SQLite 缓存；演员信息在详情页补齐后复用。</p>
     </BaseCard>
 
     <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
-    <NoticeBanner v-else-if="successMessage" >{{ successMessage }}</NoticeBanner>
+    <NoticeBanner v-else-if="successMessage">{{ successMessage }}</NoticeBanner>
 
     <section class="result-section">
       <div class="section-head">
         <h2>最近发售</h2>
         <span>{{ movies.length }} 条</span>
       </div>
-      <BaseCard as="div" class="empty" v-if="loading" >正在读取厂牌发售...</BaseCard>
-      <BaseCard as="div" class="empty" v-else-if="!movies.length" >该厂牌暂时没有作品数据。</BaseCard>
+      <BaseCard as="div" class="empty" v-if="loading">正在读取厂牌发售...</BaseCard>
+      <BaseCard as="div" class="empty" v-else-if="!movies.length">该厂牌暂时没有作品数据。</BaseCard>
       <div v-else class="card-grid">
         <SubscriptionMovieCard
           v-for="item in movies"
@@ -50,8 +58,8 @@
           @detail="openDetail"
         >
           <template #actions>
-              <BaseButton  type="button" @click.stop="openDetail(item)">详情</BaseButton>
-              <BaseButton variant="primary"  type="button" @click.stop="openSubscribe(item)">订阅</BaseButton>
+            <BaseButton type="button" @click.stop="openDetail(item)">详情</BaseButton>
+            <BaseButton variant="primary" type="button" @click.stop="openSubscribe(item)">订阅</BaseButton>
           </template>
         </SubscriptionMovieCard>
       </div>
@@ -82,8 +90,8 @@
     />
 
     <div v-if="showMakerDialog" class="modal-mask" @click.self="showMakerDialog = false">
-      <BaseCard as="form" class="maker-dialog"  @submit.prevent="addMaker">
-        <button class="modal-close" type="button" @click="showMakerDialog = false">×</button>
+      <BaseCard as="form" class="maker-dialog" @submit.prevent="addMaker">
+        <button class="modal-close" type="button" @click="showMakerDialog = false">x</button>
         <h2>添加常驻厂牌</h2>
         <label>
           厂牌名称
@@ -93,9 +101,18 @@
           JavDB 链接
           <input v-model.trim="newMaker.url" type="url" placeholder="https://javdb.com/makers/7R?f=download">
         </label>
+        <label>
+          发售首选源
+          <select v-model="newMaker.preferred_listing_source">
+            <option value="javlibrary">JavLibrary</option>
+            <option value="dmm">DMM/FANZA</option>
+            <option value="javdb">JavDB</option>
+            <option value="auto">自动</option>
+          </select>
+        </label>
         <div class="modal-actions">
-          <BaseButton  type="button" @click="showMakerDialog = false">取消</BaseButton>
-          <BaseButton variant="primary"  type="submit" :disabled="savingMaker || !newMaker.name || !newMaker.url">
+          <BaseButton type="button" @click="showMakerDialog = false">取消</BaseButton>
+          <BaseButton variant="primary" type="submit" :disabled="savingMaker || !newMaker.name || !newMaker.url">
             {{ savingMaker ? '保存中' : '保存' }}
           </BaseButton>
         </div>
@@ -106,7 +123,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useQuery } from '@tanstack/vue-query'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
@@ -116,13 +133,14 @@ import { imageProxyUrl } from '../lib/images'
 
 const route = useRoute()
 const router = useRouter()
+const queryClient = useQueryClient()
 
 const defaultMakers = [
-  { name: 'S1 NO.1 STYLE', url: 'https://javdb.com/makers/7R?f=download' },
-  { name: 'PRESTIGE', url: 'https://javdb.com/makers/6M?f=download' },
-  { name: 'IDEA POCKET', url: 'https://javdb.com/makers/ZXX?f=download' },
-  { name: 'Madonna', url: 'https://javdb.com/makers/zKW?f=download' },
-  { name: 'SOD Create', url: 'https://javdb.com/makers/q6?f=download' }
+  { name: 'S1 NO.1 STYLE', url: 'https://javdb.com/makers/7R?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'PRESTIGE', url: 'https://javdb.com/makers/6M?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'IDEA POCKET', url: 'https://javdb.com/makers/ZXX?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'Madonna', url: 'https://javdb.com/makers/zKW?f=download', preferred_listing_source: 'javlibrary' },
+  { name: 'SOD Create', url: 'https://javdb.com/makers/q6?f=download', preferred_listing_source: 'javlibrary' }
 ]
 
 const { data: settingsData, refetch: refetchSettings } = useQuery({
@@ -138,6 +156,7 @@ const loading = ref(false)
 const loadingMore = ref(false)
 const listingLimit = ref(14)
 const hasMore = ref(false)
+const listingMemoryCache = new Map()
 const errorMessage = ref('')
 const successMessage = ref('')
 const subscribeItem = ref(null)
@@ -145,7 +164,8 @@ const detailItem = ref(null)
 const submitting = ref(false)
 const showMakerDialog = ref(false)
 const savingMaker = ref(false)
-const newMaker = reactive({ name: '', url: '' })
+const newMaker = reactive({ name: '', url: '', preferred_listing_source: 'javlibrary' })
+const LISTING_CACHE_PREFIX = 'moviemuse:maker-listing:'
 
 const makers = computed(() => {
   const rows = settingsData.value?.settings?.pinned_makers
@@ -163,8 +183,11 @@ function selectMaker(maker) {
   activeUrl.value = maker.url
   manualUrl.value = maker.url
   listingLimit.value = 14
-  router.replace({ path: '/makers', query: { url: maker.url, name: maker.name } })
-  loadListing()
+  if (String(route.query.url || '') === maker.url) {
+    loadListing()
+  } else {
+    router.replace({ path: '/makers', query: { url: maker.url, name: maker.name } })
+  }
 }
 
 function searchByUrl() {
@@ -199,6 +222,22 @@ function applyRouteMaker() {
 async function loadListing(force = false, keepContent = false) {
   const url = activeUrl.value || manualUrl.value
   if (!url) return
+  const cacheKey = `${url}|${activeMaker.value?.name || ''}|${listingLimit.value}`
+  if (!force && !keepContent && listingMemoryCache.has(cacheKey)) {
+    const cached = listingMemoryCache.get(cacheKey)
+    movies.value = cached.movies
+    hasMore.value = cached.hasMore
+    return
+  }
+  if (!force && !keepContent) {
+    const cached = readListingCache(cacheKey)
+    if (cached) {
+      listingMemoryCache.set(cacheKey, cached)
+      movies.value = cached.movies
+      hasMore.value = cached.hasMore
+      return
+    }
+  }
   if (keepContent) {
     loadingMore.value = true
   } else {
@@ -215,6 +254,11 @@ async function loadListing(force = false, keepContent = false) {
     const results = Array.isArray(payload.results) ? payload.results : []
     hasMore.value = results.length > listingLimit.value
     movies.value = results.slice(0, listingLimit.value)
+    if (!keepContent) {
+      const cached = { movies: movies.value, hasMore: hasMore.value, cachedAt: Date.now() }
+      listingMemoryCache.set(cacheKey, cached)
+      writeListingCache(cacheKey, cached)
+    }
   } catch (error) {
     if (keepContent) {
       listingLimit.value = Math.max(14, listingLimit.value - 14)
@@ -229,6 +273,30 @@ async function loadListing(force = false, keepContent = false) {
     } else {
       loading.value = false
     }
+  }
+}
+
+function readListingCache(cacheKey) {
+  try {
+    const raw = sessionStorage.getItem(`${LISTING_CACHE_PREFIX}${cacheKey}`)
+    if (!raw) return null
+    const payload = JSON.parse(raw)
+    if (!Array.isArray(payload.movies)) return null
+    return {
+      movies: payload.movies,
+      hasMore: !!payload.hasMore,
+      cachedAt: Number(payload.cachedAt || 0)
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeListingCache(cacheKey, payload) {
+  try {
+    sessionStorage.setItem(`${LISTING_CACHE_PREFIX}${cacheKey}`, JSON.stringify(payload))
+  } catch {
+    // 浏览器缓存满时不影响主流程。
   }
 }
 
@@ -251,8 +319,12 @@ function openMakerFromDetail(link) {
   detailItem.value = null
   activeUrl.value = link.url
   manualUrl.value = link.url
-  router.replace({ path: '/makers', query: { url: link.url, name: link.name || '' } })
-  loadListing()
+  listingLimit.value = 14
+  if (String(route.query.url || '') === link.url) {
+    loadListing()
+  } else {
+    router.replace({ path: '/makers', query: { url: link.url, name: link.name || '' } })
+  }
 }
 
 function openSubscribe(item) {
@@ -269,11 +341,12 @@ async function confirmSubscribe(filters) {
   errorMessage.value = ''
   successMessage.value = ''
   try {
-    await postJson('/api/subscriptions/av', {
+    const payload = await postJson('/api/subscriptions/av', {
       ...subscribeItem.value,
       filters: { ...filters },
       subscription_mode: filters.subscription_mode
     })
+    updateSubscriptionCache(payload.subscription)
     successMessage.value = `${subscribeItem.value.id} 已加入订阅`
     subscribeItem.value = null
   } catch (error) {
@@ -283,18 +356,35 @@ async function confirmSubscribe(filters) {
   }
 }
 
+function updateSubscriptionCache(item) {
+  if (!item?.id) return
+  const key = ['subscriptions', 'av']
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    return {
+      ...(current || {}),
+      subscriptions: [item, ...rows.filter((row) => row?.id !== item.id)]
+    }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
+}
+
 async function addMaker() {
   savingMaker.value = true
   errorMessage.value = ''
   successMessage.value = ''
   try {
-    const next = [...makers.value.filter((maker) => maker.url !== newMaker.url), { name: newMaker.name, url: newMaker.url }]
+    const next = [
+      ...makers.value.filter((maker) => maker.url !== newMaker.url),
+      { name: newMaker.name, url: newMaker.url, preferred_listing_source: newMaker.preferred_listing_source || 'javlibrary' }
+    ]
     await postJson('/api/subscriptions/settings', { pinned_makers: next })
     await refetchSettings()
     activeUrl.value = newMaker.url
     manualUrl.value = newMaker.url
     newMaker.name = ''
     newMaker.url = ''
+    newMaker.preferred_listing_source = 'javlibrary'
     showMakerDialog.value = false
     successMessage.value = '常驻厂牌已保存'
     await loadListing()
@@ -330,8 +420,9 @@ h1 {
   color: var(--mm-text);
   font-size: 30px;
   font-weight: 650;
-  letter-spacing: -0.3px;
+  letter-spacing: 0;
 }
+
 .maker-toolbar p {
   margin-top: 8px;
   color: var(--mm-muted);
@@ -437,16 +528,12 @@ h1 {
 
 .maker-dialog {
   position: relative;
-  width: min(920px, 100%);
-  max-height: min(86vh, 900px);
-  overflow: auto;
-  padding: 28px;
-}
-
-.maker-dialog {
   width: min(560px, 100%);
+  max-height: min(86vh, 900px);
   display: grid;
   gap: 18px;
+  overflow: auto;
+  padding: 28px;
 }
 
 .maker-dialog label {
@@ -494,6 +581,5 @@ h1 {
   .card-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-
 }
 </style>

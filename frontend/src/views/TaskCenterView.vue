@@ -55,6 +55,9 @@
         <div class="bulk-actions">
           <span v-if="selectedJobs.length">已选择 {{ selectedJobs.length }} 个任务</span>
           <BaseButton  type="button" @click="toggleSelectVisible">{{ allVisibleSelected ? '取消本页全选' : '全选本页' }}</BaseButton>
+          <BaseButton type="button" :disabled="!runnableSelectedJobs.length || runningSelected" @click="runSelected">
+            {{ runningSelected ? '入队中' : '批量运行' }}
+          </BaseButton>
           <BaseButton variant="primary"  type="button" :disabled="!selectedJobs.length || retryingSelected" @click="retrySelected">
             {{ retryingSelected ? '重试中' : '批量重试' }}
           </BaseButton>
@@ -85,39 +88,67 @@
     </BaseCard>
 
     <TaskDialog v-if="computeDialog" title="Windows 算力端" @close="computeDialog = false">
-      <div class="form-grid">
-        <FormField label="启用 Windows 算力端">
-          <input v-model="computeEnabled" type="checkbox">
-        </FormField>
-        <FormField label="地址">
-          <input v-model.trim="connection.subtitle_backend_url" placeholder="http://WINDOWS-IP:18181">
-        </FormField>
-        <FormField label="API Token">
-          <input v-model.trim="connection.subtitle_backend_token">
-        </FormField>
-        <FormField label="Whisper 模型">
-          <input v-model.trim="settings.whisper_model">
-        </FormField>
-        <FormField label="设备">
-          <select v-model="settings.whisper_device"><option>cuda</option><option>cpu</option></select>
-        </FormField>
-        <FormField label="计算类型">
-          <select v-model="settings.whisper_compute_type"><option>float16</option><option>int8_float16</option><option>int8</option><option>float32</option></select>
-        </FormField>
-        <FormField label="并发数">
-          <input v-model.number="settings.subtitle_max_workers" type="number" min="1" max="4">
-        </FormField>
-        <FormField label="模型目录">
-          <input v-model.trim="settings.whisper_model_dir">
-        </FormField>
-        <FormField label="路径映射" wide>
-          <textarea v-model="settings.subtitle_path_map" rows="3"></textarea>
-        </FormField>
-      </div>
-      <div class="hardware-grid">
-        <div><span>CPU</span><strong>{{ backendStatus.hardware?.cpu || '未连接' }}</strong></div>
-        <div><span>内存</span><strong>{{ memoryLabel }}</strong></div>
-        <div><span>显卡</span><strong>{{ gpuLabel }}</strong></div>
+      <div class="compute-settings">
+        <section class="settings-section">
+          <label class="compute-toggle">
+            <input v-model="computeEnabled" type="checkbox">
+            <span>启用 Windows 算力端</span>
+          </label>
+          <div class="form-grid compact-grid">
+            <FormField label="算力端地址">
+              <input v-model.trim="connection.subtitle_backend_url" placeholder="http://WINDOWS-IP:18181">
+            </FormField>
+            <FormField label="回调地址">
+              <input v-model.trim="settings.console_public_url" placeholder="http://192.168.2.9:18188">
+            </FormField>
+            <FormField label="API Token" wide>
+              <SecretInput v-model.trim="connection.subtitle_backend_token" autocomplete="off" placeholder="未设置可留空" />
+            </FormField>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="compute-section-head">
+            <strong>Whisper 参数</strong>
+          </div>
+          <div class="form-grid compact-grid">
+            <FormField label="Whisper 模型">
+              <input v-model.trim="settings.whisper_model">
+            </FormField>
+            <FormField label="设备">
+              <select v-model="settings.whisper_device"><option>cuda</option><option>cpu</option></select>
+            </FormField>
+            <FormField label="计算类型">
+              <select v-model="settings.whisper_compute_type"><option>float16</option><option>int8_float16</option><option>int8</option><option>float32</option></select>
+            </FormField>
+            <FormField label="并发数">
+              <input v-model.number="settings.subtitle_max_workers" type="number" min="1" max="4">
+            </FormField>
+            <FormField label="模型目录" wide>
+              <input v-model.trim="settings.whisper_model_dir">
+            </FormField>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="compute-section-head">
+            <strong>路径映射</strong>
+          </div>
+          <FormField label="映射规则" wide>
+            <textarea v-model="settings.subtitle_path_map" rows="3" placeholder="/media=\\192.168.2.9\media"></textarea>
+          </FormField>
+        </section>
+
+        <section class="settings-section hardware-section">
+          <div class="compute-section-head">
+            <strong>硬件状态</strong>
+          </div>
+          <div class="hardware-grid">
+            <div><span>CPU</span><strong>{{ backendStatus.hardware?.cpu || '未连接' }}</strong></div>
+            <div><span>内存</span><strong>{{ memoryLabel }}</strong></div>
+            <div><span>显卡</span><strong>{{ gpuLabel }}</strong></div>
+          </div>
+        </section>
       </div>
       <template #actions>
         <BaseButton  type="button" @click="testBackend">测试联通</BaseButton>
@@ -134,7 +165,8 @@
       </div>
       <div class="form-grid">
         <FormField v-for="field in activeProviderFields" :key="field.key" :label="field.label" :hint="field.hint">
-          <input v-model.trim="settings[field.key]" :placeholder="field.placeholder" :type="field.secret ? 'password' : 'text'">
+          <SecretInput v-if="field.secret" v-model.trim="settings[field.key]" autocomplete="off" :placeholder="field.placeholder" />
+          <input v-else v-model.trim="settings[field.key]" :placeholder="field.placeholder">
         </FormField>
         <template v-if="settings.default_translate_backend === 'deepseek'">
           <FormField label="翻译风格">
@@ -149,6 +181,7 @@
         </template>
       </div>
       <template #actions>
+        <BaseButton as="RouterLink" to="/subtitles/compare" type="button" @click="translateDialog = false">翻译效果对比</BaseButton>
         <BaseButton  type="button" @click="testTranslate(settings.default_translate_backend)">测试</BaseButton>
         <BaseButton variant="primary"  type="button" :disabled="savingSettings" @click="saveSettings()">{{ savingSettings ? '保存中' : '保存设置' }}</BaseButton>
       </template>
@@ -156,17 +189,16 @@
 
     <TaskDialog v-if="transcodeDialog" title="转码设置" @close="transcodeDialog = false">
       <div class="form-grid">
-        <FormField label="启用自动转码">
-          <input v-model="postprocessSettings.auto_transcode_enabled" type="checkbox">
+        <FormField label="编码方案">
+          <select :value="activeEncodingKey" @change="selectEncodingPreset($event.target.value)">
+            <option value="">自定义当前参数</option>
+            <option v-for="preset in allEncodingPresets" :key="preset.key" :value="preset.key">
+              {{ preset.name }}
+            </option>
+          </select>
         </FormField>
-        <FormField label="启用自动字幕">
-          <input v-model="postprocessSettings.auto_subtitle_enabled" type="checkbox">
-        </FormField>
-        <FormField label="算力端上线后自动执行队列">
-          <input v-model="postprocessSettings.worker_auto_run" type="checkbox">
-        </FormField>
-        <FormField label="目标编码">
-          <select v-model="postprocessSettings.target_codec"><option value="av1">AV1 · av1_nvenc</option><option value="h265">H.265</option></select>
+        <FormField label="编码器">
+          <input v-model.trim="postprocessSettings.target_encoder">
         </FormField>
         <FormField label="Preset">
           <input v-model.trim="postprocessSettings.preset">
@@ -177,8 +209,36 @@
         <FormField label="最大并发">
           <input v-model.number="postprocessSettings.max_concurrency" type="number" min="1" max="8">
         </FormField>
+        <FormField label="下载目录">
+          <input v-model.trim="postprocessSettings.download_dir" placeholder="/media/你的下载目录">
+        </FormField>
+        <FormField label="输出目录">
+          <input v-model.trim="postprocessSettings.output_dir" placeholder="/media/你的输出目录">
+        </FormField>
       </div>
-      <code class="ffmpeg-preview">{{ ffmpegPreview }}</code>
+      <div class="ffmpeg-send-panel">
+        <div class="section-head">
+          <h3>FFmpeg 设置来源</h3>
+          <p>选择保存哪一组 FFmpeg 设置。选中的卡片会高亮，点击保存设置后同步到算力端。</p>
+        </div>
+        <div class="ffmpeg-mode-cards">
+          <button type="button" class="choice-card" :class="{ active: ffmpegMode === 'standard' }" @click="setFfmpegMode('standard')">
+            <strong>标准编码设置</strong>
+            <span>使用上面选中的编码方案、Preset、CQ/CRF 自动生成命令。</span>
+          </button>
+          <button type="button" class="choice-card" :class="{ active: ffmpegMode === 'custom' }" @click="setFfmpegMode('custom')">
+            <strong>自定义 FFmpeg 模板</strong>
+            <span>直接保存一段标准 FFmpeg 命令模板，支持 {input}、{output}、{encoder} 等变量。</span>
+          </button>
+        </div>
+        <textarea
+          v-if="ffmpegMode === 'custom'"
+          v-model.trim="postprocessSettings.ffmpeg_custom_template"
+          class="ffmpeg-template"
+          rows="3"
+          placeholder='ffmpeg -hide_banner -nostdin -i "{input}" -c:v {encoder} {preset_flag} {preset} {quality_flag} {quality} -c:a copy "{output}" -y'
+        ></textarea>
+      </div>
       <div class="qb-option-head">
         <p>读取 qB 分类和标签后勾选，避免误接管其它下载。</p>
         <BaseButton  type="button" :disabled="loadingQbOptions" @click="loadQbOptions">{{ loadingQbOptions ? '读取中' : '读取 qB' }}</BaseButton>
@@ -237,9 +297,13 @@ const savingTranscode = ref(false)
 const loadingQbOptions = ref(false)
 const qbOptionState = ref('')
 const retryingSelected = ref(false)
+const runningSelected = ref(false)
+const autoRunningQueue = ref(false)
 const retryingJob = reactive({})
 const selectedIds = reactive(new Set())
 let refreshTimer = 0
+let refreshGeneration = 0
+let lastAutoQueueRunAt = 0
 
 const connection = reactive({ subtitle_backend_url: '', subtitle_backend_token: '' })
 const settings = reactive({
@@ -250,6 +314,7 @@ const settings = reactive({
   subtitle_max_workers: 1,
   subtitle_output_dir: '',
   subtitle_path_map: '',
+  console_public_url: '',
   subtitle_api_token: '',
   default_translate_backend: 'google',
   google_translate_url: 'https://translate.google.com/translate_a/single',
@@ -271,9 +336,18 @@ const postprocessSettings = reactive({
   auto_transcode_enabled: false,
   auto_subtitle_enabled: false,
   worker_auto_run: false,
+  download_dir: '/media/study3',
+  output_dir: '/media/压制',
   target_codec: 'av1',
+  target_encoder: 'av1_nvenc',
   crf: 36,
   preset: 'p1',
+  preset_flag: '-preset',
+  ffmpeg_mode: 'standard',
+  ffmpeg_standard_enabled: true,
+  ffmpeg_custom_enabled: false,
+  ffmpeg_custom_template: '',
+  custom_encoding_presets: [],
   max_concurrency: 1,
   allowed_categories: [],
   required_tags: []
@@ -296,6 +370,24 @@ const providerFields = {
 const activeProvider = computed(() => providerCards.find((item) => item.value === settings.default_translate_backend))
 const activeProviderFields = computed(() => providerFields[settings.default_translate_backend] || providerFields.google)
 const backendOnline = computed(() => !!backendStatus.value.online)
+const computeCallbackWarning = computed(() => {
+  if (!computeEnabled.value) return ''
+  const value = String(settings.console_public_url || '').trim()
+  if (!value) return '请填写 Unraid 回调地址，例如 http://192.168.2.9:18188。否则 Windows 算力端转码完成后无法通知控制端。'
+  try {
+    const parsed = new URL(value)
+    const host = parsed.hostname.toLowerCase()
+    if (['unraid-ip', 'windows-ip', 'localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1'].includes(host)) {
+      return 'Unraid 回调地址不能使用占位符或本机地址，请改成 Windows 能访问的 Unraid 控制台地址。'
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return 'Unraid 回调地址需要以 http:// 或 https:// 开头。'
+    }
+  } catch {
+    return 'Unraid 回调地址格式不正确，请填写类似 http://192.168.2.9:18188 的完整地址。'
+  }
+  return ''
+})
 const translationReady = computed(() => {
   if (settings.default_translate_backend === 'google') return true
   if (settings.default_translate_backend === 'deepl') return !!settings.deepl_api_key
@@ -305,6 +397,15 @@ const translationReady = computed(() => {
 })
 
 const adaptedSubtitleJobs = computed(() => jobs.value.map(adaptSubtitleJob))
+const transcodeJobLookup = computed(() => {
+  const lookup = new Map()
+  const items = backendStatus.value?.transcode_jobs?.items || []
+  items.forEach((item) => {
+    if (item?.id) lookup.set(String(item.id), item)
+    if (item?.task_id) lookup.set(String(item.task_id), item)
+  })
+  return lookup
+})
 const adaptedPostprocessJobs = computed(() => postprocessTasks.value.map(adaptPostprocessJob))
 const adaptedJobs = computed(() => [...adaptedPostprocessJobs.value, ...adaptedSubtitleJobs.value].sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0)))
 const runningJobs = computed(() => adaptedJobs.value.filter((job) => ['running', 'translating'].includes(job.statusKey)))
@@ -320,6 +421,7 @@ const queueCount = computed(() => activeJobs.value.length)
 const postprocessCount = computed(() => adaptedPostprocessJobs.value.length)
 const transcodeRunningCount = computed(() => adaptedPostprocessJobs.value.filter((job) => job.phase === 'transcode' && job.statusKey === 'running').length)
 const subtitleProcessingCount = computed(() => adaptedPostprocessJobs.value.filter((job) => job.phase === 'subtitle' && ['running', 'translating'].includes(job.statusKey)).length)
+const activePostprocessCount = computed(() => adaptedPostprocessJobs.value.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)).length)
 const todayCompleted = computed(() => {
   const start = new Date()
   start.setHours(0, 0, 0, 0)
@@ -335,22 +437,49 @@ const visibleJobs = computed(() => taskTab.value === 'history' ? historyJobs.val
 const pageCount = computed(() => Math.max(1, Math.ceil(visibleJobs.value.length / PAGE_SIZE)))
 const visiblePagedJobs = computed(() => visibleJobs.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE))
 const selectedJobs = computed(() => adaptedJobs.value.filter((job) => selectedIds.has(job.id)))
+const runnableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canRun))
+const runnableQueueJobs = computed(() => adaptedPostprocessJobs.value.filter((job) => job.canRun))
 const allVisibleSelected = computed(() => visiblePagedJobs.value.length > 0 && visiblePagedJobs.value.every((job) => selectedIds.has(job.id)))
 const memoryLabel = computed(() => {
   const memory = backendStatus.value.hardware?.memory
   return memory ? `${memory.label || ''} · ${memory.used_percent || 0}%` : '未连接'
 })
 const gpuLabel = computed(() => backendStatus.value.hardware?.gpus?.[0]?.label || '未检测')
-const transcodeSummary = computed(() => `${String(postprocessSettings.target_codec || 'av1').toUpperCase()} · ${postprocessSettings.preset || 'p1'} · CQ/CRF ${postprocessSettings.crf || 36}`)
+const transcodeSummary = computed(() => transcodeFormatLabel(postprocessSettings.target_codec))
+const allEncodingPresets = computed(() => [
+  ...standardEncodingPresets,
+  ...(postprocessSettings.custom_encoding_presets || []).map((preset, index) => ({
+    key: `custom-${index}-${preset.name}`,
+    name: preset.name,
+    desc: `${preset.encoder} · ${preset.preset || 'preset'} · CQ/CRF ${preset.quality || 36}`,
+    codec: preset.codec,
+    encoder: preset.encoder,
+    preset: preset.preset,
+    preset_flag: preset.preset_flag || '-preset',
+    quality: preset.quality || preset.crf || 36
+  }))
+])
+const activeEncodingKey = computed(() => {
+  const match = allEncodingPresets.value.find((preset) => (
+    preset.codec === postprocessSettings.target_codec
+    && preset.encoder === postprocessSettings.target_encoder
+    && String(preset.preset) === String(postprocessSettings.preset)
+    && Number(preset.quality) === Number(postprocessSettings.crf)
+  ))
+  return match?.key || ''
+})
+const ffmpegMode = computed(() => postprocessSettings.ffmpeg_mode || (postprocessSettings.ffmpeg_custom_enabled ? 'custom' : 'standard'))
 const ffmpegPreview = computed(() => {
-  const encoder = String(postprocessSettings.target_codec || 'av1') === 'av1' ? 'av1_nvenc' : 'libx265'
-  const qualityFlag = encoder.endsWith('_nvenc') ? '-cq' : '-crf'
-  return `ffmpeg -hide_banner -nostdin -i "<输入文件>" -c:v ${encoder} -preset ${postprocessSettings.preset || 'p1'} ${qualityFlag} ${postprocessSettings.crf || 36} -c:a copy "<输出文件>" -y`
+  const encoder = postprocessSettings.target_encoder || (String(postprocessSettings.target_codec || 'av1') === 'av1' ? 'av1_nvenc' : 'libx265')
+  const qualityFlag = qualityFlagForEncoder(encoder)
+  const presetFlag = postprocessSettings.preset_flag || '-preset'
+  return `ffmpeg -hide_banner -nostdin -i "<输入文件>" -c:v ${encoder} ${presetFlag} ${postprocessSettings.preset || 'p1'} ${qualityFlag} ${postprocessSettings.crf || 36} -c:a copy "<输出文件>" -y`
 })
 const mergedQbCategories = computed(() => mergeUnique(qbOptions.categories, postprocessSettings.allowed_categories))
 const mergedQbTags = computed(() => mergeUnique(qbOptions.tags, postprocessSettings.required_tags))
 
 async function loadConsole() {
+  const generation = ++refreshGeneration
   loading.value = true
   errorMessage.value = ''
   try {
@@ -358,13 +487,15 @@ async function loadConsole() {
       api('/api/subtitle/console'),
       api('/api/postprocess/tasks?limit=200')
     ])
+    if (generation !== refreshGeneration) return
     Object.assign(connection, consolePayload.connection || {})
     computeEnabled.value = !!connection.subtitle_backend_url
     Object.assign(settings, consolePayload.compute_settings || {})
     jobs.value = consolePayload.jobs || []
     postprocessTasks.value = postprocessPayload.tasks || []
-    Object.assign(postprocessSettings, normalizePostprocessSettings(postprocessPayload.settings || {}))
+    applyPostprocessPayload(postprocessPayload)
     backendStatus.value = postprocessPayload.worker_status || consolePayload.backend_status || {}
+    await maybeAutoRunQueue()
   } catch (error) {
     errorMessage.value = error.message || '读取任务中心失败'
   } finally {
@@ -372,16 +503,31 @@ async function loadConsole() {
   }
 }
 
+const standardEncodingPresets = [
+  { key: 'av1-nvenc-balanced', name: 'AV1 NVENC · 均衡', desc: 'RTX 40/50 系列常用，速度快，体积小。', codec: 'av1', encoder: 'av1_nvenc', preset: 'p4', preset_flag: '-preset', quality: 32 },
+  { key: 'av1-nvenc-fast', name: 'AV1 NVENC · 快速', desc: '适合批量转码，速度优先。', codec: 'av1', encoder: 'av1_nvenc', preset: 'p1', preset_flag: '-preset', quality: 36 },
+  { key: 'av1-qsv', name: 'AV1 QSV', desc: 'Intel 核显/独显硬件编码。', codec: 'av1', encoder: 'av1_qsv', preset: 'medium', preset_flag: '-preset', quality: 34 },
+  { key: 'av1-svt', name: 'SVT-AV1', desc: 'CPU AV1，质量好但速度较慢。', codec: 'av1', encoder: 'libsvtav1', preset: '8', preset_flag: '-preset', quality: 34 },
+  { key: 'av1-aom', name: 'libaom-av1', desc: 'CPU AV1，高压缩率，速度最慢。', codec: 'av1', encoder: 'libaom-av1', preset: '6', preset_flag: '-cpu-used', quality: 34 },
+  { key: 'h265-nvenc-balanced', name: 'H.265 NVENC · 均衡', desc: 'NVIDIA 硬件 H.265，兼容性更高。', codec: 'h265', encoder: 'hevc_nvenc', preset: 'p4', preset_flag: '-preset', quality: 28 },
+  { key: 'h265-nvenc-fast', name: 'H.265 NVENC · 快速', desc: '转码速度优先。', codec: 'h265', encoder: 'hevc_nvenc', preset: 'p1', preset_flag: '-preset', quality: 30 },
+  { key: 'h265-qsv', name: 'H.265 QSV', desc: 'Intel Quick Sync H.265。', codec: 'h265', encoder: 'hevc_qsv', preset: 'medium', preset_flag: '-preset', quality: 28 },
+  { key: 'h265-x265', name: 'libx265', desc: 'CPU H.265，画质稳定，速度较慢。', codec: 'h265', encoder: 'libx265', preset: 'medium', preset_flag: '-preset', quality: 24 }
+]
+
 async function refreshAll() {
   if (isCompareView) return
+  const generation = ++refreshGeneration
   const [subtitlePayload, postprocessPayload] = await Promise.all([
     api('/api/subtitle/jobs?limit=0'),
     api('/api/postprocess/tasks?limit=200')
   ])
+  if (generation !== refreshGeneration) return
   jobs.value = subtitlePayload.jobs || []
   postprocessTasks.value = postprocessPayload.tasks || []
-  Object.assign(postprocessSettings, normalizePostprocessSettings(postprocessPayload.settings || {}))
+  applyPostprocessPayload(postprocessPayload)
   backendStatus.value = postprocessPayload.worker_status || backendStatus.value
+  await maybeAutoRunQueue()
 }
 
 async function testBackend() {
@@ -414,6 +560,7 @@ async function saveSettings(closeDialog = true) {
   savingSettings.value = true
   errorMessage.value = ''
   try {
+    refreshGeneration += 1
     const payload = await postJson('/api/subtitle/settings', { ...settings })
     Object.assign(settings, payload.settings || {})
     backendStatus.value = payload.backend_status || backendStatus.value
@@ -428,7 +575,12 @@ async function saveSettings(closeDialog = true) {
 
 async function saveComputeAll() {
   savingCompute.value = true
+  errorMessage.value = ''
   try {
+    if (computeCallbackWarning.value) {
+      throw new Error(computeCallbackWarning.value)
+    }
+    refreshGeneration += 1
     await saveConnection()
     await saveSettings(false)
     computeDialog.value = false
@@ -470,13 +622,21 @@ async function loadQbOptions() {
 }
 
 async function saveTranscodeSettings() {
+  if (ffmpegMode.value === 'custom' && !String(postprocessSettings.ffmpeg_custom_template || '').trim()) {
+    errorMessage.value = '请填写自定义 FFmpeg 模板，或选择标准编码设置。'
+    return
+  }
   savingTranscode.value = true
   try {
-    const payload = await postJson('/api/postprocess/settings', { ...postprocessSettings })
+    refreshGeneration += 1
+    const payload = await postJson('/api/postprocess/ffmpeg-settings/apply', {
+      ...postprocessSettings,
+      ffmpeg_standard_command: ffmpegPreview.value
+    })
     Object.assign(postprocessSettings, normalizePostprocessSettings(payload.settings || {}))
     transcodeDialog.value = false
-    notice.value = '转码设置已保存。'
-    await refreshAll()
+    notice.value = payload.warning || '转码设置已保存。'
+    await loadPostprocessSettings()
   } catch (error) {
     errorMessage.value = error.message || '保存转码设置失败'
   } finally {
@@ -484,13 +644,81 @@ async function saveTranscodeSettings() {
   }
 }
 
+async function loadPostprocessSettings() {
+  const generation = ++refreshGeneration
+  const payload = await api('/api/postprocess/settings')
+  if (generation !== refreshGeneration) return
+  Object.assign(postprocessSettings, normalizePostprocessSettings(payload.settings || {}))
+}
+
+function applyEncodingPreset(preset) {
+  postprocessSettings.target_codec = preset.codec || 'av1'
+  postprocessSettings.target_encoder = preset.encoder || ''
+  postprocessSettings.preset = String(preset.preset || 'p1')
+  postprocessSettings.preset_flag = preset.preset_flag || '-preset'
+  postprocessSettings.crf = Number(preset.quality || preset.crf || 36)
+}
+
+function selectEncodingPreset(key) {
+  const preset = allEncodingPresets.value.find((item) => item.key === key)
+  if (preset) applyEncodingPreset(preset)
+}
+
+function setFfmpegMode(mode) {
+  postprocessSettings.ffmpeg_mode = mode === 'custom' ? 'custom' : 'standard'
+  postprocessSettings.ffmpeg_standard_enabled = postprocessSettings.ffmpeg_mode === 'standard'
+  postprocessSettings.ffmpeg_custom_enabled = postprocessSettings.ffmpeg_mode === 'custom'
+}
+
+function qualityFlagForEncoder(encoder) {
+  if (['av1_qsv', 'hevc_qsv'].includes(String(encoder))) return '-global_quality'
+  return String(encoder || '').endsWith('_nvenc') ? '-cq' : '-crf'
+}
+
+function transcodeFormatLabel(codec) {
+  return String(codec || 'av1').toLowerCase() === 'h265' ? 'H.265' : 'AV1'
+}
+
+function applyPostprocessPayload(payload = {}) {
+  postprocessTasks.value = payload.tasks || []
+  if (!transcodeDialog.value && !savingTranscode.value) {
+    Object.assign(postprocessSettings, normalizePostprocessSettings(payload.settings || {}))
+  }
+}
+
 async function runPostprocessQueue() {
   try {
-    await postJson('/api/postprocess/queue/run', {})
-    notice.value = '后处理队列已触发。'
+    await postJson('/api/subscriptions/tasks/postprocess_qb/run', {})
+    notice.value = '后处理链路已触发。'
     await refreshAll()
   } catch (error) {
     errorMessage.value = error.message || '执行队列失败'
+  }
+}
+
+async function maybeAutoRunQueue() {
+  const now = Date.now()
+  if (!postprocessSettings.worker_auto_run || !backendOnline.value || autoRunningQueue.value) return
+  const runnableCount = runnableQueueJobs.value.length
+  const activeCount = activePostprocessCount.value
+  if (!runnableCount && !activeCount) return
+  if (now - lastAutoQueueRunAt < 15_000) return
+  lastAutoQueueRunAt = now
+  autoRunningQueue.value = true
+  try {
+    const payload = await postJson('/api/subscriptions/tasks/postprocess_qb/run', {})
+    const result = payload.result || {}
+    const queueResult = result.queue_auto_run || {}
+    const updated = Number(queueResult.updated || 0)
+    const subtitleChecked = Number(result.subtitle?.checked || 0)
+    if (updated || runnableCount) {
+      notice.value = `算力端在线，已自动推进后处理链路（派发 ${updated} 个，检查字幕 ${subtitleChecked} 个）。`
+    }
+    await refreshAll()
+  } catch (error) {
+    errorMessage.value = error.message || '自动推进后处理失败'
+  } finally {
+    autoRunningQueue.value = false
   }
 }
 
@@ -526,6 +754,29 @@ async function retrySelected() {
     notice.value = `已提交 ${retryable.length} 个重试任务。`
   } finally {
     retryingSelected.value = false
+  }
+}
+
+async function runSelected() {
+  const runnable = runnableSelectedJobs.value
+  if (!runnable.length) {
+    notice.value = '选中的任务里没有可运行的等待任务。'
+    return
+  }
+  runningSelected.value = true
+  try {
+    const payload = await postJson('/api/postprocess/tasks/run-selected', {
+      task_ids: runnable.map((job) => job.rawId)
+    })
+    const updated = Number(payload.updated || 0)
+    const deferred = Number(payload.deferred || payload.queued || payload.waiting || 0)
+    notice.value = `已处理 ${runnable.length} 个选中任务：派发 ${updated}，留队 ${deferred}。`
+    selectedIds.clear()
+    await refreshAll()
+  } catch (error) {
+    errorMessage.value = error.message || '批量运行失败'
+  } finally {
+    runningSelected.value = false
   }
 }
 
@@ -566,6 +817,9 @@ function adaptPostprocessJob(task) {
   const phase = postprocessPhase(task.status)
   const statusKey = postprocessStatusKey(task.status)
   const avId = task.av_id || task.id || '后处理任务'
+  const workerJob = findTranscodeJob(task)
+  const progressInfo = postprocessProgressInfo(task, phase, statusKey, workerJob)
+  const waitingDetail = postprocessWaitingDetail(task, statusKey)
   return {
     raw: task,
     id: `postprocess:${task.id}`,
@@ -574,7 +828,7 @@ function adaptPostprocessJob(task) {
     phase,
     phaseLabel: phase === 'transcode' ? '转码' : phase === 'subtitle' ? '字幕' : '后处理',
     title: phase === 'subtitle' ? `${avId} · 生成字幕` : phase === 'transcode' ? `${avId} · 转码` : avId,
-    path: task.input_path || task.output_path || task.error_message || '等待链路写入输入文件',
+    path: task.input_path || task.output_path || waitingDetail || task.error_message || '等待链路写入输入文件',
     statusKey,
     statusLabel: postprocessStatusLabel(task.status, phase, statusKey),
     createdLabel: formatTime(task.created_at),
@@ -582,10 +836,65 @@ function adaptPostprocessJob(task) {
     updatedAt: task.updated_at || task.created_at,
     finishedAt: task.finished_at,
     modelLabel: `${task.target_codec || postprocessSettings.target_codec || 'av1'} / ${task.task_type || '后处理'}`,
+    ...progressInfo,
+    progressDetail: progressInfo.progressDetail || waitingDetail,
+    canRun: ['waiting_worker', 'ready_to_run'].includes(String(task.status || '')),
     canRetry: ['failed', 'ignored', 'conflict', 'expired'].includes(String(task.status || '')),
     canCancel: !['completed', 'ignored'].includes(String(task.status || '')),
     resultSrt: ''
   }
+}
+
+function findTranscodeJob(task) {
+  const data = task?.data || {}
+  const workerJobId = data.worker_job_id || data.worker_result?.job_id || data.worker_result?.id
+  return transcodeJobLookup.value.get(String(workerJobId || '')) || transcodeJobLookup.value.get(String(task?.id || '')) || null
+}
+
+function postprocessProgressInfo(task, phase, statusKey, workerJob) {
+  if (phase !== 'transcode' && statusKey !== 'translating') {
+    return { showProgress: false, progressPercent: 0, progressLabel: '', progressDetail: '' }
+  }
+  const subtitleStatus = task?.data?.subtitle_status || {}
+  const rawProgress = Number(workerJob?.progress ?? subtitleStatus.progress ?? task?.data?.worker_result?.progress ?? task?.data?.transcode_progress)
+  const fallbackProgress = statusKey === 'completed'
+    ? 1
+    : String(task?.status || '') === 'worker_done' || String(task?.status || '') === 'transcode_validating'
+      ? 0.98
+      : statusKey === 'running'
+        ? 0.02
+        : 0
+  const progress = clampPercent(Number.isFinite(rawProgress) ? rawProgress : fallbackProgress)
+  const percent = Math.round(progress * 100)
+  const workerStatus = String(workerJob?.status || '')
+  const detail = transcodeProgressDetail(workerJob)
+    || (subtitleStatus.message ? String(subtitleStatus.message) : '')
+    || (workerStatus === 'queued' ? '算力端排队中' : '')
+    || (workerStatus === 'failed' ? (workerJob?.error || '算力端转码失败') : '')
+    || (statusKey === 'running' ? '等待算力端回报进度' : '')
+  return {
+    showProgress: statusKey === 'running' || statusKey === 'translating' || percent > 0,
+    progressPercent: percent,
+    progressLabel: `${percent}%`,
+    progressDetail: detail
+  }
+}
+
+function transcodeProgressDetail(job) {
+  if (!job) return ''
+  if (job.message) return job.message
+  const parts = []
+  const processed = Number(job.processed_seconds || 0)
+  const duration = Number(job.duration || 0)
+  if (processed && duration) parts.push(`${formatDuration(processed)} / ${formatDuration(duration)}`)
+  if (job.fps) parts.push(`${job.fps} fps`)
+  if (job.speed) parts.push(job.speed)
+  if (job.frame) parts.push(`frame ${job.frame}`)
+  return parts.join(' · ') || job.last_progress_line || ''
+}
+
+function clampPercent(value) {
+  return Math.max(0, Math.min(1, value))
 }
 
 function postprocessPhase(status) {
@@ -608,10 +917,34 @@ function postprocessStatusKey(status) {
 function postprocessStatusLabel(status, phase, statusKey) {
   if (statusKey === 'running' && phase === 'transcode') return '转码中'
   if (statusKey === 'translating' && phase === 'subtitle') return '生成字幕中'
-  if (statusKey === 'queued') return '等待中'
+  if (statusKey === 'queued') {
+    const value = String(status || '')
+    if (value === 'waiting_worker') return '等待算力端'
+    if (value === 'ready_to_run') return '等待队列'
+    if (['torrent_pushed', 'downloading'].includes(value)) return '等待下载'
+    if (value === 'created') return '等待创建'
+    return '等待中'
+  }
   if (statusKey === 'failed') return '失败'
   if (statusKey === 'completed') return '已完成'
   return status || statusLabel(statusKey)
+}
+
+function postprocessWaitingDetail(task, statusKey) {
+  if (statusKey !== 'queued') return ''
+  const status = String(task?.status || '')
+  if (status === 'waiting_worker') return '算力端离线或未就绪'
+  if (status === 'ready_to_run') {
+    if (task?.input_path) return '等待队列执行'
+    return '等待链路写入输入文件'
+  }
+  if (status === 'torrent_pushed') return '等待 qB 下载完成并回写路径'
+  if (status === 'downloading') {
+    const progress = Number(task?.data?.qb_progress)
+    return Number.isFinite(progress) && progress > 0 ? `qB 下载中 ${Math.round(progress * 100)}%` : 'qB 下载中'
+  }
+  if (status === 'created') return '等待订阅筛选和推送下载'
+  return task?.error_message || ''
 }
 
 function statusLabel(status) {
@@ -623,9 +956,18 @@ function normalizePostprocessSettings(payload = {}) {
     auto_transcode_enabled: !!payload.auto_transcode_enabled,
     auto_subtitle_enabled: !!payload.auto_subtitle_enabled,
     worker_auto_run: !!payload.worker_auto_run,
+    download_dir: payload.download_dir || '/media/study3',
+    output_dir: payload.output_dir || '/media/压制',
     target_codec: payload.target_codec || 'av1',
+    target_encoder: payload.target_encoder || (payload.target_codec === 'h265' ? 'libx265' : 'av1_nvenc'),
     crf: Number(payload.crf || 36),
     preset: payload.preset || 'p1',
+    preset_flag: payload.preset_flag || '-preset',
+    ffmpeg_mode: payload.ffmpeg_mode || (payload.ffmpeg_custom_enabled ? 'custom' : 'standard'),
+    ffmpeg_standard_enabled: payload.ffmpeg_mode ? payload.ffmpeg_mode === 'standard' : payload.ffmpeg_standard_enabled !== false,
+    ffmpeg_custom_enabled: payload.ffmpeg_mode ? payload.ffmpeg_mode === 'custom' : !!payload.ffmpeg_custom_enabled,
+    ffmpeg_custom_template: payload.ffmpeg_custom_template || '',
+    custom_encoding_presets: Array.isArray(payload.custom_encoding_presets) ? payload.custom_encoding_presets : [],
     max_concurrency: Number(payload.max_concurrency || 1),
     allowed_categories: Array.isArray(payload.allowed_categories) ? payload.allowed_categories : [],
     required_tags: Array.isArray(payload.required_tags) ? payload.required_tags : []
@@ -640,6 +982,14 @@ function formatTime(value) {
   if (!value) return '未知时间'
   const date = new Date(Number(value) * 1000)
   return Number.isNaN(date.getTime()) ? '未知时间' : date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function formatDuration(value) {
+  const total = Math.max(0, Math.floor(Number(value || 0)))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  return [hours, minutes, seconds].map((part) => String(part).padStart(2, '0')).join(':')
 }
 
 function clearRefreshTimer() {
@@ -742,9 +1092,12 @@ h1 {
 
 .service-card {
   position: relative;
+  display: grid;
+  align-content: start;
   min-height: 148px;
   padding: 22px;
   border-color: var(--mm-border);
+  font: inherit;
   text-align: left;
   cursor: pointer;
 }
@@ -753,6 +1106,7 @@ h1 {
 .metric-strip span {
   color: var(--mm-muted);
   font-size: 14px;
+  line-height: 1.35;
 }
 
 .service-card strong,
@@ -761,6 +1115,7 @@ h1 {
   margin-top: 12px;
   font-size: 28px;
   font-weight: 650;
+  line-height: 1.16;
 }
 
 .service-card em,
@@ -768,12 +1123,14 @@ h1 {
   display: block;
   margin-top: 8px;
   color: var(--mm-primary);
+  font-size: 15px;
   font-style: normal;
   font-weight: 500;
+  line-height: 1.35;
 }
 
 .service-card em.on {
-  color: #087e74;
+  color: var(--mm-primary);
 }
 
 .service-card i {
@@ -788,8 +1145,8 @@ h1 {
 }
 
 .service-card i.on {
-  background: #16a34a;
-  box-shadow: 0 0 0 10px #e9fbea;
+  background: var(--mm-primary);
+  box-shadow: 0 0 0 10px var(--mm-primary-soft);
 }
 
 .task-panel {
@@ -895,6 +1252,87 @@ h1 {
   gap: 16px;
 }
 
+.config-warning {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 47, 92, 0.36);
+  border-radius: 8px;
+  background: rgba(255, 47, 92, 0.08);
+  color: var(--mm-primary);
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.compute-settings {
+  display: grid;
+  gap: 16px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: var(--mm-surface);
+}
+
+.compute-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.compute-section-head strong {
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.compute-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  justify-self: start;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--mm-text);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.compute-toggle span {
+  color: var(--mm-text);
+  font-size: 15px;
+}
+
+.compute-toggle input {
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  accent-color: var(--mm-primary);
+}
+
+.compact-grid {
+  gap: 14px 20px;
+}
+
+.settings-section :deep(.mm-field) {
+  min-width: 0;
+}
+
+.settings-section textarea {
+  min-height: 64px;
+}
+
+.hardware-section .hardware-grid div {
+  min-height: 82px;
+  padding: 14px;
+}
+
 .hardware-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
@@ -950,14 +1388,68 @@ input[type="checkbox"] {
   background: #fff5f7;
 }
 
-.ffmpeg-preview {
-  display: block;
+.ffmpeg-send-panel {
+  display: grid;
+  gap: 12px;
   padding: 14px;
-  overflow: auto;
+  border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #111;
-  color: #fff;
-  white-space: nowrap;
+  background: var(--mm-surface);
+}
+
+.section-head {
+  display: grid;
+  gap: 6px;
+}
+
+.section-head.compact {
+  margin-bottom: 10px;
+}
+
+.section-head p {
+  margin-top: 6px;
+  color: var(--mm-muted);
+  line-height: 1.6;
+}
+
+.ffmpeg-mode-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.choice-card {
+  display: grid;
+  gap: 6px;
+  min-height: 92px;
+  padding: 16px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--mm-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.choice-card.active {
+  border-color: var(--mm-primary);
+  background: var(--mm-primary-soft);
+}
+
+.choice-card strong {
+  font-size: 16px;
+  font-weight: var(--mm-font-weight-semibold);
+  line-height: 1.25;
+}
+
+.choice-card span {
+  color: var(--mm-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ffmpeg-template {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
 }
 
 .option-chip {
@@ -977,11 +1469,12 @@ input[type="checkbox"] {
   .form-grid,
   .hardware-grid,
   .provider-grid,
+  .ffmpeg-mode-cards,
   .chip-columns {
     grid-template-columns: 1fr;
   }
 
-    .panel-head,
+  .panel-head,
   .toolbar,
   .qb-option-head {
     display: grid;

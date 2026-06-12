@@ -200,22 +200,26 @@ const subscribeLatestForm = reactive({ since_date: '', include_vr: false })
 const avQuery = useQuery({
   queryKey: ['subscriptions', 'av'],
   queryFn: () => api('/api/subscriptions/av'),
-  staleTime: 15_000,
-  refetchInterval: 60_000
+  staleTime: 300_000,
+  refetchInterval: false
 })
 
 const actressQuery = useQuery({
   queryKey: ['subscriptions', 'actress'],
   queryFn: () => api('/api/subscriptions/actress'),
-  staleTime: 15_000,
-  refetchInterval: 60_000
+  staleTime: 300_000,
+  refetchInterval: false
 })
 
 const isLoading = computed(() => avQuery.isLoading.value)
 const isActressLoading = computed(() => actressQuery.isLoading.value)
 const error = computed(() => avQuery.error.value || actressQuery.error.value)
-const avItems = computed(() => avQuery.data.value?.subscriptions || [])
-const actressItems = computed(() => actressQuery.data.value?.subscriptions || [])
+const avItems = computed(() => sortBySubscribedAt(avQuery.data.value?.subscriptions || []))
+const actressItems = computed(() => sortBySubscribedAt(actressQuery.data.value?.subscriptions || []))
+
+function sortBySubscribedAt(items) {
+  return [...items].sort((a, b) => Number(b?.subscribed_at || 0) - Number(a?.subscribed_at || 0))
+}
 
 const avStates = computed(() => [
   { key: 'pending', label: '订阅中', count: avItems.value.filter((item) => (item.status || 'pending') === 'pending').length },
@@ -247,9 +251,9 @@ function itemMatchesState(item, state) {
 }
 
 watch(
-  actressItems,
-  (items) => {
-    hydrateActressProfiles(items)
+  [actressItems, mainTab],
+  ([items, tab]) => {
+    if (tab === 'actress') hydrateActressProfiles(items)
   },
   { immediate: true }
 )
@@ -406,7 +410,8 @@ async function runBusy(id, action, success) {
   try {
     await action()
     notice.value = success
-    await refetchAll()
+    if (mainTab.value === 'av') await avQuery.refetch()
+    else await actressQuery.refetch()
   } catch (error) {
     notice.value = error.message || '操作失败'
   } finally {

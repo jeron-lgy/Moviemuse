@@ -2,7 +2,9 @@
 
 import os
 import platform
+import queue
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -19,7 +21,7 @@ from urllib.parse import urlencode, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -34,7 +36,7 @@ from .subscription_service import SubscriptionService, date_is_after
 from .system_settings import SystemSettingsService
 from .dmm_service import dmm
 from .javdb_service import is_access_ban_error, javdb
-from .javlibrary_service import javlibrary
+from .javlibrary_service import BASE_URL as JAVLIBRARY_BASE_URL, javlibrary
 from .subtitle_service import (
     SubtitleJob,
     SubtitleSegment,
@@ -134,12 +136,48 @@ def subtitle_public_url() -> str:
     return os.getenv("SUBTITLE_LOCAL_PUBLIC_URL", "http://127.0.0.1:18181").strip().rstrip("/")
 
 
+def invalid_public_url(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return True
+    if any(token in normalized for token in ("unraid-ip", "windows-ip", "your-unraid-ip", "your-windows-ip")):
+        return True
+    host = urlparse(normalized).hostname or ""
+    return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def console_public_url() -> str:
+    _, _, data_dir = settings()
+    configured = str(load_compute_config(data_dir).get("console_public_url", "")).strip().rstrip("/")
+    if configured:
+        return configured
+    for name in ("CONSOLE_PUBLIC_URL", "MOVIEMUSE_PUBLIC_URL", "SUBTITLE_CONSOLE_PUBLIC_URL"):
+        configured = os.getenv(name, "").strip().rstrip("/")
+        if configured:
+            return configured
+    return os.getenv("SUBTITLE_LOCAL_PUBLIC_URL", "http://127.0.0.1:18180").strip().rstrip("/")
+
+
+def require_remote_callback_url(task_id: str) -> str:
+    public_url = console_public_url()
+    if invalid_public_url(public_url):
+        raise RuntimeError(
+            "远程算力端回调地址未正确配置。请在算力端设置里填写 Unraid 回调地址，"
+            "例如 http://192.168.2.9:18188，不能使用 UNRAID-IP、localhost 或 127.0.0.1。"
+        )
+    return f"{public_url}/api/postprocess/tasks/{task_id}/worker-done"
+
+
 def backend_headers() -> dict[str, str]:
     _, _, data_dir = settings()
     token = str(load_compute_config(data_dir).get("subtitle_backend_token", "")).strip()
     if not token:
         token = os.getenv("SUBTITLE_BACKEND_TOKEN", "").strip()
     return {"X-API-Key": token} if token else {}
+
+
+def remote_http_client(timeout: float | None = 30) -> httpx.Client:
+    return httpx.Client(timeout=timeout, trust_env=False)
 
 
 def frontend_api_token() -> str:
@@ -168,10 +206,19 @@ def parse_proxy_path_map() -> list[tuple[str, str]]:
     raw = "\n".join(part.strip() for part in raw_parts if part.strip())
     pairs: list[tuple[str, str]] = []
     for item in raw.replace("\n", ";").split(";"):
-        if not item.strip() or "=" not in item:
+        item = item.strip()
+        if not item:
             continue
-        source, target = item.split("=", 1)
-        pairs.append((source.strip().replace("\\", "/").rstrip("/"), target.strip().rstrip("\\/")))
+        if "=" in item:
+            source, target = item.split("=", 1)
+        else:
+            source, target = "/media", item
+        source = source.strip().replace("\\", "/").rstrip("/")
+        target = target.strip().rstrip("\\/")
+        if source and not source.startswith("/"):
+            source = f"/{source}"
+        if source and target:
+            pairs.append((source, target))
     return pairs
 
 
@@ -262,6 +309,46 @@ def translation_backend_options(settings_obj: Any | None = None) -> list[dict[st
     ]
 
 
+SECRET_PLACEHOLDER = "********"
+SECRET_SETTING_KEYS = {
+    "api_token",
+    "deepl_api_key",
+    "openai_api_key",
+    "subtitle_api_token",
+    "subtitle_backend_token",
+}
+
+
+def is_secret_placeholder(value: Any) -> bool:
+    return str(value or "").strip() == SECRET_PLACEHOLDER
+
+
+def redact_secret_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
+    redacted = dict(payload or {})
+    for key in SECRET_SETTING_KEYS:
+        if key in redacted and str(redacted.get(key) or ""):
+            redacted[key] = SECRET_PLACEHOLDER
+    return redacted
+
+
+def redact_secret_response(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        redacted = {key: redact_secret_response(value) for key, value in payload.items()}
+        return redact_secret_settings(redacted)
+    if isinstance(payload, list):
+        return [redact_secret_response(item) for item in payload]
+    return payload
+
+
+def restore_secret_placeholders(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    existing = existing or {}
+    restored = dict(payload or {})
+    for key in SECRET_SETTING_KEYS:
+        if key in restored and is_secret_placeholder(restored.get(key)):
+            restored[key] = existing.get(key, "")
+    return restored
+
+
 def whisper_model_options() -> list[dict[str, str]]:
     return [
         {
@@ -315,7 +402,7 @@ def raise_remote_error(exc: httpx.HTTPStatusError) -> None:
 
 def remote_get(path: str) -> dict[str, Any]:
     try:
-        with httpx.Client(timeout=30) as client:
+        with remote_http_client(timeout=30) as client:
             response = client.get(f"{backend_url()}{path}", headers=backend_headers())
             response.raise_for_status()
             return response.json()
@@ -327,7 +414,7 @@ def remote_get(path: str) -> dict[str, Any]:
 
 def remote_get_with_timeout(path: str, timeout: float = 3.0) -> dict[str, Any]:
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with remote_http_client(timeout=timeout) as client:
             response = client.get(f"{backend_url()}{path}", headers=backend_headers())
             response.raise_for_status()
             return response.json()
@@ -346,7 +433,7 @@ def remote_get_safe(path: str) -> tuple[dict[str, Any] | None, str | None]:
 
 def remote_post_json(path: str, payload: dict[str, Any], timeout: float = 30) -> dict[str, Any]:
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with remote_http_client(timeout=timeout) as client:
             response = client.post(f"{backend_url()}{path}", headers=backend_headers(), json=payload)
             response.raise_for_status()
             return response.json()
@@ -358,43 +445,104 @@ def remote_post_json(path: str, payload: dict[str, Any], timeout: float = 30) ->
 
 def compute_settings_payload(settings_obj: Any, config: dict[str, Any] | None = None) -> dict[str, object]:
     config = config or {}
+    def value(key: str, attr: str, default: object) -> object:
+        if key in config:
+            return config[key]
+        return getattr(settings_obj, attr, default)
+
     return {
-        "whisper_model": getattr(settings_obj, "default_model", config.get("whisper_model", "large-v3")),
-        "whisper_model_dir": str(getattr(settings_obj, "model_dir", "") or config.get("whisper_model_dir", "")),
-        "whisper_device": getattr(settings_obj, "device", config.get("whisper_device", "cuda")),
-        "whisper_compute_type": getattr(settings_obj, "compute_type", config.get("whisper_compute_type", "float16")),
-        "subtitle_max_workers": getattr(settings_obj, "max_workers", config.get("subtitle_max_workers", 1)),
-        "subtitle_output_dir": str(getattr(settings_obj, "default_output_dir", "") or config.get("subtitle_output_dir", "")),
+        "whisper_model": value("whisper_model", "default_model", "large-v3"),
+        "whisper_model_dir": str(value("whisper_model_dir", "model_dir", "") or ""),
+        "whisper_device": value("whisper_device", "device", "cuda"),
+        "whisper_compute_type": value("whisper_compute_type", "compute_type", "float16"),
+        "subtitle_max_workers": value("subtitle_max_workers", "max_workers", 1),
+        "subtitle_output_dir": str(value("subtitle_output_dir", "default_output_dir", "") or ""),
         "subtitle_path_map": config.get("subtitle_path_map", ""),
-        "default_translate_backend": getattr(settings_obj, "default_translate_backend", config.get("default_translate_backend", "google")),
-        "google_translate_url": getattr(settings_obj, "google_translate_url", config.get("google_translate_url", "https://translate.google.com/translate_a/single")),
-        "deepl_api_url": getattr(settings_obj, "deepl_api_url", config.get("deepl_api_url", "https://api-free.deepl.com/v2/translate")),
-        "deepl_api_key": getattr(settings_obj, "deepl_api_key", config.get("deepl_api_key", "")),
-        "openai_base_url": getattr(settings_obj, "openai_base_url", config.get("openai_base_url", "")),
-        "openai_api_key": getattr(settings_obj, "openai_api_key", config.get("openai_api_key", "")),
-        "openai_model": getattr(settings_obj, "openai_model", config.get("openai_model", "gpt-4.1-mini")),
-        "openai_batch_size": getattr(settings_obj, "openai_batch_size", config.get("openai_batch_size", 12)),
-        "openai_max_concurrency": getattr(
-            settings_obj,
-            "openai_max_concurrency",
-            config.get("openai_max_concurrency", 2),
-        ),
-        "openai_translation_style": getattr(
-            settings_obj,
-            "openai_translation_style",
-            config.get("openai_translation_style", "adult_natural"),
-        ),
-        "openai_style_intensity": getattr(
-            settings_obj,
-            "openai_style_intensity",
-            config.get("openai_style_intensity", "medium"),
-        ),
-        "openai_context_lines": getattr(settings_obj, "openai_context_lines", config.get("openai_context_lines", 2)),
-        "openai_glossary": getattr(settings_obj, "openai_glossary", config.get("openai_glossary", "")),
-        "ollama_url": getattr(settings_obj, "ollama_url", config.get("ollama_url", "")),
-        "ollama_model": getattr(settings_obj, "ollama_model", config.get("ollama_model", "qwen2.5:7b")),
-        "subtitle_api_token": getattr(settings_obj, "api_token", config.get("subtitle_api_token", "")),
+        "console_public_url": str(config.get("console_public_url", "") or console_public_url()),
+        "default_translate_backend": value("default_translate_backend", "default_translate_backend", "google"),
+        "google_translate_url": value("google_translate_url", "google_translate_url", "https://translate.google.com/translate_a/single"),
+        "deepl_api_url": value("deepl_api_url", "deepl_api_url", "https://api-free.deepl.com/v2/translate"),
+        "deepl_api_key": value("deepl_api_key", "deepl_api_key", ""),
+        "openai_base_url": value("openai_base_url", "openai_base_url", ""),
+        "openai_api_key": value("openai_api_key", "openai_api_key", ""),
+        "openai_model": value("openai_model", "openai_model", "gpt-4.1-mini"),
+        "openai_batch_size": value("openai_batch_size", "openai_batch_size", 12),
+        "openai_max_concurrency": value("openai_max_concurrency", "openai_max_concurrency", 2),
+        "openai_translation_style": value("openai_translation_style", "openai_translation_style", "adult_natural"),
+        "openai_style_intensity": value("openai_style_intensity", "openai_style_intensity", "medium"),
+        "openai_context_lines": value("openai_context_lines", "openai_context_lines", 2),
+        "openai_glossary": value("openai_glossary", "openai_glossary", ""),
+        "ollama_url": value("ollama_url", "ollama_url", ""),
+        "ollama_model": value("ollama_model", "ollama_model", "qwen2.5:7b"),
+        "subtitle_api_token": value("subtitle_api_token", "api_token", ""),
     }
+
+
+SAVED_COMPUTE_SETTING_KEYS = {
+    "whisper_model",
+    "whisper_model_dir",
+    "whisper_device",
+    "whisper_compute_type",
+    "subtitle_max_workers",
+    "subtitle_output_dir",
+    "subtitle_path_map",
+    "console_public_url",
+    "default_translate_backend",
+    "google_translate_url",
+    "deepl_api_url",
+    "deepl_api_key",
+    "openai_base_url",
+    "openai_api_key",
+    "openai_model",
+    "openai_batch_size",
+    "openai_max_concurrency",
+    "openai_translation_style",
+    "openai_style_intensity",
+    "openai_context_lines",
+    "openai_glossary",
+    "ollama_url",
+    "ollama_model",
+    "subtitle_api_token",
+}
+
+
+REMOTE_COMPUTE_SETTING_KEYS = {
+    "whisper_model",
+    "whisper_device",
+    "whisper_compute_type",
+    "subtitle_max_workers",
+    "default_translate_backend",
+    "google_translate_url",
+    "deepl_api_url",
+    "deepl_api_key",
+    "openai_base_url",
+    "openai_api_key",
+    "openai_model",
+    "openai_batch_size",
+    "openai_max_concurrency",
+    "openai_translation_style",
+    "openai_style_intensity",
+    "openai_context_lines",
+    "openai_glossary",
+    "ollama_url",
+    "ollama_model",
+}
+
+
+def remote_compute_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: payload[key] for key in REMOTE_COMPUTE_SETTING_KEYS if key in payload}
+
+
+def overlay_saved_console_settings(visible_settings: Any, console_config: dict[str, Any] | None = None) -> dict[str, object]:
+    """Keep freshly saved console settings from being hidden by stale worker defaults."""
+    base = dict(visible_settings) if isinstance(visible_settings, dict) else {}
+    _, _, data_dir = settings()
+    config = console_config if isinstance(console_config, dict) else load_compute_config(data_dir)
+    console_settings = compute_settings_payload(load_subtitle_settings(data_dir), config)
+    for key in SAVED_COMPUTE_SETTING_KEYS:
+        if key in config and key in console_settings:
+            base[key] = console_settings[key]
+    return base or console_settings
 
 
 def console_settings_payload() -> dict[str, object]:
@@ -402,7 +550,7 @@ def console_settings_payload() -> dict[str, object]:
     _, _, data_dir = settings()
     config = load_compute_config(data_dir)
     saved_settings = load_subtitle_settings(data_dir)
-    return {
+    return redact_secret_settings({
         **compute_settings_payload(saved_settings, config),
         "default_model": saved_settings.default_model,
         "model_dir": str(saved_settings.model_dir) if saved_settings.model_dir else "",
@@ -412,12 +560,13 @@ def console_settings_payload() -> dict[str, object]:
         "default_output_dir": str(saved_settings.default_output_dir) if saved_settings.default_output_dir else "",
         "translation_backends": translation_backend_options(saved_settings),
         "local_models": [],
-    }
+    })
 
 
 def save_local_compute_settings(payload: dict[str, Any]) -> dict[str, object]:
     _, _, data_dir = settings()
     config = load_compute_config(data_dir)
+    payload = restore_secret_placeholders(payload, config)
     config.update(payload)
     save_compute_config(data_dir, config)
     restarted = reset_subtitle_service_if_idle()
@@ -431,6 +580,7 @@ def save_local_compute_settings(payload: dict[str, Any]) -> dict[str, object]:
 def save_console_compute_config(payload: dict[str, Any]) -> dict[str, Any]:
     _, _, data_dir = settings()
     config = load_compute_config(data_dir)
+    payload = restore_secret_placeholders(payload, config)
     config.update(payload)
     save_compute_config(data_dir, config)
     return config
@@ -937,22 +1087,194 @@ def set_transcode_job(job_id: str, **fields: Any) -> dict[str, Any]:
         return json.loads(json.dumps(job, ensure_ascii=False))
 
 
-def transcode_encoder(target_codec: str) -> str:
-    codec = str(target_codec or "av1").lower()
+FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+FFMPEG_TIME_RE = re.compile(r"time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+FFMPEG_FRAME_RE = re.compile(r"frame=\s*(\d+)")
+FFMPEG_FPS_RE = re.compile(r"fps=\s*([0-9.]+)")
+FFMPEG_SPEED_RE = re.compile(r"speed=\s*([0-9.]+x|N/A)")
+FFMPEG_BITRATE_RE = re.compile(r"bitrate=\s*([^\s]+)")
+FFMPEG_SIZE_RE = re.compile(r"size=\s*([^\s]+)")
+
+
+def ffmpeg_timestamp_seconds(match: re.Match[str] | None) -> float:
+    if not match:
+        return 0.0
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def clamp_progress(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def format_duration_seconds(value: float) -> str:
+    seconds = max(0, int(value))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def parse_ffmpeg_progress_line(line: str, duration: float) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    duration_match = FFMPEG_DURATION_RE.search(line)
+    if duration_match:
+        parsed_duration = ffmpeg_timestamp_seconds(duration_match)
+        if parsed_duration > 0:
+            fields["duration"] = parsed_duration
+            duration = parsed_duration
+    time_match = FFMPEG_TIME_RE.search(line)
+    if time_match:
+        processed = ffmpeg_timestamp_seconds(time_match)
+        fields["processed_seconds"] = processed
+        if duration > 0:
+            fields["progress"] = clamp_progress(processed / duration)
+            fields["progress_percent"] = round(fields["progress"] * 100, 1)
+    patterns = {
+        "frame": FFMPEG_FRAME_RE,
+        "fps": FFMPEG_FPS_RE,
+        "speed": FFMPEG_SPEED_RE,
+        "bitrate": FFMPEG_BITRATE_RE,
+        "size": FFMPEG_SIZE_RE,
+    }
+    for key, pattern in patterns.items():
+        match = pattern.search(line)
+        if match:
+            value: Any = match.group(1)
+            if key == "frame":
+                value = int(value)
+            elif key == "fps":
+                value = float(value)
+            fields[key] = value
+    if fields:
+        fields["last_progress_line"] = line
+    return fields
+
+
+def read_process_stream(stream: Any, chunks: "queue.Queue[str | None]") -> None:
+    try:
+        while True:
+            chunk = stream.read(1)
+            if not chunk:
+                break
+            chunks.put(chunk)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        chunks.put(None)
+
+
+def transcode_progress_message(job: dict[str, Any]) -> str:
+    parts: list[str] = []
+    processed = float(job.get("processed_seconds") or 0)
+    duration = float(job.get("duration") or 0)
+    if processed and duration:
+        parts.append(f"{format_duration_seconds(processed)} / {format_duration_seconds(duration)}")
+    if job.get("fps") not in (None, ""):
+        parts.append(f"{job.get('fps')} fps")
+    if job.get("speed"):
+        parts.append(str(job.get("speed")))
+    if job.get("frame"):
+        parts.append(f"frame {job.get('frame')}")
+    return " · ".join(parts) or str(job.get("last_progress_line") or "")
+
+
+def append_tail(current: str, chunk: str, limit: int = 4000) -> str:
+    return f"{current}{chunk}"[-limit:]
+
+
+def normalize_target_codec(value: Any) -> str:
+    codec = str(value or "av1").strip().lower()
+    if codec in {"h265", "hevc", "x265"}:
+        return "h265"
+    return "av1"
+
+
+def default_encoder_for_codec(target_codec: str) -> str:
+    codec = normalize_target_codec(target_codec)
     if codec == "av1":
         return os.getenv("TRANSCODE_AV1_ENCODER", "av1_nvenc")
     return os.getenv("TRANSCODE_H265_ENCODER", "libx265")
 
 
+def encoder_codec_family(encoder: str) -> str:
+    value = str(encoder or "").strip().lower()
+    if not value:
+        return ""
+    if "av1" in value or value in {"libsvtav1", "libaom-av1"}:
+        return "av1"
+    if "hevc" in value or "h265" in value or "x265" in value:
+        return "h265"
+    return ""
+
+
+def encoder_matches_codec(target_codec: str, encoder: str) -> bool:
+    family = encoder_codec_family(encoder)
+    return not family or family == normalize_target_codec(target_codec)
+
+
+def normalize_transcode_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload or {})
+    codec = normalize_target_codec(normalized.get("target_codec"))
+    encoder = str(normalized.get("target_encoder") or "").strip()
+    if not encoder or not encoder_matches_codec(codec, encoder):
+        encoder = default_encoder_for_codec(codec)
+    normalized["target_codec"] = codec
+    normalized["target_encoder"] = encoder
+    return normalized
+
+
+def transcode_encoder(target_codec: str, target_encoder: str = "") -> str:
+    custom = str(target_encoder or "").strip()
+    if custom and encoder_matches_codec(target_codec, custom):
+        return custom
+    return default_encoder_for_codec(target_codec)
+
+
+def transcode_quality_flag(encoder: str) -> str:
+    if encoder in {"av1_qsv", "hevc_qsv"}:
+        return "-global_quality"
+    return "-cq" if encoder.endswith("_nvenc") or encoder in {"av1_nvenc", "hevc_nvenc"} else "-crf"
+
+
+def build_ffmpeg_preview(settings_payload: dict[str, Any], input_path: str = "<输入文件>", output_path: str = "<输出文件>") -> str:
+    settings_payload = normalize_transcode_settings_payload(settings_payload)
+    target_codec = str(settings_payload.get("target_codec") or "av1")
+    encoder = str(settings_payload.get("target_encoder") or transcode_encoder(target_codec))
+    crf = str(settings_payload.get("crf") or 36)
+    preset = str(settings_payload.get("preset") or "p1")
+    preset_flag = str(settings_payload.get("preset_flag") or "-preset")
+    quality_flag = transcode_quality_flag(encoder)
+    return f'ffmpeg -hide_banner -nostdin -i "{input_path}" -c:v {encoder} {preset_flag} {preset} {quality_flag} {crf} -c:a copy "{output_path}" -y'
+
+
 def transcode_ffmpeg_command(job: dict[str, Any]) -> list[str]:
+    job = normalize_transcode_settings_payload(job)
     ffmpeg = os.getenv("FFMPEG_BIN", "ffmpeg")
     input_path = str(job.get("input_path") or "")
     output_path = str(job.get("output_path") or "")
     target_codec = str(job.get("target_codec") or "av1")
-    encoder = transcode_encoder(target_codec)
+    encoder = transcode_encoder(target_codec, str(job.get("target_encoder") or ""))
     crf = str(job.get("crf") or 36)
     preset = str(job.get("preset") or "p1")
-    quality_flag = "-cq" if encoder.endswith("_nvenc") or encoder in {"av1_nvenc", "hevc_nvenc"} else "-crf"
+    preset_flag = str(job.get("preset_flag") or "-preset")
+    quality_flag = transcode_quality_flag(encoder)
+    custom_template = str(job.get("ffmpeg_custom_template") or "").strip()
+    if bool(job.get("ffmpeg_custom_enabled")) and custom_template:
+        try:
+            rendered = custom_template.format(
+                input=input_path,
+                output=output_path,
+                encoder=encoder,
+                preset=preset,
+                preset_flag=preset_flag,
+                quality_flag=quality_flag,
+                quality=crf,
+                crf=crf,
+            )
+        except KeyError as exc:
+            raise RuntimeError(f"自定义 FFmpeg 模板变量不存在: {exc}") from exc
+        return shlex.split(rendered)
     command = [
         ffmpeg,
         "-hide_banner",
@@ -963,7 +1285,7 @@ def transcode_ffmpeg_command(job: dict[str, Any]) -> list[str]:
         "0",
         "-c:v",
         encoder,
-        "-preset",
+        preset_flag,
         preset,
         quality_flag,
         crf,
@@ -981,6 +1303,7 @@ def transcode_ffmpeg_command(job: dict[str, Any]) -> list[str]:
 
 
 def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict[str, Any]:
+    payload = normalize_transcode_settings_payload(payload)
     input_path = str(payload.get("input_path") or payload.get("video_path") or "").strip()
     output_path = str(payload.get("output_path") or "").strip()
     if not input_path:
@@ -988,6 +1311,9 @@ def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict
     if not output_path:
         raise HTTPException(status_code=400, detail="缺少 output_path")
     job_id = str(payload.get("job_id") or uuid.uuid4().hex)
+    ffmpeg_mode = str(payload.get("ffmpeg_mode") or "").strip().lower()
+    if ffmpeg_mode not in {"standard", "custom"}:
+        ffmpeg_mode = "custom" if bool(payload.get("ffmpeg_custom_enabled")) else "standard"
     job = {
         "id": job_id,
         "task_id": str(payload.get("task_id") or ""),
@@ -996,13 +1322,31 @@ def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict
         "input_path": input_path,
         "output_path": output_path,
         "target_codec": str(payload.get("target_codec") or "av1"),
+        "target_encoder": str(payload.get("target_encoder") or ""),
         "crf": int(payload.get("crf") or 36),
         "preset": str(payload.get("preset") or "p1"),
+        "preset_flag": str(payload.get("preset_flag") or "-preset"),
+        "ffmpeg_mode": ffmpeg_mode,
+        "ffmpeg_standard_enabled": ffmpeg_mode == "standard",
+        "ffmpeg_custom_enabled": ffmpeg_mode == "custom",
+        "ffmpeg_custom_template": str(payload.get("ffmpeg_custom_template") or ""),
+        "ffmpeg_standard_command": str(payload.get("ffmpeg_standard_command") or ""),
         "callback_url": str(payload.get("callback_url") or ""),
         "callback_token": str(payload.get("callback_token") or ""),
         "error": "",
         "command": [],
         "stderr_tail": "",
+        "last_progress_line": "",
+        "message": "等待启动",
+        "progress": 0,
+        "progress_percent": 0,
+        "duration": 0,
+        "processed_seconds": 0,
+        "frame": 0,
+        "fps": 0,
+        "speed": "",
+        "bitrate": "",
+        "size": "",
         "returncode": None,
         "created_at": time.time(),
         "updated_at": time.time(),
@@ -1023,27 +1367,78 @@ def start_transcode_job(job_id: str) -> None:
 def run_transcode_job_background(job_id: str) -> None:
     callback_payload: dict[str, Any] = {}
     try:
-        job = set_transcode_job(job_id, status="running", started_at=time.time())
+        job = set_transcode_job(job_id, status="running", started_at=time.time(), message="正在准备 ffmpeg")
         output_path = Path(str(job.get("output_path") or ""))
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        duration = probe_video_duration(str(job.get("input_path") or ""))
         command = transcode_ffmpeg_command(job)
-        set_transcode_job(job_id, command=command)
-        result = subprocess.run(
+        set_transcode_job(job_id, command=command, duration=duration, message="ffmpeg 已启动")
+        timeout = int(os.getenv("TRANSCODE_TIMEOUT_SECONDS", "43200"))
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=int(os.getenv("TRANSCODE_TIMEOUT_SECONDS", "43200")),
-            check=False,
+            encoding="utf-8",
+            errors="replace",
         )
-        stderr_tail = (result.stderr or "")[-4000:]
-        if result.returncode != 0:
-            message = f"ffmpeg 退出码 {result.returncode}"
+        chunks: queue.Queue[str | None] = queue.Queue()
+        if process.stderr:
+            threading.Thread(target=read_process_stream, args=(process.stderr, chunks), daemon=True).start()
+        stderr_tail = ""
+        line_buffer = ""
+        deadline = time.time() + timeout if timeout > 0 else 0
+        while True:
+            if deadline and time.time() > deadline and process.poll() is None:
+                process.kill()
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                chunk = chunks.get(timeout=0.5)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            if chunk is None:
+                if process.poll() is not None:
+                    break
+                continue
+            stderr_tail = append_tail(stderr_tail, chunk)
+            if chunk in {"\r", "\n"}:
+                line = line_buffer.strip()
+                line_buffer = ""
+                if not line:
+                    set_transcode_job(job_id, stderr_tail=stderr_tail)
+                    continue
+                progress_fields = parse_ffmpeg_progress_line(line, duration)
+                if progress_fields.get("duration"):
+                    duration = float(progress_fields["duration"])
+                update_fields = {"stderr_tail": stderr_tail, "last_progress_line": line}
+                update_fields.update(progress_fields)
+                if progress_fields:
+                    temp_job = {**job, **update_fields}
+                    update_fields["message"] = transcode_progress_message(temp_job)
+                set_transcode_job(job_id, **update_fields)
+            else:
+                line_buffer += chunk
+        if line_buffer.strip():
+            line = line_buffer.strip()
+            progress_fields = parse_ffmpeg_progress_line(line, duration)
+            update_fields = {"stderr_tail": stderr_tail, "last_progress_line": line}
+            update_fields.update(progress_fields)
+            if progress_fields:
+                temp_job = {**job, **update_fields}
+                update_fields["message"] = transcode_progress_message(temp_job)
+            set_transcode_job(job_id, **update_fields)
+        returncode = process.wait()
+        if returncode != 0:
+            message = f"ffmpeg 退出码 {returncode}"
             job = set_transcode_job(
                 job_id,
                 status="failed",
                 error=message,
                 stderr_tail=stderr_tail,
-                returncode=result.returncode,
+                message=message,
+                returncode=returncode,
                 finished_at=time.time(),
             )
             callback_payload = {"status": "failed", "job_id": job_id, "error": message, "stderr_tail": stderr_tail}
@@ -1052,7 +1447,10 @@ def run_transcode_job_background(job_id: str) -> None:
                 job_id,
                 status="worker_done",
                 stderr_tail=stderr_tail,
-                returncode=result.returncode,
+                progress=1,
+                progress_percent=100,
+                message="转码完成",
+                returncode=returncode,
                 finished_at=time.time(),
             )
             callback_payload = {
@@ -1060,11 +1458,15 @@ def run_transcode_job_background(job_id: str) -> None:
                 "job_id": job_id,
                 "output_path": job.get("output_path", ""),
                 "input_path": job.get("input_path", ""),
+                "console_output_path": job.get("console_output_path", ""),
+                "console_input_path": job.get("console_input_path", ""),
                 "target_codec": job.get("target_codec", ""),
+                "progress": job.get("progress", 1),
+                "progress_percent": job.get("progress_percent", 100),
             }
     except Exception as exc:
         try:
-            job = set_transcode_job(job_id, status="failed", error=str(exc), finished_at=time.time())
+            job = set_transcode_job(job_id, status="failed", error=str(exc), message=str(exc), finished_at=time.time())
         except Exception:
             job = {"callback_url": ""}
         callback_payload = {"status": "failed", "job_id": job_id, "error": str(exc)}
@@ -1162,7 +1564,7 @@ def local_node_status() -> dict[str, object]:
         "status": "ok",
         "online": True,
         "mode": "local",
-        "settings": {
+        "settings": redact_secret_settings({
             **compute_settings,
             "default_model": service.settings.default_model,
             "model_dir": str(service.settings.model_dir) if service.settings.model_dir else "",
@@ -1172,7 +1574,7 @@ def local_node_status() -> dict[str, object]:
             "default_output_dir": str(service.settings.default_output_dir) if service.settings.default_output_dir else "",
             "translation_backends": translation_backend_options(service.settings),
             "local_models": local_model_dirs(service.settings.model_dir),
-        },
+        }),
         "hardware": {
             "cpu": platform.processor() or platform.machine() or "未知 CPU",
             "cpu_count": os.cpu_count(),
@@ -1218,6 +1620,8 @@ def subtitle_backend_status() -> dict[str, object]:
         return status
     try:
         status = remote_get_with_timeout("/api/subtitle/node/status", timeout=8.0)
+        if isinstance(status.get("settings"), dict):
+            status["settings"] = redact_secret_settings(status.get("settings"))
         status["online"] = True
         status["mode"] = "remote"
         status["backend_url"] = backend_url()
@@ -1251,11 +1655,11 @@ def subtitle_console_payload() -> dict[str, object]:
             backend_error = str(status.get("error") or "后端暂不可用")
     else:
         jobs = [job_payload(job) for job in get_subtitle_service().list_jobs()]
-    visible_settings = status.get("settings") or console_settings_payload()
+    visible_settings = redact_secret_settings(overlay_saved_console_settings(status.get("settings"), console_config))
     return {
         "connection": {
             "subtitle_backend_url": backend_url() or str(console_config.get("subtitle_backend_url", "")),
-            "subtitle_backend_token": str(console_config.get("subtitle_backend_token", "")),
+            "subtitle_backend_token": SECRET_PLACEHOLDER if str(console_config.get("subtitle_backend_token", "")) else "",
         },
         "backend_status": status,
         "backend_error": backend_error,
@@ -1775,17 +2179,23 @@ async def api_save_subtitle_connection(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="连接配置格式不正确")
+    _, _, data_dir = settings()
+    current_config = load_compute_config(data_dir)
+    token = str(payload.get("subtitle_backend_token", "")).strip()
+    if is_secret_placeholder(token):
+        token = str(current_config.get("subtitle_backend_token", ""))
     save_console_compute_config(
         {
             "subtitle_backend_url": str(payload.get("subtitle_backend_url", "")).strip(),
-            "subtitle_backend_token": str(payload.get("subtitle_backend_token", "")).strip(),
+            "subtitle_backend_token": token,
         }
     )
+    saved_token = str(load_compute_config(data_dir).get("subtitle_backend_token", ""))
     return {
         "status": "ok",
         "connection": {
             "subtitle_backend_url": backend_url(),
-            "subtitle_backend_token": backend_headers().get("X-API-Key", ""),
+            "subtitle_backend_token": SECRET_PLACEHOLDER if saved_token else "",
         },
         "backend_status": subtitle_backend_status(),
     }
@@ -1796,10 +2206,11 @@ async def api_save_subtitle_settings(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="算力端设置格式不正确")
+    payload = restore_secret_placeholders(payload, load_compute_config(settings()[2]))
     save_console_compute_config(payload)
     if backend_url():
         try:
-            result = remote_post_json("/api/compute/settings", payload)
+            result = remote_post_json("/api/compute/settings", remote_compute_settings_payload(payload))
         except HTTPException as exc:
             return {
                 "status": "saved",
@@ -1811,8 +2222,8 @@ async def api_save_subtitle_settings(request: Request) -> dict[str, object]:
         return {
             "status": "ok",
             "synced": True,
-            "remote": result,
-            "settings": result.get("settings", payload),
+            "remote": redact_secret_response(result),
+            "settings": redact_secret_settings(overlay_saved_console_settings(result.get("settings"), load_compute_config(settings()[2]))),
             "backend_status": subtitle_backend_status(),
         }
     result = save_local_compute_settings(payload)
@@ -1820,7 +2231,7 @@ async def api_save_subtitle_settings(request: Request) -> dict[str, object]:
     _, _, data_dir = settings()
     return {
         **result,
-        "settings": compute_settings_payload(service.settings, load_compute_config(data_dir)),
+        "settings": redact_secret_settings(compute_settings_payload(service.settings, load_compute_config(data_dir))),
         "backend_status": subtitle_backend_status(),
     }
 
@@ -1992,7 +2403,7 @@ def test_subtitle_backend(
         raise HTTPException(status_code=400, detail="请先填写 Windows 算力端地址")
     headers = {"X-API-Key": subtitle_backend_token.strip()} if subtitle_backend_token.strip() else {}
     try:
-        with httpx.Client(timeout=8.0) as client:
+        with remote_http_client(timeout=8.0) as client:
             response = client.get(f"{target}/api/subtitle/node/status", headers=headers)
             response.raise_for_status()
             payload = response.json()
@@ -2189,7 +2600,7 @@ def api_get_compute_settings() -> dict[str, object]:
     _, _, data_dir = settings()
     return {
         "status": "ok",
-        "settings": compute_settings_payload(service.settings, load_compute_config(data_dir)),
+        "settings": redact_secret_settings(compute_settings_payload(service.settings, load_compute_config(data_dir))),
         "translation_backends": translation_backend_options(service.settings),
         "local_models": local_model_dirs(service.settings.model_dir),
     }
@@ -2205,7 +2616,7 @@ async def api_save_compute_settings(request: Request) -> dict[str, object]:
     _, _, data_dir = settings()
     return {
         **result,
-        "settings": compute_settings_payload(service.settings, load_compute_config(data_dir)),
+        "settings": redact_secret_settings(compute_settings_payload(service.settings, load_compute_config(data_dir))),
     }
 
 
@@ -2214,6 +2625,20 @@ def api_list_transcode_jobs(limit: int = 100) -> dict[str, object]:
     jobs = transcode_jobs_payload(limit or None)
     active = [job for job in jobs if job.get("status") in {"queued", "running"}]
     return {"jobs": jobs, "total": len(transcode_jobs_payload()), "active": len(active)}
+
+
+@app.post("/api/transcode/settings", dependencies=[Depends(require_subtitle_token)])
+async def api_save_transcode_worker_settings(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="转码算力端设置格式不正确")
+    payload = normalize_transcode_settings_payload(payload)
+    settings_payload = get_postprocess_service().update_settings(payload)
+    return {
+        "status": "ok",
+        "settings": settings_payload,
+        "ffmpeg_standard_command": build_ffmpeg_preview(settings_payload),
+    }
 
 
 @app.post("/api/transcode/jobs", dependencies=[Depends(require_subtitle_token)])
@@ -2329,7 +2754,7 @@ async def api_upload_subtitle_job(
             "translate": str(translate).lower(),
         }
         try:
-            with httpx.Client(timeout=None) as client:
+            with remote_http_client(timeout=None) as client:
                 response = client.post(
                     f"{backend_url()}/api/subtitle/upload",
                     headers=backend_headers(),
@@ -2400,7 +2825,7 @@ def download_subtitle_file(job_id: str, kind: str):
 
 def proxy_subtitle_file(job_id: str, kind: str) -> Response:
     try:
-        with httpx.Client(timeout=120) as client:
+        with remote_http_client(timeout=120) as client:
             response = client.get(
                 f"{backend_url()}/api/subtitle/jobs/{job_id}/files/{kind}",
                 headers=backend_headers(),
@@ -2456,6 +2881,8 @@ subscription_poll_thread: threading.Thread | None = None
 subscription_poll_stop = threading.Event()
 notification_dedupe_lock = threading.RLock()
 notification_dedupe: dict[str, float] = {}
+asset_prewarm_lock = threading.RLock()
+asset_prewarm_pending: set[str] = set()
 wechat_token_lock = threading.RLock()
 wechat_token_cache: dict[str, dict[str, Any]] = {}
 wechat_session_lock = threading.RLock()
@@ -2468,24 +2895,24 @@ DMM_HOSTS = ("dmm.co.jp",)
 JAVLIBRARY_HOSTS = ("javlibrary.com",)
 DMM_MAKER_LIST_URLS = {
     "s1 no.1 style": [
-        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=3152/list_type=reserve/sort=date/",
         "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=3152/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=3152/list_type=reserve/sort=date/",
     ],
     "prestige": [
-        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=40136/list_type=reserve/sort=date/",
         "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=40136/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=40136/list_type=reserve/sort=date/",
     ],
     "idea pocket": [
-        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=1219/list_type=reserve/sort=date/",
         "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=1219/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=1219/list_type=reserve/sort=date/",
     ],
     "madonna": [
-        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=2661/list_type=reserve/sort=date/",
         "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=2661/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=2661/list_type=reserve/sort=date/",
     ],
     "sod create": [
-        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=45276/list_type=reserve/sort=date/",
         "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=45276/sort=date/",
+        "https://www.dmm.co.jp/mono/dvd/-/list/=/article=maker/id=45276/list_type=reserve/sort=date/",
     ],
 }
 DMM_MAKER_ALIASES = {
@@ -2545,6 +2972,9 @@ METADATA_JAVLIBRARY_MAP_TTL = int(os.getenv("SUBSCRIPTION_JAVLIBRARY_MAP_TTL_SEC
 METADATA_DETAIL_TTL = int(os.getenv("SUBSCRIPTION_METADATA_DETAIL_TTL_SECONDS", "2592000"))
 METADATA_PROFILE_TTL = int(os.getenv("SUBSCRIPTION_METADATA_PROFILE_TTL_SECONDS", "604800"))
 METADATA_LISTING_TTL = int(os.getenv("SUBSCRIPTION_METADATA_LISTING_TTL_SECONDS", "43200"))
+METADATA_MAKER_LISTING_TTL = int(os.getenv("SUBSCRIPTION_MAKER_LISTING_TTL_SECONDS", "21600"))
+MAKER_REFRESH_PREWARM_LIMIT = int(os.getenv("SUBSCRIPTION_MAKER_REFRESH_PREWARM_LIMIT", "60"))
+MAKER_REFRESH_COVER_PREWARM_LIMIT = int(os.getenv("SUBSCRIPTION_MAKER_REFRESH_COVER_PREWARM_LIMIT", "28"))
 ASSET_IMAGE_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_IMAGE_MAX_BYTES", str(12 * 1024 * 1024)))
 ASSET_CACHE_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
 ASSET_MEDIA_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_MEDIA_MAX_BYTES", str(300 * 1024 * 1024)))
@@ -2618,6 +3048,14 @@ def configured_proxy_url() -> str:
     ).strip()
 
 
+def configured_flaresolverr_url() -> str:
+    network = network_proxy_settings()
+    configured = str(network.get("flaresolverr_url") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    return str(os.getenv("JAVLIBRARY_FLARESOLVERR_URL") or JAVLIBRARY_FLARESOLVERR_URL).strip().rstrip("/")
+
+
 def apply_system_proxy_settings() -> None:
     network = network_proxy_settings()
     if network.get("proxy_enabled"):
@@ -2635,7 +3073,7 @@ def apply_system_proxy_settings() -> None:
             os.environ["no_proxy"] = no_proxy
     javdb.set_proxy_provider(lambda: configured_proxy_url() if network_proxy_settings().get("apply_to_javdb", True) else "")
     dmm.set_proxy_provider(lambda: configured_proxy_url() if network_proxy_settings().get("apply_to_javdb", True) else "")
-    javlibrary.set_service_url_provider(lambda: str(os.getenv("JAVLIBRARY_FLARESOLVERR_URL") or JAVLIBRARY_FLARESOLVERR_URL).strip())
+    javlibrary.set_service_url_provider(configured_flaresolverr_url)
 
 
 def proxy_status_payload() -> dict[str, object]:
@@ -2646,6 +3084,8 @@ def proxy_status_payload() -> dict[str, object]:
         "env": env,
         "effective_proxy": configured_proxy_url(),
         "javdb_proxy_enabled": bool(network.get("apply_to_javdb", True)),
+        "flaresolverr_url": configured_flaresolverr_url(),
+        "javlibrary": javlibrary.stats(),
     }
 
 
@@ -2838,6 +3278,13 @@ def configured_max_coactors() -> int:
     return max(1, min(GLOBAL_MAX_COACTORS, value))
 
 
+def javdb_source_enabled() -> bool:
+    env_value = os.getenv("SUBSCRIPTION_JAVDB_SOURCE_ENABLED")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(get_subscription_service().get_settings().get("javdb_source_enabled", False))
+
+
 def resolve_av_actors_for_limit(av: dict[str, Any]) -> list[dict[str, str]]:
     detail = cached_av_detail(av)
     if isinstance(detail, dict):
@@ -2849,7 +3296,7 @@ def resolve_av_actors_for_limit(av: dict[str, Any]) -> list[dict[str, str]]:
         if actors:
             return actors
     detail_actors = []
-    if av.get("url") and allowed_external_url(str(av.get("url") or ""), JAVDB_HOSTS):
+    if javdb_source_enabled() and av.get("url") and allowed_external_url(str(av.get("url") or ""), JAVDB_HOSTS):
         detail_actors = javdb.get_av_actresses(str(av.get("url") or ""), include_profiles=False)
     return normalize_actor_items(detail_actors) or normalize_actor_items(av.get("actresses") or av.get("actress"))
 
@@ -3052,10 +3499,74 @@ def remember_av_metadata(item: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def prewarm_cover_asset(item: dict[str, Any]) -> None:
+    if not isinstance(item, dict):
+        return
+    av_id = canonical_av_id(item.get("id"))
+    cover = normalize_cover_url(str(item.get("cover") or "").strip())
+    if not av_id or not cover:
+        return
+    service = get_subscription_service()
+    existing = service.get_asset_cache(av_id, "cover")
+    if existing and image_source_rank(str(existing.get("source_url") or "")) >= image_source_rank(cover):
+        return
+    try:
+        persist_image_asset(cover, av_id, "cover", metadata_item_released(item))
+    except Exception as exc:
+        app_log("warning", "asset-cache", "封面资产预热失败", {
+            "stage": "asset_cache_prewarm_error",
+            "av_id": av_id,
+            "cover": cover,
+            "error": str(exc),
+        })
+
+
+def schedule_cover_asset_prewarm(items: list[dict[str, Any]], *, limit: int = 14) -> None:
+    if os.getenv("SUBSCRIPTION_ASSET_PREWARM", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    selected: list[dict[str, Any]] = []
+    safe_limit = max(0, min(40, int(limit or 0)))
+    if safe_limit <= 0:
+        return
+    with asset_prewarm_lock:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            av_id = canonical_av_id(item.get("id"))
+            cover = normalize_cover_url(str(item.get("cover") or "").strip())
+            if not av_id or not cover:
+                continue
+            key = f"cover:{av_id}"
+            existing = get_subscription_service().get_asset_cache(av_id, "cover")
+            if existing and image_source_rank(str(existing.get("source_url") or "")) >= image_source_rank(cover):
+                continue
+            if key in asset_prewarm_pending:
+                continue
+            asset_prewarm_pending.add(key)
+            selected.append(public_metadata_item(item))
+            if len(selected) >= safe_limit:
+                break
+    if not selected:
+        return
+
+    def worker(batch: list[dict[str, Any]]) -> None:
+        for entry in batch:
+            key = f"cover:{canonical_av_id(entry.get('id'))}"
+            try:
+                prewarm_cover_asset(entry)
+            finally:
+                with asset_prewarm_lock:
+                    asset_prewarm_pending.discard(key)
+
+    threading.Thread(target=worker, args=(selected,), name="asset-cover-prewarm", daemon=True).start()
+
+
 def remember_av_summaries(items: list[dict[str, Any]]) -> None:
+    remembered: list[dict[str, Any]] = []
     for item in items:
         if isinstance(item, dict):
-            remember_av_metadata(item)
+            remembered.append(remember_av_metadata(item))
+    schedule_cover_asset_prewarm(remembered)
 
 
 def cached_av_summary(av_id: str) -> dict[str, Any]:
@@ -3235,7 +3746,132 @@ def remember_actor_identity(item: dict[str, Any], *, match_reason: str = "", con
     return payload
 
 
+def actor_identity_canonical_id(payload: dict[str, Any]) -> str:
+    for key in ("javdb_id", "javlibrary_star_id", "dmm_url", "canonical_id", "display_name", "name", "dmm_name", "id"):
+        value = str(payload.get(key) or "").strip()
+        if not value:
+            continue
+        if key == "dmm_url":
+            return f"dmm_url:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+        if key in {"javdb_id", "javlibrary_star_id"}:
+            return f"{key}:{value.lower()}"
+        normalized = normalized_person_name(value)
+        if normalized:
+            return f"actor:{normalized}"
+    return ""
+
+
+def normalize_alias_list(value: object) -> list[str]:
+    raw_items = value if isinstance(value, list) else re.split(r"[,，、\n]+", str(value or ""))
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        key = normalized_person_name(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        aliases.append(text)
+    return aliases
+
+
+def manual_actor_identity_payload(payload: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = dict(existing or {})
+    data = {**base, **(payload or {})}
+    display_name = str(data.get("display_name") or data.get("name") or data.get("dmm_name") or data.get("id") or "").strip()
+    aliases = normalize_alias_list(data.get("aliases"))
+    for value in (display_name, data.get("name"), data.get("dmm_name"), data.get("id")):
+        text = str(value or "").strip()
+        if text and normalized_person_name(text) not in {normalized_person_name(alias) for alias in aliases}:
+            aliases.append(text)
+    result = {
+        "canonical_id": str(data.get("canonical_id") or "").strip(),
+        "id": str(data.get("id") or data.get("javdb_id") or display_name).strip(),
+        "display_name": display_name,
+        "name": str(data.get("name") or display_name).strip(),
+        "aliases": aliases,
+        "preferred_source": str(data.get("preferred_source") or "").strip().lower(),
+        "source": str(data.get("source") or "manual").strip() or "manual",
+        "source_chain": source_chain_for_item(data) or ["manual"],
+        "javdb_id": str(data.get("javdb_id") or "").strip(),
+        "dmm_name": str(data.get("dmm_name") or "").strip(),
+        "dmm_url": str(data.get("dmm_url") or "").strip(),
+        "javlibrary_star_id": str(data.get("javlibrary_star_id") or data.get("star_id") or "").strip(),
+        "cover": str(data.get("cover") or "").strip(),
+        "latest_cover": str(data.get("latest_cover") or "").strip(),
+        "latest_av_id": str(data.get("latest_av_id") or "").strip(),
+        "latest_title": str(data.get("latest_title") or "").strip(),
+        "latest_date": str(data.get("latest_date") or "").strip(),
+        "match_reason": "manual_identity",
+        "confidence": "manual",
+        "locked": bool(data.get("locked", True)),
+        "manual": True,
+        "updated_at": time.time(),
+    }
+    if not result["canonical_id"]:
+        result["canonical_id"] = actor_identity_canonical_id(result)
+    return {key: value for key, value in result.items() if value not in ("", [], {}, None)}
+
+
+def actor_identity_lookup_keys(payload: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for value in [payload.get("display_name"), payload.get("name"), payload.get("dmm_name"), payload.get("id"), *(payload.get("aliases") or [])]:
+        key = actor_identity_cache_key(value)
+        if key:
+            keys.add(key)
+    if payload.get("javdb_id"):
+        keys.add(f"javdb:{str(payload['javdb_id']).strip().lower()}")
+    if payload.get("javlibrary_star_id"):
+        keys.add(f"javlibrary:{str(payload['javlibrary_star_id']).strip().lower()}")
+    if payload.get("dmm_url"):
+        keys.add(f"dmm_url:{hashlib.sha256(str(payload['dmm_url']).encode('utf-8')).hexdigest()}")
+    if payload.get("canonical_id"):
+        keys.add(f"canonical:{str(payload['canonical_id']).strip().lower()}")
+    return keys
+
+
+def cached_manual_actor_identity(query: object) -> dict[str, Any]:
+    keys: list[str] = []
+    key = actor_identity_cache_key(query)
+    if key:
+        keys.append(key)
+    raw = str(query or "").strip()
+    if raw:
+        keys.extend([f"javdb:{raw.lower()}", f"javlibrary:{raw.lower()}", f"canonical:{raw.lower()}"])
+    for cache_key in keys:
+        cached = cache_get("actor_identity_manual", cache_key, allow_stale=True)
+        if isinstance(cached, dict) and cached:
+            return normalize_image_fields(cached)
+    return {}
+
+
+def save_manual_actor_identity(payload: dict[str, Any]) -> dict[str, Any]:
+    service = get_subscription_service()
+    normalized = manual_actor_identity_payload(payload)
+    normalized["canonical_id"] = actor_identity_canonical_id({**normalized, "canonical_id": ""})
+    canonical_id = str(normalized.get("canonical_id") or "").strip()
+    if not canonical_id:
+        raise ValueError("缺少可识别的演员名称或外部 ID")
+    normalized_lookup_keys = actor_identity_lookup_keys(normalized)
+    normalized_group_keys = actor_identity_group_keys(actor_identity_public_record(normalized, origin="manual"))
+    for row in service.list_metadata_cache("actor_identity_manual", limit=50000):
+        data = row.get("data") if isinstance(row, dict) else {}
+        if not isinstance(data, dict):
+            continue
+        data_canonical = str(data.get("canonical_id") or "").strip()
+        data_lookup_keys = actor_identity_lookup_keys(data)
+        data_group_keys = actor_identity_group_keys(actor_identity_public_record(data, origin="manual", cache_key=str(row.get("cache_key") or "")))
+        if data_canonical == canonical_id or normalized_lookup_keys & data_lookup_keys or normalized_group_keys & data_group_keys:
+            service.delete_metadata_cache("actor_identity_manual", str(row.get("cache_key") or ""))
+    for key in actor_identity_lookup_keys(normalized):
+        cache_set("actor_identity_manual", key, normalized, METADATA_DETAIL_TTL * 12)
+    return normalized
+
+
 def cached_actor_identity(query: object) -> dict[str, Any]:
+    manual = cached_manual_actor_identity(query)
+    if manual:
+        return manual
     keys: list[str] = []
     key = actor_identity_cache_key(query)
     if key:
@@ -3459,7 +4095,26 @@ def javlibrary_seed_disallowed(seed: dict[str, Any]) -> bool:
     ))
 
 
+def javlibrary_get_listing_avs(url: str, limit: int, *, retries: int = 3, timeout_ms: int = 120000) -> list[dict[str, Any]]:
+    try:
+        return javlibrary.get_listing_avs(url, limit=limit, retries=retries, timeout_ms=timeout_ms)
+    except TypeError:
+        return javlibrary.get_listing_avs(url, limit=limit)
+
+
+def javlibrary_get_actor_avs(star_id: str, limit: int, *, retries: int = 3, timeout_ms: int = 120000) -> list[dict[str, Any]]:
+    try:
+        return javlibrary.get_actor_avs(star_id, limit=limit, retries=retries, timeout_ms=timeout_ms)
+    except TypeError:
+        return javlibrary.get_actor_avs(star_id, limit=limit)
+
+
 def javlibrary_actor_star_id(actress: dict[str, Any], seed_avs: list[dict[str, Any]] | None = None) -> str:
+    anchored_star_id = str(actress.get("javlibrary_star_id") or "").strip()
+    if anchored_star_id:
+        for value in dmm_actress_queries(actress):
+            cache_javlibrary_actor_map(value, anchored_star_id)
+        return anchored_star_id
     for value in dmm_actress_queries(actress):
         normalized = normalized_person_name(value)
         if not normalized:
@@ -3522,7 +4177,7 @@ def javlibrary_actor_avs(actress: dict[str, Any], limit: int, seed_avs: list[dic
             if isinstance(item, dict) and not javlibrary_seed_disallowed({"id": item.get("id", ""), "title": item.get("title", "")})
         ][:limit]
     try:
-        items = javlibrary.get_actor_avs(star_id, limit=max(limit, 20))
+        items = javlibrary_get_actor_avs(star_id, limit=max(limit, 20), retries=1, timeout_ms=60000)
     except Exception as exc:
         stale = cache_get("javlibrary_actor_avs", key, allow_stale=True)
         if isinstance(stale, list):
@@ -3600,7 +4255,7 @@ def javlibrary_maker_avs(maker_name: str, limit: int) -> list[dict[str, Any]]:
             )
             continue
         try:
-            items = javlibrary.get_listing_avs(url, limit=max(limit, 20))
+            items = javlibrary_get_listing_avs(url, limit=max(limit, 20), retries=0, timeout_ms=45000)
         except Exception as exc:
             stale = cache_get("javlibrary_maker_avs", key, allow_stale=True)
             if isinstance(stale, list):
@@ -3682,11 +4337,24 @@ def enrich_dmm_actress_items(items: list[dict[str, Any]], actress: dict[str, Any
 
 
 def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, include_dmm_detail: bool = False) -> list[dict[str, Any]]:
+    actress = dict(actress or {})
+    for identity_query in (actress.get("javdb_id"), actress.get("id"), actress.get("name"), actress.get("dmm_name")):
+        identity = cached_actor_identity(identity_query)
+        if not identity:
+            continue
+        for field in ("javdb_id", "dmm_name", "dmm_url", "javlibrary_star_id", "preferred_source", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date"):
+            if identity.get(field) and not actress.get(field):
+                actress[field] = identity[field]
+        if identity.get("name") and bad_actress_name(actress.get("name")):
+            actress["name"] = identity["name"]
+        break
     actress_id = str(actress.get("id") or "").strip()
     javdb_id = actress_javdb_lookup_id(actress)
     lookup_name = actress_lookup_name(actress)
     dmm_url = actress_dmm_lookup_url(actress)
-    cache_key = metadata_cache_key("v8", "actress_avs", actress_id, javdb_id, lookup_name, dmm_url)
+    source_strategy = normalize_source_preference(actress.get("preferred_source"), "auto")
+    javlibrary_star_id = str(actress.get("javlibrary_star_id") or "").strip()
+    cache_key = metadata_cache_key("v9", "actress_avs", actress_id, javdb_id, lookup_name, dmm_url, javlibrary_star_id, source_strategy)
     cached = cache_get("actress_avs", cache_key) if cache_key else None
     if isinstance(cached, list):
         cached = [
@@ -3704,38 +4372,51 @@ def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, i
         })
         return cached[:limit]
 
-    dmm_results: list[dict[str, Any]] = []
-    for query in dmm_actress_queries(actress):
-        try:
-            results = dmm.get_actress_avs(query, limit=min(max(limit, 40), 100), include_detail=False)
-            dmm_results.extend(enrich_dmm_actress_items(results, {**actress, "dmm_name": query}, limit))
-        except Exception as exc:
-            app_log("warning", "subscription", "DMM/FANZA 女优名字搜索失败", {
-                "stage": "actress_avs_dmm_search_error",
-                "actress_id": actress_id,
-                "actress": lookup_name,
-                "query": query,
-                "error": str(exc),
-            })
-    if dmm_url and len(merge_av_sources(dmm_results)) < min(limit, 20):
-        try:
-            page_results = dmm.get_listing_avs(dmm_url, limit=min(max(limit, 40), 100), include_detail=False)
-            dmm_results.extend(enrich_dmm_actress_items(page_results, actress, limit))
-        except Exception as exc:
-            app_log("warning", "subscription", "DMM 女优专页作品读取失败，尝试按名字搜索", {
-                "stage": "actress_avs_dmm_url_error",
-                "actress_id": actress_id,
-                "actress": lookup_name,
-                "dmm_url": dmm_url,
-                "error": str(exc),
-            })
     javlibrary_results: list[dict[str, Any]] = []
-    if len(merge_av_sources(dmm_results)) < min(limit, 20):
-        javlibrary_results = javlibrary_actor_avs(actress, limit, seed_avs=merge_av_sources(dmm_results)[:6])
+    dmm_results: list[dict[str, Any]] = []
     javdb_results: list[dict[str, Any]] = []
-    if javdb_id and len(merge_av_sources(javdb_results, javlibrary_results, dmm_results)) < min(limit, 20):
+
+    def fetch_dmm_actress() -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for query in dmm_actress_queries(actress):
+            try:
+                rows = dmm.get_actress_avs(query, limit=min(max(limit, 40), 100), include_detail=False)
+                results.extend(enrich_dmm_actress_items(rows, {**actress, "dmm_name": query}, limit))
+            except Exception as exc:
+                app_log("warning", "subscription", "DMM/FANZA 女优名字搜索失败", {
+                    "stage": "actress_avs_dmm_search_error",
+                    "actress_id": actress_id,
+                    "actress": lookup_name,
+                    "query": query,
+                    "error": str(exc),
+                })
+        if dmm_url and len(merge_av_sources(results)) < min(limit, 20):
+            try:
+                page_results = dmm.get_listing_avs(dmm_url, limit=min(max(limit, 40), 100), include_detail=False)
+                results.extend(enrich_dmm_actress_items(page_results, actress, limit))
+            except Exception as exc:
+                app_log("warning", "subscription", "DMM 女优专页作品读取失败，尝试按名字搜索", {
+                    "stage": "actress_avs_dmm_url_error",
+                    "actress_id": actress_id,
+                    "actress": lookup_name,
+                    "dmm_url": dmm_url,
+                    "error": str(exc),
+                })
+        return results
+
+    def fetch_javdb_actress() -> list[dict[str, Any]]:
+        if not javdb_source_enabled():
+            app_log("info", "subscription", "JavDB 数据源已关闭，跳过女优作品读取", {
+                "stage": "javdb_source_disabled",
+                "context": "actress_avs",
+                "actress_id": actress_id,
+                "javdb_id": javdb_id,
+            })
+            return []
+        if not javdb_id:
+            return []
         try:
-            javdb_results = javdb.get_actress_avs(javdb_id, limit=limit)
+            return javdb.get_actress_avs(javdb_id, limit=limit)
         except Exception as exc:
             app_log("warning", "subscription", "JavDB 女优作品读取失败", {
                 "stage": "actress_avs_javdb_error",
@@ -3743,6 +4424,27 @@ def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, i
                 "javdb_id": javdb_id,
                 "error": str(exc),
             })
+            return []
+
+    javlibrary_first = source_strategy == "javlibrary" or (source_strategy == "auto" and bool(javlibrary_star_id))
+    if javlibrary_first and javlibrary_star_id:
+        javlibrary_results = javlibrary_actor_avs(actress, limit, seed_avs=[])
+        if len(merge_av_sources(javlibrary_results)) < min(limit, 20):
+            dmm_results = fetch_dmm_actress()
+        if len(merge_av_sources(javlibrary_results, dmm_results)) < min(limit, 20):
+            javdb_results = fetch_javdb_actress()
+    elif source_strategy == "javdb":
+        javdb_results = fetch_javdb_actress()
+        if len(merge_av_sources(javdb_results)) < min(limit, 20):
+            dmm_results = fetch_dmm_actress()
+        if len(merge_av_sources(javdb_results, dmm_results)) < min(limit, 20):
+            javlibrary_results = javlibrary_actor_avs(actress, limit, seed_avs=merge_av_sources(dmm_results)[:6])
+    else:
+        dmm_results = fetch_dmm_actress()
+        if len(merge_av_sources(dmm_results)) < min(limit, 20):
+            javlibrary_results = javlibrary_actor_avs(actress, limit, seed_avs=merge_av_sources(dmm_results)[:6])
+        if len(merge_av_sources(javdb_results, javlibrary_results, dmm_results)) < min(limit, 20):
+            javdb_results = fetch_javdb_actress()
     dmm_results = [
         explain_match(append_source_chain(item, "dmm"), default_reason="actress_dmm_match", default_confidence="high")
         for item in dmm_results
@@ -3769,6 +4471,7 @@ def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, i
         "stage": "actress_avs_merged",
         "actress_id": actress_id,
         "actress": lookup_name,
+        "source_strategy": source_strategy,
         "javdb_count": len(javdb_results),
         "javlibrary_count": len(javlibrary_results),
         "dmm_count": len(dmm_results),
@@ -3777,13 +4480,18 @@ def subscription_avs_for_actress(actress: dict[str, Any], limit: int = 100, *, i
     return merged[:limit]
 
 
-def prepare_subscription_av_payload(av: dict[str, Any]) -> dict[str, Any]:
+def prepare_subscription_av_payload(av: dict[str, Any], *, allow_live_detail: bool = True) -> dict[str, Any]:
     payload = dict(av)
     cached_detail = cached_av_detail(payload)
     payload_url = str(payload.get("url") or "")
     if cached_detail and not detail_needs_refresh(cached_detail, payload_url):
         payload = {**payload, **cached_detail}
         payload["detail"] = cached_detail.get("detail") if isinstance(cached_detail.get("detail"), dict) else cached_detail
+        return payload
+    if not allow_live_detail:
+        if cached_detail:
+            payload = {**payload, **cached_detail}
+            payload["detail"] = cached_detail.get("detail") if isinstance(cached_detail.get("detail"), dict) else cached_detail
         return payload
     if str(payload.get("source") or "").lower() == "dmm" and payload.get("url"):
         try:
@@ -3848,7 +4556,7 @@ def fetch_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
                     "latest_title": jl_works[0].get("title", ""),
                     "latest_date": jl_works[0].get("date") or jl_works[0].get("release_date") or "",
                 }]
-        if not dmm_results and not javlibrary_results:
+        if javdb_source_enabled() and not dmm_results and not javlibrary_results:
             try:
                 javdb_results = javdb.search_actress(query)
             except Exception as exc:
@@ -3865,7 +4573,7 @@ def fetch_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]:
         dmm_avs = dmm.search_av(query, limit=12, include_detail=True)
     except Exception as exc:
         app_log("warning", "subscription", "DMM/FANZA 番号搜索失败", {"stage": "av_search_dmm_error", "query": query, "error": str(exc)})
-    if not dmm_avs:
+    if javdb_source_enabled() and not dmm_avs:
         try:
             javdb_avs = javdb.search_av(query)
         except Exception as exc:
@@ -3907,6 +4615,9 @@ def cached_subscription_search(q: str, search_type: str) -> list[dict[str, Any]]
 
 
 def cached_actress_profile(actress_id: str) -> dict[str, Any]:
+    if not javdb_source_enabled():
+        stale = cache_get("actress_profile", metadata_cache_key("profile", actress_id), allow_stale=True)
+        return stale if isinstance(stale, dict) else {}
     key = metadata_cache_key("profile", actress_id)
     result = cached_metadata(
         "actress_profile",
@@ -3949,6 +4660,26 @@ def maker_name_for_listing_url(page_url: str, explicit_name: str = "") -> str:
         if str(maker.get("url") or "").strip() == target_url:
             return str(maker.get("name") or "").strip()
     return ""
+
+
+def normalize_source_preference(value: object, fallback: str = "auto") -> str:
+    source = str(value or "").strip().lower()
+    return source if source in {"auto", "javlibrary", "dmm", "javdb"} else fallback
+
+
+def maker_listing_source_strategy(maker_name: str, page_url: str = "") -> str:
+    key = str(maker_name or "").strip().lower()
+    target_url = str(page_url or "").strip()
+    for maker in get_subscription_service().get_settings().get("pinned_makers") or []:
+        if not isinstance(maker, dict):
+            continue
+        maker_key = str(maker.get("name") or "").strip().lower()
+        maker_url = str(maker.get("url") or "").strip()
+        if (key and maker_key == key) or (target_url and maker_url == target_url):
+            return normalize_source_preference(maker.get("preferred_listing_source") or maker.get("preferred_source"), "auto")
+    if key in JAVLIBRARY_MAKER_URLS:
+        return "javlibrary"
+    return "auto"
 
 
 def dmm_listing_urls_for_maker(maker_name: str) -> list[str]:
@@ -4061,52 +4792,95 @@ def fetch_listing_sources(page_url: str, maker_name: str, safe_limit: int, *, fo
     dmm_results: list[dict[str, Any]] = []
     javlibrary_results: list[dict[str, Any]] = []
     dmm_limit = min(80, max(safe_limit * 3, safe_limit + 14))
-    if allowed_external_url(page_url, DMM_HOSTS):
-        try:
-            dmm_results.extend(dmm.get_listing_avs(page_url, limit=dmm_limit))
-        except Exception as exc:
-            app_log("warning", "maker", "DMM/FANZA 厂牌页面读取失败", {
-                "stage": "maker_dmm_page_listing_error",
-                "url": page_url,
-                "error": str(exc),
-            })
-    mapped_dmm_urls = dmm_listing_urls_for_maker(maker_name)
-    for dmm_url in mapped_dmm_urls:
-        try:
-            dmm_results.extend(dmm.get_listing_avs(dmm_url, limit=dmm_limit))
-        except Exception as exc:
-            app_log("warning", "maker", "DMM/FANZA 厂牌映射读取失败", {
-                "stage": "maker_dmm_mapped_listing_error",
-                "maker": maker_name,
-                "url": dmm_url,
-                "error": str(exc),
-            })
-    if not mapped_dmm_urls or len(merge_av_sources(dmm_results)) < safe_limit:
-        for term in dmm_search_terms_for_maker(maker_name):
+    source_strategy = maker_listing_source_strategy(maker_name, page_url)
+
+    def fetch_dmm() -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        if allowed_external_url(page_url, DMM_HOSTS):
             try:
-                dmm_results.extend(dmm.get_maker_avs(term, limit=dmm_limit))
+                results.extend(dmm.get_listing_avs(page_url, limit=dmm_limit, force_refresh=force_refresh))
             except Exception as exc:
-                app_log("warning", "maker", "DMM/FANZA 厂牌发售读取失败", {
-                    "stage": "maker_dmm_listing_error",
-                    "maker": maker_name,
-                    "term": term,
+                app_log("warning", "maker", "DMM/FANZA 厂牌页面读取失败", {
+                    "stage": "maker_dmm_page_listing_error",
+                    "url": page_url,
                     "error": str(exc),
                 })
-    if any("/mono/dvd/" in str(item.get("url") or "") for item in dmm_results):
-        dmm_results = [item for item in dmm_results if "/mono/dvd/" in str(item.get("url") or "")]
-    if maker_name:
-        dmm_results = enrich_dmm_maker_items(dmm_results, maker_name, max(safe_limit * 2, safe_limit + 8))
-    if len(merge_av_sources(dmm_results)) < safe_limit:
-        javlibrary_results = javlibrary_maker_avs(maker_name, safe_limit)
-    if allowed_external_url(page_url, JAVDB_HOSTS) and len(merge_av_sources(javdb_results, javlibrary_results, dmm_results)) < safe_limit:
+        mapped_dmm_urls = dmm_listing_urls_for_maker(maker_name)
+        for dmm_url in mapped_dmm_urls:
+            try:
+                results.extend(dmm.get_listing_avs(dmm_url, limit=dmm_limit, force_refresh=force_refresh))
+            except Exception as exc:
+                app_log("warning", "maker", "DMM/FANZA 厂牌映射读取失败", {
+                    "stage": "maker_dmm_mapped_listing_error",
+                    "maker": maker_name,
+                    "url": dmm_url,
+                    "error": str(exc),
+                })
+        if not mapped_dmm_urls or len(merge_av_sources(results)) < safe_limit:
+            for term in dmm_search_terms_for_maker(maker_name):
+                try:
+                    results.extend(dmm.get_maker_avs(term, limit=dmm_limit, force_refresh=force_refresh))
+                except Exception as exc:
+                    app_log("warning", "maker", "DMM/FANZA 厂牌发售读取失败", {
+                        "stage": "maker_dmm_listing_error",
+                        "maker": maker_name,
+                        "term": term,
+                        "error": str(exc),
+                    })
+        if any("/mono/dvd/" in str(item.get("url") or "") for item in results):
+            results = [item for item in results if "/mono/dvd/" in str(item.get("url") or "")]
+        if maker_name:
+            results = enrich_dmm_maker_items(results, maker_name, max(safe_limit * 2, safe_limit + 8))
+        return results
+
+    def fetch_javdb() -> list[dict[str, Any]]:
+        if not javdb_source_enabled():
+            app_log("info", "maker", "JavDB 数据源已关闭，跳过厂牌发售兜底", {
+                "stage": "javdb_source_disabled",
+                "context": "maker_listing",
+                "url": page_url,
+            })
+            return []
+        if not allowed_external_url(page_url, JAVDB_HOSTS):
+            return []
         try:
-            javdb_results = javdb.get_listing(page_url, limit=safe_limit, force_refresh=force_refresh)
+            return javdb.get_listing(page_url, limit=safe_limit, force_refresh=force_refresh)
         except Exception as exc:
             app_log("warning", "maker", "JavDB 厂牌发售读取失败", {
                 "stage": "maker_javdb_listing_error",
                 "url": page_url,
                 "error": str(exc),
             })
+            return []
+
+    if source_strategy == "javlibrary":
+        javlibrary_results = javlibrary_maker_avs(maker_name, safe_limit)
+        javlibrary_ids = {canonical_av_id(item.get("id")) for item in javlibrary_results if isinstance(item, dict)}
+        if force_refresh or len(javlibrary_ids) < safe_limit:
+            dmm_results = fetch_dmm()
+            if len(javlibrary_ids) >= safe_limit:
+                dmm_results = [item for item in dmm_results if canonical_av_id(item.get("id")) in javlibrary_ids]
+            if len(merge_av_sources(javlibrary_results, dmm_results)) < safe_limit:
+                javdb_results = fetch_javdb()
+        else:
+            app_log("info", "maker", "JavLibrary 厂牌列表已满足首屏，跳过同步 DMM 补全", {
+                "stage": "maker_javlibrary_fast_path",
+                "maker": maker_name,
+                "count": len(javlibrary_ids),
+                "limit": safe_limit,
+            })
+    elif source_strategy == "javdb":
+        javdb_results = fetch_javdb()
+        if len(merge_av_sources(javdb_results)) < safe_limit:
+            javlibrary_results = javlibrary_maker_avs(maker_name, safe_limit)
+        if len(merge_av_sources(javdb_results, javlibrary_results)) < safe_limit:
+            dmm_results = fetch_dmm()
+    else:
+        dmm_results = fetch_dmm()
+        if len(merge_av_sources(dmm_results)) < safe_limit or source_strategy == "auto":
+            javlibrary_results = javlibrary_maker_avs(maker_name, safe_limit)
+        if len(merge_av_sources(javdb_results, javlibrary_results, dmm_results)) < safe_limit:
+            javdb_results = fetch_javdb()
     dmm_results = [
         explain_match(append_source_chain(item, "dmm"), default_reason="primary_label", default_confidence="high")
         for item in dmm_results
@@ -4131,6 +4905,7 @@ def fetch_listing_sources(page_url: str, maker_name: str, safe_limit: int, *, fo
     app_log("info", "maker", "厂牌发售数据源合并完成", {
         "stage": "maker_listing_merged",
         "maker": maker_name,
+        "source_strategy": source_strategy,
         "javdb_count": len(javdb_results),
         "javlibrary_count": len(javlibrary_results),
         "dmm_count": len(dmm_results),
@@ -4145,15 +4920,17 @@ def cached_listing(page_url: str, limit: int = 60, *, force_refresh: bool = Fals
         return []
     safe_limit = max(1, min(60, int(limit or 60)))
     resolved_maker_name = maker_name_for_listing_url(url, maker_name)
-    key = hashlib.sha256(f"v18|{url}|{resolved_maker_name}".encode("utf-8")).hexdigest()
+    source_strategy = maker_listing_source_strategy(resolved_maker_name, url)
+    key = hashlib.sha256(f"v21|{url}|{resolved_maker_name}|{source_strategy}".encode("utf-8")).hexdigest()
     if force_refresh:
         results = fetch_listing_sources(url, resolved_maker_name, safe_limit, force_refresh=True)
         if results:
-            cache_set("listing", key, [public_metadata_item(item) for item in results], METADATA_LISTING_TTL)
+            cache_set("listing", key, [public_metadata_item(item) for item in results], METADATA_MAKER_LISTING_TTL)
             remember_av_summaries(results)
         return results[:safe_limit]
     cached = cache_get("listing", key)
-    if isinstance(cached, list) and len(cached) >= safe_limit:
+    cached_count = len(cached) if isinstance(cached, list) else 0
+    if isinstance(cached, list) and cached_count > 0:
         result = [
             public_metadata_item(explain_match({**item, "_cache_hit": True}, default_reason="sqlite_cache", default_confidence="high"))
             for item in cached
@@ -4164,11 +4941,13 @@ def cached_listing(page_url: str, limit: int = 60, *, force_refresh: bool = Fals
             "maker": resolved_maker_name,
             "count": len(cached),
             "limit": safe_limit,
+            "partial": len(cached) < safe_limit,
         })
+        return filter_avs_by_actor_limit(result, context="listing_cache")[:safe_limit]
     else:
         result = fetch_listing_sources(url, resolved_maker_name, safe_limit, force_refresh=False)
         if result:
-            cache_set("listing", key, [public_metadata_item(item) for item in result], METADATA_LISTING_TTL)
+            cache_set("listing", key, [public_metadata_item(item) for item in result], METADATA_MAKER_LISTING_TTL)
     items = filter_avs_by_actor_limit(result if isinstance(result, list) else [], context="listing_cache")
     remember_av_summaries([item for item in items if isinstance(item, dict)])
     return items[:safe_limit]
@@ -4194,6 +4973,8 @@ def cached_detail_for_url(url: str) -> dict[str, Any]:
     def fetch() -> dict[str, Any]:
         if allowed_external_url(target_url, DMM_HOSTS):
             return dmm.get_av_detail(summary or target_url)
+        if allowed_external_url(target_url, JAVDB_HOSTS) and not javdb_source_enabled():
+            return {}
         return javdb.get_av_detail(target_url)
 
     detail = fetch()
@@ -4601,23 +5382,166 @@ def download_pending_wash_subscriptions() -> dict[str, Any]:
     }
 
 
+def run_subscription_background_job(name: str, worker: Callable[[], Any]) -> None:
+    try:
+        app_log("info", "subscription", "后台订阅任务开始", {"stage": "subscription_background_start", "job": name})
+        worker()
+        app_log("info", "subscription", "后台订阅任务完成", {"stage": "subscription_background_done", "job": name})
+    except Exception as exc:
+        app_log("error", "subscription", "后台订阅任务失败", {
+            "stage": "subscription_background_error",
+            "job": name,
+            "error": str(exc),
+        })
+
+
+def background_download_subscription_av(av_id: str) -> None:
+    service = get_subscription_service()
+    av = next((item for item in service.get_subscribed_av() if item.get("id") == av_id), None)
+    if not av:
+        return
+    run_subscription_background_job(f"download_av:{av_id}", lambda: download_av_from_mteam(av))
+
+
+def cached_only_enriched_actress_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    result = normalize_image_fields(payload)
+    if av_cover_used_as_actress_cover(result.get("cover")):
+        result.setdefault("latest_cover", result.get("cover"))
+        result["cover"] = ""
+    actress_ref = str(result.get("id") or result.get("name") or "").strip()
+    actress_name = str(result.get("name") or actress_ref).strip()
+    identity = cached_actor_identity(actress_name or actress_ref)
+    if identity:
+        for field in ("javdb_id", "dmm_name", "dmm_url", "source", "source_chain", "match_reason", "confidence", "javlibrary_star_id"):
+            if identity.get(field) and not result.get(field):
+                result[field] = identity.get(field)
+        if not result.get("cover") and identity.get("cover"):
+            result["cover"] = normalize_cover_url(str(identity.get("cover") or ""))
+        if not result.get("latest_cover") and identity.get("latest_cover"):
+            result["latest_cover"] = normalize_cover_url(str(identity.get("latest_cover") or ""))
+        for field in ("latest_av_id", "latest_title", "latest_date"):
+            if identity.get(field) and not result.get(field):
+                result[field] = identity.get(field)
+        if bad_actress_name(result.get("name")) and identity.get("name"):
+            result["name"] = identity.get("name")
+    if not result.get("dmm_name") and not bad_actress_name(result.get("name")):
+        result["dmm_name"] = result.get("name")
+    return explain_match(normalize_image_fields(result), default_reason="actor_identity_cache", default_confidence="medium")
+
+
+def hydrate_actress_subscriptions_cached(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    service = get_subscription_service()
+    hydrated: list[dict[str, Any]] = []
+    for item in items:
+        current = normalize_image_fields(dict(item or {}))
+        needs_name = bad_actress_name(current.get("name"))
+        bad_cover = av_cover_used_as_actress_cover(current.get("cover"))
+        needs_cover = not current.get("cover") or bad_cover
+        if needs_name or needs_cover or not current.get("javlibrary_star_id"):
+            cached = cached_only_enriched_actress_payload(current)
+            patch: dict[str, Any] = {}
+            for field in ("name", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date", "source", "source_chain", "match_reason", "confidence", "javdb_id", "dmm_name", "dmm_url", "javlibrary_star_id"):
+                value = cached.get(field)
+                if value and not current.get(field):
+                    patch[field] = value
+            if bad_cover:
+                patch["cover"] = cached.get("cover") or ""
+            if patch:
+                updated = service.update_actress_subscription(str(current.get("id") or ""), patch)
+                current = updated or {**current, **patch}
+        hydrated.append(normalize_image_fields(current))
+    return hydrated
+
+
+def background_enrich_and_subscribe_latest_actress(actress_id: str, *, future_only: bool = True, download: bool = True) -> None:
+    def worker() -> None:
+        service = get_subscription_service()
+        actress = next((item for item in service.get_subscribed_actresses() if item.get("id") == actress_id), None)
+        if not actress:
+            return
+        enriched = enriched_actress_payload(dict(actress))
+        if enriched:
+            updated = service.subscribe_actress({**actress, **enriched})
+            remember_actor_identity(updated, match_reason=str(updated.get("match_reason") or "subscribed_actor"), confidence=str(updated.get("confidence") or "medium"))
+            subscribe_latest_for_actress(updated, future_only=future_only, download=download)
+        else:
+            subscribe_latest_for_actress(actress, future_only=future_only, download=download)
+
+    run_subscription_background_job(f"actress_latest:{actress_id}", worker)
+
+
 def refresh_pinned_makers() -> dict[str, Any]:
     makers = get_subscription_service().get_settings().get("pinned_makers") or []
     refreshed: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    app_log("info", "maker", "开始刷新常驻厂牌", {"stage": "maker_refresh_start", "count": len(makers)})
+    prewarm_limit = max(14, min(60, int(MAKER_REFRESH_PREWARM_LIMIT or 60)))
+    cover_limit = max(0, min(prewarm_limit, int(MAKER_REFRESH_COVER_PREWARM_LIMIT or 0)))
+    app_log("info", "maker", "开始刷新常驻厂牌", {
+        "stage": "maker_refresh_start",
+        "count": len(makers),
+        "prewarm_limit": prewarm_limit,
+        "cover_limit": cover_limit,
+    })
     for maker in makers:
         name = str(maker.get("name") or "")
         url = str(maker.get("url") or "")
         try:
-            results = cached_listing(url, force_refresh=False, maker_name=name)
-            refreshed.append({"name": name, "url": url, "count": len(results)})
-            app_log("info", "maker", "厂牌刷新完成", {"stage": "maker_refresh_item_done", "name": name, "count": len(results)})
+            started_at = time.time()
+            results = cached_listing(url, limit=prewarm_limit, force_refresh=True, maker_name=name)
+            cover_cached = 0
+            cover_errors = 0
+            for item in results[:cover_limit]:
+                av_id = canonical_av_id(item.get("id")) if isinstance(item, dict) else ""
+                if not av_id:
+                    continue
+                try:
+                    before = get_subscription_service().get_asset_cache(av_id, "cover")
+                    prewarm_cover_asset(item)
+                    after = get_subscription_service().get_asset_cache(av_id, "cover")
+                    if after:
+                        cover_cached += 1
+                    elif before:
+                        cover_cached += 1
+                except Exception as exc:
+                    cover_errors += 1
+                    app_log("warning", "maker", "厂牌封面预热失败", {
+                        "stage": "maker_refresh_cover_error",
+                        "name": name,
+                        "av_id": av_id,
+                        "error": str(exc),
+                    })
+            cache_probe = cached_listing(url, limit=min(prewarm_limit, 15), force_refresh=False, maker_name=name)
+            elapsed = round(time.time() - started_at, 2)
+            item_result = {
+                "name": name,
+                "url": url,
+                "source_strategy": maker_listing_source_strategy(name, url),
+                "requested": prewarm_limit,
+                "cached_listing": len(results),
+                "first_screen_cache_ok": len(cache_probe) >= min(14, prewarm_limit),
+                "cover_checked": min(len(results), cover_limit),
+                "cover_cached": cover_cached,
+                "cover_errors": cover_errors,
+                "elapsed": elapsed,
+            }
+            refreshed.append(item_result)
+            app_log("info", "maker", "厂牌刷新完成", {"stage": "maker_refresh_item_done", **item_result})
         except Exception as exc:
             errors.append({"name": name, "error": str(exc)})
             app_log("error", "maker", "厂牌刷新失败", {"stage": "maker_refresh_item_error", "name": name, "error": str(exc)})
-    app_log("info", "maker", "常驻厂牌刷新完成", {"stage": "maker_refresh_done", "refreshed": len(refreshed), "errors": len(errors)})
-    return {"refreshed": refreshed, "errors": errors}
+    result = {
+        "refreshed": refreshed,
+        "errors": errors,
+        "maker_count": len(makers),
+        "refreshed_count": len(refreshed),
+        "error_count": len(errors),
+        "prewarm_limit": prewarm_limit,
+        "cover_limit": cover_limit,
+        "metadata_cache": get_subscription_service().metadata_cache_stats(),
+        "asset_cache": get_subscription_service().asset_cache_stats(),
+    }
+    app_log("info", "maker", "常驻厂牌刷新完成", {"stage": "maker_refresh_done", **result})
+    return result
 
 
 def freeze_released_asset_cache() -> dict[str, Any]:
@@ -4738,6 +5662,13 @@ def run_subscription_task(task_id: str, *, minute_key: str | None = None) -> dic
         else:
             raise HTTPException(status_code=404, detail="未知订阅任务")
     except Exception as exc:
+        failure_result = {
+            "status": "failed",
+            "task_id": task_id,
+            "error": str(exc),
+            "failed_at": "task",
+        }
+        service.mark_task_poll(task_id, minute_key, failure_result, status="failed")
         send_notification_event("task_failed", {
             "status": "failed",
             "title": "定时任务执行失败",
@@ -5566,18 +6497,8 @@ def add_torrent_to_qbittorrent(torrent_bytes: bytes, filename: str, config: dict
         data["category"] = str(config.get("category") or "")
     if config.get("tags"):
         data["tags"] = str(config.get("tags") or "")
-    with httpx.Client(timeout=30, follow_redirects=True) as client:
-        username = str(config.get("username") or "")
-        password = str(config.get("password") or "")
-        if username or password:
-            login = client.post(f"{base_url}/api/v2/auth/login", data={"username": username, "password": password})
-            login.raise_for_status()
-            login_text = login.text.strip()
-            if login_text and "Ok." not in login_text:
-                app_log("info", "qbittorrent", "qBittorrent 登录返回非标准文本，继续尝试添加种子", {
-                    "stage": "qb_login_nonstandard",
-                    "response": login_text[:120],
-                })
+
+    def operation(client: httpx.Client, _auth_method: str) -> dict[str, object]:
         category_result = ensure_qb_category(client, base_url, config)
         if info_hash:
             existing = client.get(f"{base_url}/api/v2/torrents/info", params={"hashes": info_hash})
@@ -5617,7 +6538,9 @@ def add_torrent_to_qbittorrent(torrent_bytes: bytes, filename: str, config: dict
                     }
             raise RuntimeError(f"qBittorrent 添加失败: {text}")
         label_result = ensure_qb_torrent_labels(client, base_url, info_hash, config) if info_hash else {"status": "skipped"}
-    return {"status": "ok", "message": "已发送到 qBittorrent", "hash": info_hash, "category_result": category_result, "label_result": label_result}
+        return {"status": "ok", "message": "已发送到 qBittorrent", "hash": info_hash, "category_result": category_result, "label_result": label_result}
+
+    return with_qbittorrent_client(base_url, config, operation, timeout=30)
 
 
 def ensure_qb_category(client: httpx.Client, base_url: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -5705,8 +6628,8 @@ def refresh_qb_torrent_status(row: dict[str, Any], task: dict[str, Any], qb_conf
         raise RuntimeError("未配置 qBittorrent Web UI 地址")
     torrent_hash = str(row.get("torrent_hash") or "")
     post = get_postprocess_service()
-    with httpx.Client(timeout=30, follow_redirects=True) as client:
-        login_qbittorrent(client, base_url, qb_config)
+
+    def operation(client: httpx.Client, _auth_method: str) -> dict[str, Any]:
         resp = client.get(f"{base_url}/api/v2/torrents/info", params={"hashes": torrent_hash})
         resp.raise_for_status()
         items = resp.json()
@@ -5783,14 +6706,75 @@ def refresh_qb_torrent_status(row: dict[str, Any], task: dict[str, Any], qb_conf
         })
         return {"torrent_hash": torrent_hash, "status": next_status, "input_path": picked["path"]}
 
+    return with_qbittorrent_client(base_url, qb_config, operation, timeout=30)
 
-def login_qbittorrent(client: httpx.Client, base_url: str, config: dict[str, Any]) -> None:
-    username = str(config.get("username") or "")
-    password = str(config.get("password") or "")
-    if not username and not password:
+
+def qb_auth_methods(config: dict[str, Any]) -> list[str]:
+    methods: list[str] = []
+    if str(config.get("api_key") or "").strip():
+        methods.append("api_key")
+    if str(config.get("username") or "").strip() or str(config.get("password") or ""):
+        methods.append("password")
+    if not methods:
+        methods.append("none")
+    return methods
+
+
+def apply_qbittorrent_auth(client: httpx.Client, base_url: str, config: dict[str, Any], method: str) -> None:
+    if method == "api_key":
+        api_key = str(config.get("api_key") or "").strip()
+        if api_key:
+            client.headers["Authorization"] = f"Bearer {api_key}"
         return
-    login = client.post(f"{base_url}/api/v2/auth/login", data={"username": username, "password": password})
-    login.raise_for_status()
+    if method == "password":
+        username = str(config.get("username") or "")
+        password = str(config.get("password") or "")
+        login = client.post(f"{base_url}/api/v2/auth/login", data={"username": username, "password": password})
+        login.raise_for_status()
+        login_text = login.text.strip()
+        if login_text and "Ok." not in login_text:
+            if any(token in login_text.lower() for token in ("fail", "forbidden", "unauthorized", "denied")):
+                raise RuntimeError(f"qBittorrent 账号密码登录失败: {login_text[:120]}")
+            app_log("info", "qbittorrent", "qBittorrent 登录返回非标准文本，继续尝试请求", {
+                "stage": "qb_login_nonstandard",
+                "response": login_text[:120],
+            })
+
+
+def qb_auth_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {401, 403}
+    text = str(exc).lower()
+    return "forbidden" in text or "unauthorized" in text or "login failed" in text
+
+
+def with_qbittorrent_client(
+    base_url: str,
+    config: dict[str, Any],
+    operation: Callable[[httpx.Client, str], Any],
+    *,
+    timeout: float = 30,
+) -> Any:
+    methods = qb_auth_methods(config)
+    last_exc: Exception | None = None
+    for index, method in enumerate(methods):
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                apply_qbittorrent_auth(client, base_url, config, method)
+                return operation(client, method)
+        except Exception as exc:
+            last_exc = exc
+            if index >= len(methods) - 1 or not qb_auth_error(exc):
+                raise
+            app_log("info", "qbittorrent", "qBittorrent 认证方式失败，切换下一种方式", {
+                "stage": "qb_auth_fallback",
+                "method": method,
+                "next_method": methods[index + 1],
+                "error": str(exc),
+            })
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("qBittorrent 请求未执行")
 
 
 def qb_torrent_files(client: httpx.Client, base_url: str, torrent_hash: str) -> list[dict[str, Any]]:
@@ -5942,7 +6926,7 @@ def build_postprocess_output_path(task: dict[str, Any], settings_payload: dict[s
         variant = ".chinese"
     elif task_type == "wash_4k":
         variant = ".4k"
-    output_dir = Path(str(settings_payload.get("output_dir") or "/压制")) / av_id
+    output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
     return str(output_dir / f"{av_id}{variant}.{codec}{suffix}")
 
 
@@ -5956,7 +6940,7 @@ def build_postprocess_original_output_path(task: dict[str, Any], settings_payloa
         variant = ".chinese"
     elif task_type == "wash_4k":
         variant = ".4k"
-    output_dir = Path(str(settings_payload.get("output_dir") or "/压制")) / av_id
+    output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
     return str(output_dir / f"{av_id}{variant}.original{suffix}")
 
 
@@ -5999,7 +6983,7 @@ def output_path_conflicts(path: str, task_id: str = "") -> bool:
 
 def ensure_managed_original_product(task: dict[str, Any], settings_payload: dict[str, Any], source_path: str) -> str:
     source = Path(source_path)
-    output_root = Path(str(settings_payload.get("output_dir") or "/压制"))
+    output_root = Path(str(settings_payload.get("output_dir") or "/media/压制"))
     configured_output = str(task.get("output_path") or "").strip()
     if configured_output:
         target = Path(configured_output)
@@ -6023,17 +7007,85 @@ def ensure_managed_subtitle_product(subtitle_path: str, product_path: str) -> st
     product = Path(product_path)
     if not subtitle.exists() or not product.exists():
         return subtitle_path
-    target = product.with_name(f"{product.stem}.zh{subtitle.suffix or '.srt'}")
+    target = product.with_suffix(subtitle.suffix or ".srt")
     try:
         if subtitle.resolve() == target.resolve():
             return str(subtitle)
     except OSError:
         pass
-    if target.exists():
-        target = Path(avoid_output_conflict(str(target), product.stem))
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(subtitle, target)
     return str(target)
+
+
+def subtitle_job_from_worker_result(worker_result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(worker_result, dict):
+        return {}
+    job = worker_result.get("subtitle_job")
+    return job if isinstance(job, dict) else {}
+
+
+def subtitle_artifact_candidates(worker_result: dict[str, Any] | None) -> list[Path]:
+    job = subtitle_job_from_worker_result(worker_result)
+    paths: list[Path] = []
+    for key in SUBTITLE_FILE_KINDS:
+        value = str(job.get(key) or "").strip()
+        if value:
+            paths.append(Path(rewrite_backend_path_to_console(value) or value))
+    return paths
+
+
+def ensure_managed_vtt_product(worker_result: dict[str, Any] | None, product_path: str) -> str:
+    job = subtitle_job_from_worker_result(worker_result)
+    vtt_path = str(job.get("translated_vtt") or job.get("original_vtt") or "").strip()
+    if not vtt_path:
+        return ""
+    return ensure_managed_subtitle_product(rewrite_backend_path_to_console(vtt_path) or vtt_path, product_path)
+
+
+def cleanup_postprocess_subtitle_artifacts(
+    product_path: str,
+    worker_result: dict[str, Any] | None,
+    keep_paths: list[str],
+) -> dict[str, Any]:
+    product = Path(product_path)
+    try:
+        product_dir = product.parent.resolve()
+    except OSError:
+        product_dir = product.parent
+    keep: set[str] = set()
+    for item in keep_paths:
+        if not item:
+            continue
+        try:
+            keep.add(str(Path(item).resolve()))
+        except OSError:
+            keep.add(str(Path(item)))
+    candidates: list[Path] = []
+    candidates.extend(subtitle_artifact_candidates(worker_result))
+    candidates.extend(product.parent.glob(f"{product.stem}.zh.*"))
+    candidates.extend(product.parent.glob(f"{product.stem}.bilingual.*"))
+    unique_candidates = list(dict.fromkeys(candidates))
+    cleanup_results: list[dict[str, object]] = []
+    media_dirs, trash_dir, data_dir = settings()
+    store = Storage(data_dir, trash_dir, media_dirs)
+    for candidate in unique_candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if str(resolved) in keep:
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        try:
+            if resolved.parent.resolve() != product_dir:
+                continue
+        except OSError:
+            continue
+        result = store.move_to_trash([MoveRequest(source=resolved)])[0]
+        cleanup_results.append(move_result_payload(result))
+    return {"checked": len(unique_candidates), "moved": cleanup_results}
 
 
 def dispatch_postprocess_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -6044,8 +7096,13 @@ def dispatch_postprocess_task(task: dict[str, Any]) -> dict[str, Any]:
     if not input_path:
         raise RuntimeError("任务缺少输入文件，不能派发到算力端")
     if bool(settings_payload.get("auto_transcode_enabled")):
+        transcode_settings = normalize_transcode_settings_payload({
+            **settings_payload,
+            "target_codec": task.get("target_codec") or settings_payload.get("target_codec"),
+        })
         output_path = str(task.get("output_path") or avoid_output_conflict(build_postprocess_output_path(task, settings_payload), task_id))
         remote_worker = bool(backend_url())
+        callback_url = require_remote_callback_url(task_id) if remote_worker else ""
         payload = {
             "task_id": task_id,
             "av_id": task.get("av_id", ""),
@@ -6053,10 +7110,17 @@ def dispatch_postprocess_task(task: dict[str, Any]) -> dict[str, Any]:
             "output_path": rewrite_proxy_path(output_path) if remote_worker else output_path,
             "console_input_path": input_path,
             "console_output_path": output_path,
-            "target_codec": settings_payload.get("target_codec"),
-            "crf": settings_payload.get("crf"),
-            "preset": settings_payload.get("preset"),
-            "callback_url": f"{subtitle_public_url()}/api/postprocess/tasks/{task_id}/worker-done" if remote_worker else "",
+            "target_codec": transcode_settings.get("target_codec"),
+            "target_encoder": transcode_settings.get("target_encoder"),
+            "crf": transcode_settings.get("crf"),
+            "preset": transcode_settings.get("preset"),
+            "preset_flag": transcode_settings.get("preset_flag"),
+            "ffmpeg_mode": transcode_settings.get("ffmpeg_mode"),
+            "ffmpeg_standard_enabled": transcode_settings.get("ffmpeg_standard_enabled"),
+            "ffmpeg_custom_enabled": transcode_settings.get("ffmpeg_custom_enabled"),
+            "ffmpeg_custom_template": transcode_settings.get("ffmpeg_custom_template"),
+            "ffmpeg_standard_command": build_ffmpeg_preview(transcode_settings),
+            "callback_url": callback_url,
             "callback_token": frontend_api_token() if remote_worker else "",
         }
         if remote_worker:
@@ -6077,7 +7141,8 @@ def dispatch_postprocess_task(task: dict[str, Any]) -> dict[str, Any]:
             "worker_job_id": worker_job_id,
             "input_path": input_path,
             "output_path": output_path,
-            "target_codec": settings_payload.get("target_codec"),
+            "target_codec": transcode_settings.get("target_codec"),
+            "target_encoder": transcode_settings.get("target_encoder"),
         })
         if not remote_worker:
             start_transcode_job(worker_job_id)
@@ -6395,11 +7460,11 @@ def try_unraid_postprocess_fast_move(
 
 def validate_managed_version_trashable(version: dict[str, Any], settings_payload: dict[str, Any]) -> dict[str, Any]:
     source = Path(str(version.get("path") or ""))
-    output_root = Path(str(settings_payload.get("output_dir") or "/压制"))
+    output_root = Path(str(settings_payload.get("output_dir") or "/media/压制"))
     if str(version.get("generated_by") or "") != "moviemuse":
         raise RuntimeError("旧版本不是 MovieMuse 托管版本，拒绝移动")
     if not path_under(source, output_root):
-        raise RuntimeError("旧版本路径不在 /压制 托管目录，拒绝移动")
+        raise RuntimeError("旧版本路径不在托管输出目录，拒绝移动")
     if not source.exists() or not source.is_file():
         raise RuntimeError("旧版本文件不存在，拒绝移动")
     recorded_size = int(version.get("file_size") or 0)
@@ -6461,7 +7526,7 @@ def move_postprocess_source_to_trash(task: dict[str, Any], product_path: str, se
             return None
     except OSError:
         return None
-    download_root = Path(str(settings_payload.get("download_dir") or "/study3"))
+    download_root = Path(str(settings_payload.get("download_dir") or "/media/study3"))
     if not path_under(source, download_root):
         raise RuntimeError("源文件不在后处理下载目录内，拒绝自动清理")
     if not source.exists() or not source.is_file():
@@ -6535,7 +7600,7 @@ def validate_and_activate_postprocess_task(
         source_product = chosen_output or input_source
         if chosen_output and not Path(chosen_output).exists() and input_source and Path(input_source).exists():
             source_product = input_source
-        output_root = Path(str(settings_payload.get("output_dir") or "/压制"))
+        output_root = Path(str(settings_payload.get("output_dir") or "/media/压制"))
         if path_under(Path(source_product), output_root):
             product_path = source_product
         else:
@@ -6577,6 +7642,16 @@ def validate_and_activate_postprocess_task(
                 subtitle_path = managed_subtitle_path
                 subtitle_validation = validate_subtitle_output(subtitle_path, video_path=product_path)
                 post.add_event(task_id, "info", "subtitle_managed", "中文字幕已复制到最终视频目录", subtitle_validation)
+            managed_vtt_path = ensure_managed_vtt_product(worker_result, product_path)
+            if managed_vtt_path:
+                post.add_event(task_id, "info", "subtitle_vtt_managed", "VTT 字幕已整理到最终视频目录", {"path": managed_vtt_path})
+            cleanup_payload = cleanup_postprocess_subtitle_artifacts(
+                product_path,
+                worker_result,
+                [subtitle_path, managed_vtt_path],
+            )
+            if cleanup_payload.get("moved"):
+                post.add_event(task_id, "info", "subtitle_artifacts_cleaned", "字幕中间文件已移动到 trash", cleanup_payload)
     source_type = str(task.get("task_type") or "subscription")
     version_codec = (
         str(task.get("target_codec") or settings_payload.get("target_codec") or "")
@@ -7238,15 +8313,43 @@ def api_run_postprocess_task(task_id: str) -> dict[str, object]:
     return dispatch_postprocess_task(task)
 
 
+def reset_postprocess_task_for_retry(task: dict[str, Any]) -> str:
+    post = get_postprocess_service()
+    task_id = str(task.get("id") or "")
+    input_path = str(task.get("input_path") or "").strip()
+    torrent_hash = str(task.get("torrent_hash") or "").strip()
+    if input_path:
+        post.update_task(task_id, status="ready_to_run", error_code="", error_message="")
+        return "ready_to_run"
+    if torrent_hash:
+        qb_row = post.get_qb_torrent(torrent_hash)
+        qb_progress = float((qb_row or {}).get("progress") or 0)
+        qb_status = "downloading" if qb_progress > 0 else "torrent_pushed"
+        post.update_qb_torrent(torrent_hash, status=qb_status)
+        post.update_task(task_id, status=qb_status, error_code="", error_message="")
+        post.add_event(task_id, "info", "retry_waiting_qb", "任务缺少输入文件，已恢复 qB 轮询等待回写路径", {
+            "torrent_hash": torrent_hash,
+            "qb_status": qb_status,
+            "qb_progress": qb_progress,
+        })
+        return qb_status
+    post.update_task(task_id, status="ready_to_run", error_code="", error_message="")
+    return "ready_to_run"
+
+
 @app.post("/api/postprocess/tasks/{task_id}/retry")
 def api_retry_postprocess_task(task_id: str) -> dict[str, object]:
     post = get_postprocess_service()
     task = post.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="后处理任务不存在")
-    updated = post.update_task(task_id, status="ready_to_run", error_code="", error_message="")
-    post.add_event(task_id, "info", "task_retry", "用户手动重试后处理任务", {"previous_status": task.get("status", "")})
-    return {"status": "ready_to_run", "task": updated}
+    next_status = reset_postprocess_task_for_retry(task)
+    updated = post.get_task(task_id) or post.update_task(task_id, status=next_status, error_code="", error_message="")
+    post.add_event(task_id, "info", "task_retry", "用户手动重试后处理任务", {
+        "previous_status": task.get("status", ""),
+        "next_status": next_status,
+    })
+    return {"status": next_status, "task": updated}
 
 
 @app.post("/api/postprocess/tasks/{task_id}/cancel")
@@ -7336,6 +8439,8 @@ async def api_update_postprocess_settings(request: Request) -> dict[str, object]
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="设置内容必须是对象")
+    if "target_codec" in payload or "target_encoder" in payload:
+        payload = normalize_transcode_settings_payload(payload)
     settings_payload = get_postprocess_service().update_settings(payload)
     app_log("info", "postprocess", "后处理设置已保存", {
         "stage": "postprocess_settings_saved",
@@ -7346,9 +8451,62 @@ async def api_update_postprocess_settings(request: Request) -> dict[str, object]
     return {"settings": settings_payload}
 
 
+@app.post("/api/postprocess/ffmpeg-settings/apply")
+async def api_apply_postprocess_ffmpeg_settings(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="FFmpeg 设置内容必须是对象")
+    payload = normalize_transcode_settings_payload(payload)
+    settings_payload = get_postprocess_service().update_settings(payload)
+    ffmpeg_payload = {
+        "target_codec": settings_payload.get("target_codec"),
+        "target_encoder": settings_payload.get("target_encoder"),
+        "crf": settings_payload.get("crf"),
+        "preset": settings_payload.get("preset"),
+        "preset_flag": settings_payload.get("preset_flag"),
+        "ffmpeg_mode": settings_payload.get("ffmpeg_mode"),
+        "ffmpeg_standard_enabled": settings_payload.get("ffmpeg_standard_enabled"),
+        "ffmpeg_custom_enabled": settings_payload.get("ffmpeg_custom_enabled"),
+        "ffmpeg_custom_template": settings_payload.get("ffmpeg_custom_template"),
+        "ffmpeg_standard_command": build_ffmpeg_preview(settings_payload),
+    }
+    remote_result: dict[str, Any] | None = None
+    warning = ""
+    if backend_url():
+        try:
+            remote_result = remote_post_json("/api/transcode/settings", ffmpeg_payload, timeout=30)
+        except HTTPException as exc:
+            warning = f"FFmpeg 设置已保存到控制台，但暂时无法同步算力端: {exc.detail}"
+    app_log("info", "postprocess", "FFmpeg 设置已应用", {
+        "stage": "ffmpeg_settings_applied",
+        "target_codec": settings_payload.get("target_codec"),
+        "preset": settings_payload.get("preset"),
+        "ffmpeg_custom_enabled": settings_payload.get("ffmpeg_custom_enabled"),
+        "synced": bool(remote_result),
+    })
+    return {
+        "status": "ok",
+        "settings": settings_payload,
+        "ffmpeg": ffmpeg_payload,
+        "remote": remote_result,
+        "warning": warning,
+    }
+
+
 @app.post("/api/postprocess/queue/run")
 def api_run_postprocess_queue() -> dict[str, object]:
     return run_postprocess_queue()
+
+
+@app.post("/api/postprocess/tasks/run-selected")
+async def api_run_selected_postprocess_tasks(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求内容必须是对象")
+    task_ids = payload.get("task_ids")
+    if not isinstance(task_ids, list):
+        raise HTTPException(status_code=400, detail="task_ids 必须是数组")
+    return run_selected_postprocess_tasks([str(item) for item in task_ids if str(item or "").strip()])
 
 
 WORKER_ACTIVE_TASK_STATUSES = {
@@ -7362,6 +8520,55 @@ WORKER_ACTIVE_TASK_STATUSES = {
 }
 
 
+def worker_transcode_job_ids(worker_status: dict[str, Any]) -> set[str]:
+    transcode_jobs_info = worker_status.get("transcode_jobs") if isinstance(worker_status, dict) else {}
+    items = transcode_jobs_info.get("items", []) if isinstance(transcode_jobs_info, dict) else []
+    ids: set[str] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("id"):
+            ids.add(str(item.get("id")))
+        if item.get("task_id"):
+            ids.add(str(item.get("task_id")))
+    return ids
+
+
+def recover_missing_worker_jobs(worker_status: dict[str, Any]) -> list[dict[str, Any]]:
+    if not backend_url() or not bool(worker_status.get("online") or worker_status.get("status") == "ok"):
+        return []
+    known_ids = worker_transcode_job_ids(worker_status)
+    transcode_info = worker_status.get("transcode_jobs") if isinstance(worker_status, dict) else {}
+    total = int((transcode_info or {}).get("total") or 0) if isinstance(transcode_info, dict) else 0
+    if total and not known_ids:
+        return []
+    grace_seconds = max(10, int(os.getenv("POSTPROCESS_WORKER_MISSING_GRACE_SECONDS", "60")))
+    now = time.time()
+    post = get_postprocess_service()
+    recovered: list[dict[str, Any]] = []
+    for task in post.list_tasks(statuses=["sent_to_worker", "transcoding"], limit=500):
+        data = task.get("data") if isinstance(task.get("data"), dict) else {}
+        worker_result = data.get("worker_result") if isinstance(data.get("worker_result"), dict) else {}
+        worker_job_id = str(data.get("worker_job_id") or worker_result.get("job_id") or "")
+        age = now - float(task.get("updated_at") or task.get("created_at") or 0)
+        if not worker_job_id or worker_job_id in known_ids or age < grace_seconds:
+            continue
+        post.update_task(
+            str(task["id"]),
+            status="ready_to_run",
+            error_code="worker_job_missing",
+            error_message="算力端重启或任务丢失，已退回队列等待重新派发",
+            data={"worker_job_id": "", "worker_result": {}, "worker_missing_job_id": worker_job_id},
+        )
+        post.add_event(str(task["id"]), "warning", "worker_job_missing", "算力端找不到已派发的转码任务，已退回队列", {
+            "worker_job_id": worker_job_id,
+            "age_seconds": round(age, 1),
+            "worker_transcode_total": total,
+        })
+        recovered.append({"task_id": str(task["id"]), "status": "ready_to_run", "missing_worker_job_id": worker_job_id})
+    return recovered
+
+
 def active_postprocess_worker_count() -> int:
     return len(get_postprocess_service().list_tasks(statuses=sorted(WORKER_ACTIVE_TASK_STATUSES), limit=500))
 
@@ -7370,6 +8577,145 @@ def postprocess_task_needs_worker(task: dict[str, Any], settings_payload: dict[s
     if bool(settings_payload.get("auto_transcode_enabled")):
         return True
     return bool(settings_payload.get("auto_subtitle_enabled")) and bool(task.get("needs_subtitle"))
+
+
+RUNNABLE_POSTPROCESS_STATUSES = {"waiting_worker", "ready_to_run"}
+
+
+def hold_postprocess_tasks_missing_input(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    runnable: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = []
+    for task in tasks:
+        if str(task.get("input_path") or "").strip():
+            runnable.append(task)
+            continue
+        torrent_hash = str(task.get("torrent_hash") or "").strip()
+        if not torrent_hash:
+            runnable.append(task)
+            continue
+        next_status = reset_postprocess_task_for_retry(task)
+        held.append({
+            "task_id": str(task.get("id") or ""),
+            "status": next_status,
+            "reason": "missing_input_waiting_qb",
+            "torrent_hash": torrent_hash,
+        })
+    return runnable, held
+
+
+def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
+    post = get_postprocess_service()
+    settings_payload = post.get_settings()
+    unique_ids = list(dict.fromkeys(str(item or "").strip() for item in task_ids if str(item or "").strip()))
+    worker_status = subtitle_backend_status()
+    online = bool(worker_status.get("online") or worker_status.get("status") == "ok")
+    recovered_missing = recover_missing_worker_jobs(worker_status) if online else []
+    tasks: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for task_id in unique_ids:
+        task = post.get_task(task_id)
+        if not task:
+            skipped.append({"task_id": task_id, "reason": "not_found"})
+            continue
+        status = str(task.get("status") or "")
+        if status not in RUNNABLE_POSTPROCESS_STATUSES:
+            skipped.append({"task_id": task_id, "status": status, "reason": "not_runnable"})
+            continue
+        tasks.append(task)
+
+    tasks, held_missing_input = hold_postprocess_tasks_missing_input(tasks)
+    local_candidates = [task for task in tasks if not postprocess_task_needs_worker(task, settings_payload)]
+    worker_candidates = [task for task in tasks if postprocess_task_needs_worker(task, settings_payload)]
+    updated: list[dict[str, Any]] = []
+    for task in local_candidates:
+        try:
+            updated.append(dispatch_postprocess_task(task))
+        except Exception as exc:
+            message = str(exc)
+            post.update_task(str(task["id"]), status="ready_to_run", error_code="local_postprocess_failed", error_message=message)
+            post.add_event(str(task["id"]), "error", "local_postprocess_failed", "批量运行本地后处理失败，任务保留可重试", {"error": message})
+            updated.append({"task_id": task["id"], "status": "ready_to_run", "error": message})
+
+    if not online:
+        for task in worker_candidates:
+            post.update_task(str(task["id"]), status="waiting_worker", error_code="", error_message="")
+            post.add_event(str(task["id"]), "info", "worker_offline", "算力端离线，批量运行已保留在等待队列", {"worker_status": worker_status})
+        return {
+            "status": "waiting_worker" if worker_candidates else "dispatched",
+            "selected": len(unique_ids),
+            "runnable": len(tasks),
+            "updated": len(updated),
+            "waiting": len(worker_candidates),
+            "held": held_missing_input,
+            "skipped": skipped,
+            "recovered_missing": recovered_missing,
+            "worker_status": worker_status,
+            "tasks": updated,
+        }
+
+    max_concurrency = max(1, min(8, int(settings_payload.get("max_concurrency") or 1)))
+    active_count = active_postprocess_worker_count()
+    available_slots = max(0, max_concurrency - active_count)
+    if available_slots <= 0:
+        for task in worker_candidates:
+            if task.get("status") == "waiting_worker":
+                post.update_task(str(task["id"]), status="ready_to_run", error_code="", error_message="")
+            post.add_event(str(task["id"]), "info", "worker_concurrency_full", "后处理并发已满，选中任务保留在可执行队列", {
+                "max_concurrency": max_concurrency,
+                "active_count": active_count,
+            })
+        return {
+            "status": "concurrency_full",
+            "selected": len(unique_ids),
+            "runnable": len(tasks),
+            "updated": len(updated),
+            "queued": len(worker_candidates),
+            "held": held_missing_input,
+            "skipped": skipped,
+            "recovered_missing": recovered_missing,
+            "max_concurrency": max_concurrency,
+            "active_count": active_count,
+            "worker_status": worker_status,
+            "tasks": updated,
+        }
+
+    deferred = max(0, len(worker_candidates) - available_slots)
+    for task in worker_candidates[:available_slots]:
+        try:
+            updated.append(dispatch_postprocess_task(task))
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            message = f"算力端接口返回 {status_code}: {exc.response.text[:200] if exc.response is not None else exc}"
+            post.update_task(str(task["id"]), status="ready_to_run", error_code="worker_dispatch_failed", error_message=message)
+            post.add_event(str(task["id"]), "error", "worker_dispatch_failed", "批量运行派发失败，任务保留可重试", {"error": message})
+            updated.append({"task_id": task["id"], "status": "ready_to_run", "error": message})
+        except Exception as exc:
+            message = str(exc)
+            post.update_task(str(task["id"]), status="waiting_worker", error_code="worker_dispatch_failed", error_message=message)
+            post.add_event(str(task["id"]), "error", "worker_dispatch_failed", "批量运行派发失败，任务退回等待队列", {"error": message})
+            updated.append({"task_id": task["id"], "status": "waiting_worker", "error": message})
+    for task in worker_candidates[available_slots:]:
+        if task.get("status") == "waiting_worker":
+            post.update_task(str(task["id"]), status="ready_to_run", error_code="", error_message="")
+        post.add_event(str(task["id"]), "info", "worker_concurrency_deferred", "后处理并发槽位不足，选中任务保留在可执行队列", {
+            "max_concurrency": max_concurrency,
+            "active_count": active_count,
+            "available_slots": available_slots,
+        })
+    return {
+        "status": "dispatched",
+        "selected": len(unique_ids),
+        "runnable": len(tasks),
+        "updated": len(updated),
+        "deferred": deferred,
+        "held": held_missing_input,
+        "skipped": skipped,
+        "recovered_missing": recovered_missing,
+        "max_concurrency": max_concurrency,
+        "active_count": active_count,
+        "worker_status": worker_status,
+        "tasks": updated,
+    }
 
 
 def wash_mode_from_task_type(task_type: str) -> str:
@@ -7400,10 +8746,12 @@ def run_postprocess_queue() -> dict[str, object]:
     settings_payload = post.get_settings()
     worker_status = subtitle_backend_status()
     online = bool(worker_status.get("online") or worker_status.get("status") == "ok")
+    recovered_missing = recover_missing_worker_jobs(worker_status) if online else []
     candidates = sorted(
         post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=200),
         key=lambda item: float(item.get("created_at") or 0),
     )
+    candidates, held_missing_input = hold_postprocess_tasks_missing_input(candidates)
     local_candidates = [task for task in candidates if not postprocess_task_needs_worker(task, settings_payload)]
     worker_candidates = [task for task in candidates if postprocess_task_needs_worker(task, settings_payload)]
     updated: list[dict[str, Any]] = []
@@ -7423,6 +8771,8 @@ def run_postprocess_queue() -> dict[str, object]:
             "status": "waiting_worker" if worker_candidates else "dispatched",
             "updated": len(updated),
             "waiting": len(worker_candidates),
+            "held": held_missing_input,
+            "recovered_missing": recovered_missing,
             "worker_status": worker_status,
             "tasks": updated,
         }
@@ -7442,6 +8792,8 @@ def run_postprocess_queue() -> dict[str, object]:
             "status": "concurrency_full",
             "updated": len(updated),
             "queued": len(worker_candidates),
+            "held": held_missing_input,
+            "recovered_missing": recovered_missing,
             "max_concurrency": max_concurrency,
             "active_count": active_count,
             "worker_status": worker_status,
@@ -7476,6 +8828,8 @@ def run_postprocess_queue() -> dict[str, object]:
         "status": "dispatched",
         "updated": len(updated),
         "deferred": deferred,
+        "held": held_missing_input,
+        "recovered_missing": recovered_missing,
         "max_concurrency": max_concurrency,
         "active_count": active_count,
         "tasks": updated,
@@ -7621,7 +8975,7 @@ def api_search_subscriptions(q: str = "", type: str = "av", include_mteam: bool 
         mteam = search_mteam(q.strip(), get_system_settings_service().get()) if include_mteam else None
         search_type = "actress" if type == "actress" else "av"
         results = cached_subscription_search(q.strip(), search_type)
-        if not results and is_access_ban_error(javdb.stats().get("last_error")):
+        if javdb_source_enabled() and not results and is_access_ban_error(javdb.stats().get("last_error")):
             target = "女优" if search_type == "actress" else "番号"
             return {"status": "error", "message": f"JavDB 当前访问被限制，DMM 预售数据源也没有找到该{target}。请暂停抓取或更换代理后再试。", "results": [], "type": search_type, "mteam": mteam}
         return {"results": results, "type": search_type, "mteam": mteam}
@@ -7631,26 +8985,27 @@ def api_search_subscriptions(q: str = "", type: str = "av", include_mteam: bool 
 
 
 @app.post("/api/subscriptions/av")
-async def api_subscribe_av(request: Request) -> dict[str, object]:
+async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) -> dict[str, object]:
     """订阅番号"""
     payload = await request.json()
     if not isinstance(payload, dict) or not payload.get("id"):
         raise HTTPException(status_code=400, detail="番号信息格式不正确")
     payload["id"] = canonical_av_id(payload.get("id"))
     app_log("info", "subscription", "开始订阅番号", {"stage": "subscribe_start", "av_id": payload.get("id")})
-    payload = prepare_subscription_av_payload(payload)
+    payload = prepare_subscription_av_payload(payload, allow_live_detail=False)
     verification = actor_limit_verification(payload, context="manual_subscribe")
     if not verification["ok"]:
         raise HTTPException(status_code=400, detail=verification["reason"] or f"该番号超过全局 {GLOBAL_MAX_COACTORS} 人共演限制，已自动过滤")
     payload = verification["payload"]
-    apply_jellyfin_status(payload)
+    if not payload.get("download_status"):
+        payload["download_status"] = "queued"
+    if not payload.get("download_message"):
+        payload["download_message"] = "已加入订阅，后台检查 Jellyfin 与 MTeam"
     service = get_subscription_service()
     result = service.subscribe_av(payload)
-    download_result = {"status": "skipped", "message": ""}
+    download_result = {"status": "queued", "message": "后台检查 Jellyfin 与 MTeam"}
     if result.get("status") != "in_library":
-        download_result = download_av_from_mteam(result)
-        latest = next((item for item in service.get_subscribed_av() if item.get("id") == result.get("id")), result)
-        result = latest
+        background_tasks.add_task(background_download_subscription_av, str(result.get("id") or ""))
     send_notification_event("av_subscribed", {
         "status": result.get("status") or "subscribed",
         "title": str(result.get("title") or result.get("id") or ""),
@@ -7665,7 +9020,7 @@ async def api_subscribe_av(request: Request) -> dict[str, object]:
             "av_id": result.get("id", ""),
             "path": result.get("jellyfin_path", ""),
         })
-    app_log("info", "subscription", "订阅番号完成", {"stage": "subscribe_done", "av_id": result.get("id"), "status": result.get("status"), "download_status": download_result.get("status")})
+    app_log("info", "subscription", "订阅番号已写入，后台检查已入队", {"stage": "subscribe_queued", "av_id": result.get("id"), "status": result.get("status"), "download_status": download_result.get("status")})
     return {"status": "ok", "subscription": result, "download": download_result}
 
 
@@ -7932,25 +9287,245 @@ def hydrate_actress_subscriptions(items: list[dict[str, Any]]) -> list[dict[str,
     return hydrated
 
 
+def actor_identity_public_record(payload: dict[str, Any], *, origin: str, cache_key: str = "") -> dict[str, Any]:
+    data = normalize_image_fields(dict(payload or {}))
+    canonical_id = str(actor_identity_canonical_id(data) or data.get("canonical_id") or "").strip()
+    aliases = normalize_alias_list(data.get("aliases"))
+    display_name = str(data.get("display_name") or data.get("name") or data.get("dmm_name") or data.get("id") or "").strip()
+    return {
+        "canonical_id": canonical_id,
+        "cache_key": cache_key,
+        "origin": origin,
+        "manual": bool(data.get("manual") or origin == "manual"),
+        "locked": bool(data.get("locked")),
+        "id": str(data.get("id") or data.get("javdb_id") or display_name).strip(),
+        "display_name": display_name,
+        "name": str(data.get("name") or display_name).strip(),
+        "aliases": aliases,
+        "preferred_source": str(data.get("preferred_source") or "").strip(),
+        "source": str(data.get("source") or "").strip(),
+        "source_chain": source_chain_for_item(data),
+        "javdb_id": str(data.get("javdb_id") or "").strip(),
+        "dmm_name": str(data.get("dmm_name") or "").strip(),
+        "dmm_url": str(data.get("dmm_url") or "").strip(),
+        "javlibrary_star_id": str(data.get("javlibrary_star_id") or data.get("star_id") or "").strip(),
+        "cover": str(data.get("cover") or "").strip(),
+        "latest_cover": str(data.get("latest_cover") or "").strip(),
+        "latest_av_id": str(data.get("latest_av_id") or "").strip(),
+        "latest_title": str(data.get("latest_title") or "").strip(),
+        "latest_date": str(data.get("latest_date") or "").strip(),
+        "match_reason": str(data.get("match_reason") or "").strip(),
+        "confidence": str(data.get("confidence") or "").strip(),
+        "updated_at": float(data.get("updated_at") or 0),
+    }
+
+
+def actor_identity_group_keys(record: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    canonical_id = str(record.get("canonical_id") or "").strip().lower()
+    if canonical_id:
+        keys.add(f"canonical:{canonical_id}")
+    javdb_id = str(record.get("javdb_id") or "").strip().lower()
+    if javdb_id:
+        keys.add(f"javdb:{javdb_id}")
+    javlibrary_star_id = str(record.get("javlibrary_star_id") or "").strip().lower()
+    if javlibrary_star_id:
+        keys.add(f"javlibrary:{javlibrary_star_id}")
+    dmm_url = str(record.get("dmm_url") or "").strip()
+    if dmm_url:
+        keys.add(f"dmm_url:{hashlib.sha256(dmm_url.encode('utf-8')).hexdigest()}")
+    for value in [
+        record.get("display_name"),
+        record.get("name"),
+        record.get("dmm_name"),
+        record.get("id"),
+        *(record.get("aliases") or []),
+    ]:
+        normalized = normalized_person_name(value)
+        if normalized:
+            keys.add(f"name:{normalized}")
+    return keys
+
+
+def merge_actor_identity_public_records(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    if incoming.get("manual") and not result.get("manual"):
+        result = {**incoming, "related": result.get("related", [])}
+    for field in ("javdb_id", "dmm_name", "dmm_url", "javlibrary_star_id", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date"):
+        if not result.get(field) and incoming.get(field):
+            result[field] = incoming.get(field)
+    if incoming.get("manual"):
+        result["manual"] = True
+        result["locked"] = bool(incoming.get("locked"))
+        result["preferred_source"] = incoming.get("preferred_source") or result.get("preferred_source", "")
+    aliases = normalize_alias_list([*(result.get("aliases") or []), *(incoming.get("aliases") or []), incoming.get("display_name"), incoming.get("name"), incoming.get("dmm_name")])
+    result["aliases"] = aliases
+    chain = []
+    for item in [*(result.get("source_chain") or []), *(incoming.get("source_chain") or [])]:
+        if item and item not in chain:
+            chain.append(item)
+    result["source_chain"] = chain
+    related = result.setdefault("related", [])
+    if incoming.get("cache_key") and incoming.get("cache_key") not in {row.get("cache_key") for row in related if isinstance(row, dict)}:
+        related.append({"origin": incoming.get("origin"), "cache_key": incoming.get("cache_key")})
+    result["updated_at"] = max(float(result.get("updated_at") or 0), float(incoming.get("updated_at") or 0))
+    return result
+
+
+def list_actor_identity_records(query: str = "", limit: int = 300) -> list[dict[str, Any]]:
+    service = get_subscription_service()
+    records: dict[str, dict[str, Any]] = {}
+    key_index: dict[str, str] = {}
+
+    def add(record: dict[str, Any]) -> None:
+        key = str(record.get("canonical_id") or actor_identity_canonical_id(record) or record.get("cache_key") or "").strip()
+        if not key:
+            return
+        group_keys = actor_identity_group_keys(record)
+        candidate_ids = [key_index[group_key] for group_key in group_keys if group_key in key_index and key_index[group_key] in records]
+        if key in records:
+            candidate_ids.append(key)
+        if not candidate_ids:
+            records[key] = record
+            for group_key in group_keys:
+                key_index[group_key] = key
+            return
+        primary = candidate_ids[0]
+        merged = records.get(primary, {})
+        for candidate in list(dict.fromkeys(candidate_ids[1:])):
+            merged = merge_actor_identity_public_records(merged, records.pop(candidate))
+            for index_key, index_value in list(key_index.items()):
+                if index_value == candidate:
+                    key_index[index_key] = primary
+        merged = merge_actor_identity_public_records(merged, record)
+        records[primary] = merged
+        for group_key in actor_identity_group_keys(merged) | group_keys:
+            key_index[group_key] = primary
+
+    for row in service.list_metadata_cache("actor_identity", limit=50000):
+        data = row.get("data") if isinstance(row, dict) else {}
+        if isinstance(data, dict):
+            add(actor_identity_public_record(data, origin="auto", cache_key=str(row.get("cache_key") or "")))
+
+    for actress in service.get_subscribed_actresses():
+        if isinstance(actress, dict):
+            add(actor_identity_public_record({**actress, "manual": False, "source": actress.get("source") or "subscription"}, origin="subscription", cache_key=f"subscription:{actress.get('id', '')}"))
+
+    for row in service.list_metadata_cache("actor_identity_manual", limit=50000):
+        data = row.get("data") if isinstance(row, dict) else {}
+        if isinstance(data, dict):
+            add(actor_identity_public_record(data, origin="manual", cache_key=str(row.get("cache_key") or "")))
+
+    values = list(records.values())
+    needle = normalized_person_name(query)
+    if needle:
+        values = [
+            item for item in values
+            if any(needle in normalized_person_name(value) for value in [
+                item.get("display_name"), item.get("name"), item.get("dmm_name"), item.get("javdb_id"), item.get("javlibrary_star_id"), *(item.get("aliases") or [])
+            ])
+        ]
+    values.sort(key=lambda item: (1 if item.get("manual") else 0, float(item.get("updated_at") or 0), str(item.get("display_name") or "")), reverse=True)
+    return values[: max(1, min(1000, int(limit or 300)))]
+
+
+def merge_manual_actor_identity(payload: dict[str, Any]) -> dict[str, Any]:
+    target = payload.get("target") if isinstance(payload.get("target"), dict) else payload
+    source_ids = payload.get("source_ids") if isinstance(payload.get("source_ids"), list) else []
+    source_records = [
+        item for item in list_actor_identity_records(limit=1000)
+        if str(item.get("canonical_id") or "") in {str(value) for value in source_ids}
+    ]
+    merged = dict(target or {})
+    for source in source_records:
+        for field in ("javdb_id", "dmm_name", "dmm_url", "javlibrary_star_id", "cover", "latest_cover", "latest_av_id", "latest_title", "latest_date"):
+            if not merged.get(field) and source.get(field):
+                merged[field] = source.get(field)
+        merged["aliases"] = normalize_alias_list([*(merged.get("aliases") or []), *(source.get("aliases") or []), source.get("display_name"), source.get("name"), source.get("dmm_name")])
+    return save_manual_actor_identity(merged)
+
+
+@app.get("/api/subscriptions/actor-identities")
+def api_list_actor_identities(q: str = "", limit: int = 300) -> dict[str, object]:
+    return {"status": "ok", "identities": list_actor_identity_records(q, limit)}
+
+
+@app.post("/api/subscriptions/actor-identities")
+async def api_save_actor_identity(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="身份锚点格式不正确")
+    try:
+        identity = save_manual_actor_identity(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", "identity": actor_identity_public_record(identity, origin="manual")}
+
+
+@app.post("/api/subscriptions/actor-identities/merge")
+async def api_merge_actor_identity(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="身份合并格式不正确")
+    try:
+        identity = merge_manual_actor_identity(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", "identity": actor_identity_public_record(identity, origin="manual")}
+
+
+@app.post("/api/subscriptions/actor-identities/delete-alias")
+async def api_delete_actor_identity_alias(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求格式不正确")
+    canonical_id = str(payload.get("canonical_id") or "").strip()
+    alias = str(payload.get("alias") or "").strip()
+    if not canonical_id or not alias:
+        raise HTTPException(status_code=400, detail="缺少 canonical_id 或 alias")
+    current = next((item for item in list_actor_identity_records(limit=1000) if str(item.get("canonical_id") or "") == canonical_id), None)
+    if not current:
+        raise HTTPException(status_code=404, detail="身份锚点不存在")
+    alias_key = normalized_person_name(alias)
+    current["aliases"] = [item for item in current.get("aliases") or [] if normalized_person_name(item) != alias_key]
+    identity = save_manual_actor_identity(current)
+    return {"status": "ok", "identity": actor_identity_public_record(identity, origin="manual")}
+
+
+@app.delete("/api/subscriptions/actor-identities/{canonical_id}")
+def api_delete_actor_identity(canonical_id: str) -> dict[str, object]:
+    target = str(canonical_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="缺少 canonical_id")
+    service = get_subscription_service()
+    removed = 0
+    for row in service.list_metadata_cache("actor_identity_manual", limit=50000):
+        data = row.get("data") if isinstance(row, dict) else {}
+        if isinstance(data, dict) and str(data.get("canonical_id") or "").strip() == target:
+            if service.delete_metadata_cache("actor_identity_manual", str(row.get("cache_key") or "")):
+                removed += 1
+    if not removed:
+        raise HTTPException(status_code=404, detail="人工身份锚点不存在")
+    return {"status": "ok", "removed": removed}
+
+
 @app.post("/api/subscriptions/actress")
-async def api_subscribe_actress(request: Request) -> dict[str, object]:
+async def api_subscribe_actress(request: Request, background_tasks: BackgroundTasks) -> dict[str, object]:
     """订阅女优"""
     payload = await request.json()
     if not isinstance(payload, dict) or not payload.get("id"):
         raise HTTPException(status_code=400, detail="女优信息格式不正确")
     service = get_subscription_service()
-    payload = enriched_actress_payload(payload)
+    payload = cached_only_enriched_actress_payload(payload)
     result = service.subscribe_actress(payload)
     remember_actor_identity(result, match_reason=str(result.get("match_reason") or "subscribed_actor"), confidence=str(result.get("confidence") or "medium"))
     app_log("info", "subscription", "订阅女优", {"actress_id": result.get("id"), "name": result.get("name"), "since_date": result.get("since_date")})
-    latest = subscribe_latest_for_actress(result, future_only=True)
-    app_log("info", "subscription", "订阅女优并扫描未发售番号完成", {
-        "stage": "actress_subscribe_done",
+    background_tasks.add_task(background_enrich_and_subscribe_latest_actress, str(result.get("id") or ""), future_only=True, download=True)
+    latest = {"status": "queued", "message": "后台补全身份并扫描未发售番号", "added": [], "skipped": [], "errors": []}
+    app_log("info", "subscription", "订阅女优已写入，后台扫描已入队", {
+        "stage": "actress_subscribe_queued",
         "actress_id": result.get("id"),
         "name": result.get("name"),
-        "added": len(latest.get("added") or []),
-        "skipped": len(latest.get("skipped") or []),
-        "errors": len(latest.get("errors") or []),
     })
     return {"status": "ok", "subscription": result, "latest": latest}
 
@@ -7969,12 +9544,13 @@ async def api_update_actress_subscription(actress_id: str, request: Request) -> 
 
 
 @app.post("/api/subscriptions/actress/{actress_id}/subscribe-latest")
-def api_subscribe_actress_latest(actress_id: str) -> dict[str, object]:
+def api_subscribe_actress_latest(actress_id: str, background_tasks: BackgroundTasks) -> dict[str, object]:
     service = get_subscription_service()
     actress = next((item for item in service.get_subscribed_actresses() if item.get("id") == actress_id), None)
     if not actress:
         raise HTTPException(status_code=404, detail="女优未订阅")
-    result = subscribe_latest_for_actress(actress, future_only=True)
+    background_tasks.add_task(background_enrich_and_subscribe_latest_actress, actress_id, future_only=True, download=True)
+    result = {"status": "queued", "message": "后台扫描未发售番号", "added": [], "skipped": [], "errors": []}
     return {"status": "ok", "result": result}
 
 
@@ -7991,7 +9567,7 @@ def api_unsubscribe_actress(actress_id: str) -> dict[str, object]:
 def api_get_subscribed_actresses() -> dict[str, object]:
     """获取已订阅女优列表"""
     service = get_subscription_service()
-    return {"subscriptions": hydrate_actress_subscriptions(service.get_subscribed_actresses())}
+    return {"subscriptions": hydrate_actress_subscriptions_cached(service.get_subscribed_actresses())}
 
 
 @app.get("/api/subscriptions/actress/{actress_id}/profile")
@@ -8019,7 +9595,7 @@ def api_get_actress_avs(actress_id: str) -> dict[str, object]:
         if not actress:
             actress = {"id": actress_id, "name": actress_id}
         results = subscription_avs_for_actress(actress, limit=100)
-        if not results and is_access_ban_error(javdb.stats().get("last_error")):
+        if javdb_source_enabled() and not results and is_access_ban_error(javdb.stats().get("last_error")):
             return {"status": "error", "message": "JavDB 当前访问被限制，DMM 预售数据源也没有找到作品。请暂停抓取或更换代理后再试。", "results": []}
         return {"results": results}
     except Exception as e:
@@ -8040,7 +9616,7 @@ def api_get_av_actresses(url: str = "", profiles: bool = True) -> dict[str, obje
         else:
             detail = cached_detail_for_url(url)
             actresses = detail.get("actors") or detail.get("actresses") or []
-            if not actresses:
+            if not actresses and javdb_source_enabled():
                 actresses = javdb.get_av_actresses(url, include_profiles=profiles)
         return {"actresses": actresses}
     except Exception as e:
@@ -8080,6 +9656,7 @@ def api_get_javdb_status() -> dict[str, object]:
     return {
         "status": "ok",
         "javdb": javdb.stats(),
+        "javdb_source_enabled": javdb_source_enabled(),
         "dmm": dmm.stats(),
         "javlibrary": javlibrary.stats(),
         "metadata_cache": get_subscription_service().metadata_cache_stats(),
@@ -8097,6 +9674,7 @@ def api_subscription_metadata_cache_status(clean: bool = True) -> dict[str, obje
         "metadata_cache": service.metadata_cache_stats(),
         "asset_cache": service.asset_cache_stats(),
         "javdb": javdb.stats(),
+        "javdb_source_enabled": javdb_source_enabled(),
         "dmm": dmm.stats(),
         "javlibrary": javlibrary.stats(),
     }
@@ -8226,6 +9804,44 @@ async def api_system_proxy_test(request: Request) -> dict[str, object]:
         }
 
 
+@app.post("/api/system-flaresolverr/test")
+def api_system_flaresolverr_test() -> dict[str, object]:
+    apply_system_proxy_settings()
+    service_url = configured_flaresolverr_url()
+    if not service_url:
+        return {"status": "error", "message": "FlareSolverr URL 未配置", "proxy": proxy_status_payload()}
+    session = f"moviemuse-test-{uuid.uuid4().hex[:8]}"
+    started_at = time.time()
+    try:
+        with httpx.Client(timeout=20, trust_env=False) as client:
+            create_resp = client.post(service_url, json={"cmd": "sessions.create", "session": session})
+            create_resp.raise_for_status()
+            create_payload = create_resp.json()
+            if create_payload.get("status") != "ok":
+                return {"status": "error", "message": str(create_payload.get("message") or create_payload), "proxy": proxy_status_payload()}
+            try:
+                client.post(service_url, json={"cmd": "sessions.destroy", "session": session})
+            except Exception:
+                pass
+        javlibrary.fetch_with_flaresolverr(f"{JAVLIBRARY_BASE_URL}/cn/", retries=0, timeout_ms=120000, cooldown=0)
+        elapsed = round(time.time() - started_at, 2)
+        return {
+            "status": "ok",
+            "message": f"FlareSolverr 可用，JavLibrary 预热成功（{elapsed}s）",
+            "url": service_url,
+            "elapsed": elapsed,
+            "proxy": proxy_status_payload(),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "url": service_url,
+            "elapsed": round(time.time() - started_at, 2),
+            "proxy": proxy_status_payload(),
+        }
+
+
 @app.get("/api/jellyfin/libraries")
 def api_jellyfin_libraries() -> dict[str, object]:
     settings_data = get_system_settings_service().get()
@@ -8315,8 +9931,7 @@ def qbittorrent_options(config: dict[str, Any]) -> dict[str, object]:
     if not base_url:
         return {"status": "error", "message": "未配置 qBittorrent Web UI 地址", "categories": [], "tags": []}
     try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
-            login_qbittorrent(client, base_url, config)
+        def operation(client: httpx.Client, _auth_method: str) -> dict[str, object]:
             categories_resp = client.get(f"{base_url}/api/v2/torrents/categories")
             categories_resp.raise_for_status()
             tags_resp = client.get(f"{base_url}/api/v2/torrents/tags")
@@ -8328,6 +9943,7 @@ def qbittorrent_options(config: dict[str, Any]) -> dict[str, object]:
             raw_tags = tags_resp.json()
             tags = sorted(str(item) for item in raw_tags if str(item).strip()) if isinstance(raw_tags, list) else []
             return {"status": "ok", "categories": categories, "tags": tags}
+        return with_qbittorrent_client(base_url, config, operation, timeout=10)
     except Exception as exc:
         app_log("error", "qbittorrent", "读取 qBittorrent 分类/标签失败", {"stage": "qb_options_failed", "error": str(exc)})
         return {"status": "error", "message": str(exc), "categories": [], "tags": []}
@@ -9240,12 +10856,7 @@ def test_qbittorrent(config: dict[str, Any]) -> dict[str, object]:
     if not base_url:
         return {"status": "error", "message": "未配置 qBittorrent Web UI 地址"}
     try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
-            username = str(config.get("username") or "")
-            password = str(config.get("password") or "")
-            if username or password:
-                login = client.post(f"{base_url}/api/v2/auth/login", data={"username": username, "password": password})
-                login.raise_for_status()
+        def operation(client: httpx.Client, auth_method: str) -> dict[str, object]:
             resp = client.get(f"{base_url}/api/v2/app/version")
             resp.raise_for_status()
             categories = client.get(f"{base_url}/api/v2/torrents/categories")
@@ -9254,10 +10865,16 @@ def test_qbittorrent(config: dict[str, Any]) -> dict[str, object]:
             category_note = ""
             if category and category not in categories.json():
                 category_note = f"，分类 {category} 尚未创建"
-            message = f"qBittorrent {resp.text.strip()}{category_note}"
-            app_log("info", "qbittorrent", "测试 qBittorrent 连接", {"message": message})
+            auth_label = {"api_key": "API Key", "password": "账号密码", "none": "免登录"}.get(auth_method, auth_method)
+            message = f"qBittorrent {resp.text.strip()}（{auth_label}）{category_note}"
+            app_log("info", "qbittorrent", "测试 qBittorrent 连接", {"message": message, "auth_method": auth_method})
             return {"status": "ok", "message": message}
+        return with_qbittorrent_client(base_url, config, operation, timeout=10)
     except httpx.HTTPError as exc:
+        message = f"qBittorrent 连接失败: {exc}"
+        app_log("error", "qbittorrent", "测试 qBittorrent 连接失败", {"error": str(exc)})
+        return {"status": "error", "message": message}
+    except RuntimeError as exc:
         message = f"qBittorrent 连接失败: {exc}"
         app_log("error", "qbittorrent", "测试 qBittorrent 连接失败", {"error": str(exc)})
         return {"status": "error", "message": message}

@@ -20,9 +20,10 @@ services:
       MEDIA_DIRS: /media
       TRASH_DIR: /media/trash
       APP_DATA_DIR: /data
-      POSTPROCESS_DOWNLOAD_DIR: /study3
-      POSTPROCESS_OUTPUT_DIR: /压制
-      POSTPROCESS_DOWNLOAD_UNRAID_RELATIVE: study3
+      # Keep postprocess folders under /media so one Windows mapping covers all subfolders.
+      POSTPROCESS_DOWNLOAD_DIR: /media/study3
+      POSTPROCESS_OUTPUT_DIR: /media/压制
+      POSTPROCESS_DOWNLOAD_UNRAID_RELATIVE: media/study3
       POSTPROCESS_OUTPUT_UNRAID_RELATIVE: media/压制
       WHISPER_MODEL: large-v3
       PUID: "99"
@@ -36,6 +37,13 @@ services:
       SUBTITLE_BACKEND_PUBLIC_URL: ""
       SUBTITLE_BACKEND_TOKEN: ""
       SUBTITLE_API_TOKEN: ""
+      # Windows 算力端回调 Unraid 控制端用；可在 WebUI “Windows 算力端”里保存。
+      # 示例：http://192.168.2.9:18188
+      CONSOLE_PUBLIC_URL: ""
+      # JavLibrary fallback 需要 FlareSolverr；如果同 compose 部署可填 http://flaresolverr:8191/v1。
+      JAVLIBRARY_FLARESOLVERR_URL: ${JAVLIBRARY_FLARESOLVERR_URL:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+      no_proxy: ${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
 
       # 第一次配置可留空，建议进 WebUI 里配置路径映射。
       # 示例：/media=\\192.168.2.9\media
@@ -46,9 +54,6 @@ services:
       - /mnt/user/media:/media
 
       # 自动订阅/洗版后处理目录。qBittorrent 也应把系统任务保存到同一个 /study3。
-      - /mnt/user/study3:/study3
-      - /mnt/user/media/压制:/压制
-
       # 第一次配置建议保留：保存配置、扫描缓存、字幕任务队列。
       - /mnt/user/appdata/media-toolbox/data:/data
 

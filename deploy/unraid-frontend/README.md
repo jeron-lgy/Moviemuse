@@ -7,7 +7,12 @@ It does not run Whisper locally. Subtitle jobs are forwarded to the Windows back
 ```yaml
 SUBTITLE_BACKEND_URL: http://WINDOWS-IP:18181
 SUBTITLE_BACKEND_PUBLIC_URL: http://WINDOWS-IP:18181
+CONSOLE_PUBLIC_URL: http://UNRAID-IP:18188
 ```
+
+`SUBTITLE_BACKEND_URL` is used by Unraid to call Windows. `CONSOLE_PUBLIC_URL`
+is used by Windows to call back Unraid after a transcode job finishes. In the
+WebUI, set `CONSOLE_PUBLIC_URL` from “Windows 算力端 -> Unraid 回调地址”.
 
 ## Run On Unraid
 
@@ -50,6 +55,13 @@ The subtitle task UI will be available at:
 http://UNRAID_IP:18180/subtitles
 ```
 
+If the compose port maps `18188:18180`, the callback URL should use the left
+host port:
+
+```text
+http://UNRAID_IP:18188
+```
+
 ## Path Mapping
 
 Inside the container, media is mounted as:
@@ -62,8 +74,10 @@ Before requests are forwarded to Windows, paths are rewritten by the console:
 
 ```text
 /media -> //UNRAID/media
-/trash -> //UNRAID/appdata/media-toolbox/trash
 ```
+
+Post-processing download and output directories should also stay under `/media`,
+for example `/media/study3` and `/media/压制`, so one mapping covers subtitles and transcoding.
 
 The Windows backend can stay simple and does not need its own path map if the console sends Windows-readable UNC paths:
 

@@ -50,6 +50,7 @@ class PostprocessFlowTest(unittest.TestCase):
     def setUp(self) -> None:
         require_ffmpeg()
         self.root = Path(tempfile.mkdtemp(prefix="moviemuse-postprocess-test-"))
+        os.environ["MEDIA_DIRS"] = str(self.root)
         os.environ["APP_DATA_DIR"] = str(self.root / "data")
         os.environ["TRASH_DIR"] = str(self.root / "trash")
         os.environ["SUBTITLE_BACKEND_URL"] = ""
@@ -828,7 +829,71 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertTrue(active_path.exists())
         self.assertTrue(str(active_path).startswith(str(self.root / "out-subtitle")))
         self.assertTrue(active["has_chinese_subtitle"])
-        self.assertTrue(active_path.with_name(f"{active_path.stem}.zh.srt").exists())
+        self.assertTrue(active_path.with_suffix(".srt").exists())
+        self.assertFalse(active_path.with_name(f"{active_path.stem}.zh.srt").exists())
+
+    def test_subtitle_artifacts_cleanup_keeps_video_named_srt_and_vtt(self) -> None:
+        product_path = self.root / "out-clean" / "ABF-359.av1.mp4"
+        original_srt = product_path.with_name("ABF-359.srt")
+        original_vtt = product_path.with_name("ABF-359.vtt")
+        translated_srt = product_path.with_suffix(".srt")
+        translated_vtt = product_path.with_suffix(".vtt")
+        legacy_zh = product_path.with_name(f"{product_path.stem}.zh.srt")
+        make_sample_video(product_path)
+        for path, content in [
+            (original_srt, "1\n00:00:00,000 --> 00:00:01,000\noriginal\n\n"),
+            (original_vtt, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\noriginal\n"),
+            (translated_srt, "1\n00:00:00,000 --> 00:00:01,000\n你好，清理字幕。\n\n"),
+            (translated_vtt, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n你好，清理字幕。\n"),
+            (legacy_zh, "1\n00:00:00,000 --> 00:00:01,000\n旧的中文字幕。\n\n"),
+        ]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        post = self.main.get_postprocess_service()
+        post.update_settings(
+            {
+                "auto_transcode_enabled": True,
+                "auto_subtitle_enabled": True,
+                "download_dir": str(self.root),
+                "output_dir": str(self.root / "out-clean"),
+                "target_codec": "h264",
+            }
+        )
+        task = post.create_task(
+            av_id="ABF-359",
+            task_type="subscription",
+            status="subtitle_processing",
+            target_codec="h264",
+            needs_subtitle=True,
+        )
+        post.update_task(task["id"], input_path=str(product_path), output_path=str(product_path))
+
+        result = self.main.validate_and_activate_postprocess_task(
+            task["id"],
+            output_path=str(product_path),
+            subtitle_path=str(translated_srt),
+            worker_result={
+                "subtitle_job": {
+                    "status": "completed",
+                    "original_srt": str(original_srt),
+                    "original_vtt": str(original_vtt),
+                    "translated_srt": str(translated_srt),
+                    "translated_vtt": str(translated_vtt),
+                }
+            },
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(product_path.exists())
+        self.assertTrue(translated_srt.exists())
+        self.assertTrue(translated_vtt.exists())
+        self.assertFalse(original_srt.exists())
+        self.assertFalse(original_vtt.exists())
+        self.assertFalse(legacy_zh.exists())
+        trash_files = [path.name for path in (self.root / "trash").rglob("*") if path.is_file()]
+        self.assertIn("ABF-359.srt", trash_files)
+        self.assertIn("ABF-359.vtt", trash_files)
+        self.assertIn("ABF-359.av1.zh.srt", trash_files)
 
     def test_subtitle_validation_failure_keeps_video_version_active(self) -> None:
         input_path = self.root / "input-bad-subtitle.mp4"

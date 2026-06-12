@@ -10,6 +10,85 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
 
         self.main = main
 
+    def test_subscribe_av_endpoint_queues_download_without_sync_mteam(self) -> None:
+        import asyncio
+        from unittest.mock import Mock
+
+        class Request:
+            async def json(self) -> dict[str, object]:
+                return {"id": "ABF-358", "title": "cached", "actresses": [{"name": "A"}]}
+
+        class Service:
+            def get_settings(self) -> dict[str, object]:
+                return {"max_coactors": 2, "javdb_source_enabled": False}
+
+            def subscribe_av(self, payload: dict[str, object]) -> dict[str, object]:
+                return dict(payload)
+
+            def get_subscribed_av(self) -> list[dict[str, object]]:
+                return []
+
+        background = Mock()
+        with patch.object(self.main, "get_subscription_service", return_value=Service()), \
+            patch.object(self.main, "download_av_from_mteam", side_effect=AssertionError("download should be background only")), \
+            patch.object(self.main, "send_notification_event", return_value=None), \
+            patch.object(self.main, "cached_av_detail", return_value={}):
+            result = asyncio.run(self.main.api_subscribe_av(Request(), background))
+
+        self.assertEqual(result["download"]["status"], "queued")
+        background.add_task.assert_called_once()
+
+    def test_subscribe_actress_endpoint_queues_latest_scan_without_sync_fetch(self) -> None:
+        import asyncio
+        from unittest.mock import Mock
+
+        class Request:
+            async def json(self) -> dict[str, object]:
+                return {"id": "7BX1", "name": "西宮夢"}
+
+        class Service:
+            def get_settings(self) -> dict[str, object]:
+                return {"max_coactors": 2, "javdb_source_enabled": False}
+
+            def get_metadata_cache(self, *_args: object, **_kwargs: object) -> object:
+                return None
+
+            def set_metadata_cache(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def subscribe_actress(self, payload: dict[str, object]) -> dict[str, object]:
+                return dict(payload)
+
+        background = Mock()
+        with patch.object(self.main, "get_subscription_service", return_value=Service()), \
+            patch.object(self.main, "subscribe_latest_for_actress", side_effect=AssertionError("latest scan should be background only")):
+            result = asyncio.run(self.main.api_subscribe_actress(Request(), background))
+
+        self.assertEqual(result["latest"]["status"], "queued")
+        background.add_task.assert_called_once()
+
+    def test_subscription_lists_are_newest_first(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from app.subscription_service import SubscriptionService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = SubscriptionService(Path(tmp))
+            clock = {"value": 100.0}
+
+            def tick() -> float:
+                clock["value"] += 100.0
+                return clock["value"]
+
+            with patch("app.subscription_service.time.time", side_effect=tick):
+                service.subscribe_av({"id": "OLD-001", "title": "old"})
+                service.subscribe_av({"id": "NEW-001", "title": "new"})
+                service.subscribe_actress({"id": "old", "name": "old"})
+                service.subscribe_actress({"id": "new", "name": "new"})
+
+            self.assertEqual([item["id"] for item in service.get_subscribed_av()[:2]], ["NEW-001", "OLD-001"])
+            self.assertEqual([item["id"] for item in service.get_subscribed_actresses()[:2]], ["new", "old"])
+
     def test_global_actor_limit_filters_three_actor_items(self) -> None:
         items = [
             {"id": "OK-001", "actresses": [{"name": "A"}, {"name": "B"}]},
@@ -216,6 +295,71 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
         self.assertTrue(all(item.get("source_scope") == "label" for item in results))
         self.assertTrue(all(item.get("match_reason") == "primary_label" for item in results))
         self.assertEqual(results[1]["source_chain"], ["javlibrary"])
+
+    def test_listing_cache_fourteen_items_satisfies_first_screen_probe(self) -> None:
+        cached = [{"id": f"TEST-{index:03d}", "title": f"cached {index}"} for index in range(14)]
+
+        with patch.object(self.main, "cache_get", return_value=cached), \
+            patch.object(self.main, "fetch_listing_sources", side_effect=AssertionError("should not fetch external")):
+            results = self.main.cached_listing("https://javdb.com/makers/7R?f=download", limit=15, maker_name="S1 NO.1 STYLE")
+
+        self.assertEqual(len(results), 14)
+        self.assertTrue(all(item.get("match_reason") == "sqlite_cache" for item in results))
+
+    def test_listing_cache_twenty_eight_items_satisfies_load_more_probe(self) -> None:
+        cached = [{"id": f"TEST-{index:03d}", "title": f"cached {index}"} for index in range(28)]
+
+        with patch.object(self.main, "cache_get", return_value=cached), \
+            patch.object(self.main, "fetch_listing_sources", side_effect=AssertionError("should not fetch external")):
+            results = self.main.cached_listing("https://javdb.com/makers/7R?f=download", limit=29, maker_name="S1 NO.1 STYLE")
+
+        self.assertEqual(len(results), 28)
+        self.assertTrue(all(item.get("match_reason") == "sqlite_cache" for item in results))
+
+    def test_listing_cache_partial_items_still_return_without_external_fetch(self) -> None:
+        cached = [{"id": f"TEST-{index:03d}", "title": f"cached {index}"} for index in range(5)]
+
+        with patch.object(self.main, "cache_get", return_value=cached), \
+            patch.object(self.main, "fetch_listing_sources", side_effect=AssertionError("should not fetch external")):
+            results = self.main.cached_listing("https://javdb.com/makers/7R?f=download", limit=15, maker_name="S1 NO.1 STYLE")
+
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(item.get("match_reason") == "sqlite_cache" for item in results))
+
+    def test_javlibrary_strategy_skips_dmm_when_listing_is_complete(self) -> None:
+        javlibrary_items = [
+            {"id": f"ABF-{index:03d}", "date": "2026-06-01", "source": "javlibrary", "source_scope": "label"}
+            for index in range(1, 4)
+        ]
+
+        with patch.object(self.main, "maker_listing_source_strategy", return_value="javlibrary"), \
+            patch.object(self.main, "javlibrary_maker_avs", return_value=javlibrary_items), \
+            patch.object(self.main.dmm, "get_listing_avs", side_effect=AssertionError("DMM should not be called")), \
+            patch.object(self.main.dmm, "get_maker_avs", side_effect=AssertionError("DMM should not be called")), \
+            patch.object(self.main.javdb, "get_listing", side_effect=AssertionError("JavDB should not be called")):
+            results = self.main.fetch_listing_sources("https://javdb.com/makers/6M?f=download", "PRESTIGE", 3, force_refresh=False)
+
+        self.assertEqual([item["id"] for item in results], ["ABF-003", "ABF-002", "ABF-001"])
+
+    def test_disabled_javdb_source_skips_subscription_search_fallback(self) -> None:
+        with patch.object(self.main, "javdb_source_enabled", return_value=False), \
+            patch.object(self.main.dmm, "get_actress_avs", return_value=[]), \
+            patch.object(self.main, "javlibrary_actor_avs", return_value=[]), \
+            patch.object(self.main.javdb, "search_actress", side_effect=AssertionError("JavDB should not be called")):
+            results = self.main.fetch_subscription_search("Alice", "actress")
+
+        self.assertEqual(results, [])
+
+    def test_disabled_javdb_source_skips_maker_javdb_strategy(self) -> None:
+        with patch.object(self.main, "javdb_source_enabled", return_value=False), \
+            patch.object(self.main, "maker_listing_source_strategy", return_value="javdb"), \
+            patch.object(self.main.javdb, "get_listing", side_effect=AssertionError("JavDB should not be called")), \
+            patch.object(self.main, "javlibrary_maker_avs", return_value=[]), \
+            patch.object(self.main.dmm, "get_listing_avs", return_value=[]), \
+            patch.object(self.main.dmm, "get_maker_avs", return_value=[]):
+            results = self.main.fetch_listing_sources("https://javdb.com/makers/7R?f=download", "S1 NO.1 STYLE", 3, force_refresh=False)
+
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":

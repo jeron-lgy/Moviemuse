@@ -48,6 +48,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "qbittorrent": {
         "url": "",
+        "api_key": "",
         "username": "",
         "password": "",
         "save_path": "",
@@ -66,8 +67,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "proxy_enabled": False,
         "http_proxy": "",
         "https_proxy": "",
-        "no_proxy": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12",
         "apply_to_javdb": True,
+        "flaresolverr_url": "",
     },
     "notifications": {
         "channels": [],
@@ -137,7 +139,7 @@ class SystemSettingsService:
             network.setdefault(key, default)
         network["proxy_enabled"] = bool(network.get("proxy_enabled"))
         network["apply_to_javdb"] = bool(network.get("apply_to_javdb", True))
-        for key in ("http_proxy", "https_proxy", "no_proxy"):
+        for key in ("http_proxy", "https_proxy", "no_proxy", "flaresolverr_url"):
             network[key] = str(network.get(key) or "").strip()
 
     def _normalize_notifications(self) -> None:

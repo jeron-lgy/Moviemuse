@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -17,11 +18,18 @@ DEFAULT_POSTPROCESS_SETTINGS: dict[str, Any] = {
     "auto_transcode_enabled": False,
     "auto_subtitle_enabled": False,
     "worker_auto_run": False,
-    "download_dir": str(Path(os.getenv("POSTPROCESS_DOWNLOAD_DIR", "/study3"))),
-    "output_dir": str(Path(os.getenv("POSTPROCESS_OUTPUT_DIR", "/压制"))),
+    "download_dir": str(Path(os.getenv("POSTPROCESS_DOWNLOAD_DIR", "/media/study3"))),
+    "output_dir": str(Path(os.getenv("POSTPROCESS_OUTPUT_DIR", "/media/压制"))),
     "target_codec": "av1",
+    "target_encoder": "av1_nvenc",
     "crf": 36,
     "preset": "p1",
+    "preset_flag": "-preset",
+    "ffmpeg_mode": "standard",
+    "ffmpeg_standard_enabled": True,
+    "ffmpeg_custom_enabled": False,
+    "ffmpeg_custom_template": "",
+    "custom_encoding_presets": [],
     "allowed_categories": ["study3"],
     "required_tags": ["moviemuse", "auto-postprocess", "jav"],
     "max_concurrency": 1,
@@ -375,6 +383,9 @@ class PostprocessService:
         if updates.get("status") in TERMINAL_TASK_STATUSES:
             assignments.append("finished_at = ?")
             params.append(now)
+        elif "status" in updates:
+            assignments.append("finished_at = ?")
+            params.append(0.0)
         params.append(task_id)
         with self._connect() as conn:
             conn.execute(f"UPDATE postprocess_tasks SET {', '.join(assignments)} WHERE id = ?", params)
@@ -646,11 +657,20 @@ def normalize_postprocess_settings(raw: dict[str, Any]) -> dict[str, Any]:
     result["auto_transcode_enabled"] = bool(result.get("auto_transcode_enabled"))
     result["auto_subtitle_enabled"] = bool(result.get("auto_subtitle_enabled"))
     result["worker_auto_run"] = bool(result.get("worker_auto_run"))
+    result["ffmpeg_mode"] = str(result.get("ffmpeg_mode") or "").strip().lower()
+    if result["ffmpeg_mode"] not in {"standard", "custom"}:
+        result["ffmpeg_mode"] = "custom" if bool(result.get("ffmpeg_custom_enabled")) else "standard"
+    result["ffmpeg_standard_enabled"] = result["ffmpeg_mode"] == "standard"
+    result["ffmpeg_custom_enabled"] = result["ffmpeg_mode"] == "custom"
     result["target_codec"] = str(result.get("target_codec") or "av1").lower()
     if result["target_codec"] not in {"h265", "av1"}:
         result["target_codec"] = "av1"
-    for key in ("download_dir", "output_dir", "preset"):
+    for key in ("download_dir", "output_dir", "target_encoder", "preset", "preset_flag", "ffmpeg_custom_template"):
         result[key] = str(result.get(key) or DEFAULT_POSTPROCESS_SETTINGS[key]).strip()
+    result["download_dir"] = normalize_container_media_path(result["download_dir"], DEFAULT_POSTPROCESS_SETTINGS["download_dir"])
+    result["output_dir"] = normalize_container_media_path(result["output_dir"], DEFAULT_POSTPROCESS_SETTINGS["output_dir"])
+    if result["preset_flag"] not in {"-preset", "-cpu-used"}:
+        result["preset_flag"] = "-preset"
     for key, fallback, low, high in (("crf", 36, 12, 51), ("max_concurrency", 1, 1, 8)):
         try:
             number = int(result.get(key) or fallback)
@@ -659,7 +679,53 @@ def normalize_postprocess_settings(raw: dict[str, Any]) -> dict[str, Any]:
         result[key] = max(low, min(high, number))
     result["allowed_categories"] = normalize_string_list(result.get("allowed_categories"))
     result["required_tags"] = normalize_string_list(result.get("required_tags"))
+    result["custom_encoding_presets"] = normalize_encoding_presets(result.get("custom_encoding_presets"))
     return result
+
+
+def normalize_container_media_path(value: str, fallback: str) -> str:
+    text = str(value or fallback or "").strip().replace("\\", "/")
+    if not text:
+        return str(fallback)
+    if text.startswith("//") or re.match(r"^[A-Za-z]:/", text):
+        return text
+    if text.startswith("/"):
+        return text.rstrip("/") or "/"
+    return f"/media/{text.strip('/')}"
+
+
+def normalize_encoding_presets(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    presets: list[dict[str, Any]] = []
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        encoder = str(item.get("encoder") or "").strip()
+        if not name or not encoder:
+            continue
+        codec = str(item.get("codec") or "av1").strip().lower()
+        if codec not in {"av1", "h265"}:
+            codec = "av1"
+        preset_flag = str(item.get("preset_flag") or "-preset").strip()
+        if preset_flag not in {"-preset", "-cpu-used"}:
+            preset_flag = "-preset"
+        try:
+            quality = max(12, min(51, int(item.get("quality") or item.get("crf") or 36)))
+        except (TypeError, ValueError):
+            quality = 36
+        presets.append(
+            {
+                "name": name,
+                "codec": codec,
+                "encoder": encoder,
+                "preset": str(item.get("preset") or "p1").strip(),
+                "preset_flag": preset_flag,
+                "quality": quality,
+            }
+        )
+    return presets
 
 
 def normalize_string_list(value: Any) -> list[str]:

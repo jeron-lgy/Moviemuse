@@ -27,6 +27,7 @@ class DMMService:
         self._cache_dir = Path(cache_root)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._search_cache_ttl = int(os.getenv("DMM_SEARCH_CACHE_TTL_SECONDS", "21600"))
+        self._maker_cache_ttl = int(os.getenv("DMM_MAKER_CACHE_TTL_SECONDS", "1800"))
         self._detail_cache_ttl = int(os.getenv("DMM_DETAIL_CACHE_TTL_SECONDS", "2592000"))
         self._timeout = int(os.getenv("DMM_REQUEST_TIMEOUT_SECONDS", "30"))
         self._last_error = ""
@@ -63,10 +64,10 @@ class DMMService:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self._cache_dir / f"{digest}.json"
 
-    def _cached(self, key: str, fetch: Callable[[], Any], ttl: int) -> Any:
+    def _cached(self, key: str, fetch: Callable[[], Any], ttl: int, *, force_refresh: bool = False) -> Any:
         now = time.time()
         path = self._cache_path(key)
-        if path.exists():
+        if path.exists() and not force_refresh:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 if float(payload.get("expires_at") or 0) > now:
@@ -429,7 +430,7 @@ class DMMService:
             return [self.get_av_detail(item) for item in items]
         return [{key: value for key, value in item.items() if not key.startswith("_")} for item in items]
 
-    def get_maker_avs(self, maker_name: str, limit: int = 60, *, include_detail: bool = False) -> list[dict[str, Any]]:
+    def get_maker_avs(self, maker_name: str, limit: int = 60, *, include_detail: bool = False, force_refresh: bool = False) -> list[dict[str, Any]]:
         query = str(maker_name or "").strip()
         if not query:
             return []
@@ -446,13 +447,13 @@ class DMMService:
                 hits.extend(self._parse_search_hits(response.text))
             return self._dedupe_hits(hits)
 
-        results = self._cached(f"dmm_maker_avs:v5:{query.lower()}", fetch, self._search_cache_ttl)
+        results = self._cached(f"dmm_maker_avs:v6:{query.lower()}", fetch, self._maker_cache_ttl, force_refresh=force_refresh)
         items = (results if isinstance(results, list) else [])[:limit]
         if include_detail:
             return [self.get_av_detail(item) for item in items]
         return [{key: value for key, value in item.items() if not key.startswith("_")} for item in items]
 
-    def get_listing_avs(self, page_url: str, limit: int = 60, *, include_detail: bool = False) -> list[dict[str, Any]]:
+    def get_listing_avs(self, page_url: str, limit: int = 60, *, include_detail: bool = False, force_refresh: bool = False) -> list[dict[str, Any]]:
         url = self._dated_list_url(page_url)
         if not url:
             return []
@@ -463,7 +464,7 @@ class DMMService:
             response = self._get(session, url)
             return self._dedupe_hits(self._parse_search_hits(response.text))
 
-        results = self._cached(f"dmm_listing_avs:v3:{url}", fetch, self._search_cache_ttl)
+        results = self._cached(f"dmm_listing_avs:v4:{url}", fetch, self._maker_cache_ttl, force_refresh=force_refresh)
         items = (results if isinstance(results, list) else [])[:limit]
         if include_detail:
             return [self.get_av_detail(item) for item in items]

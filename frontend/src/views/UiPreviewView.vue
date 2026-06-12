@@ -37,6 +37,30 @@
         </div>
       </BaseCard>
 
+      <BaseCard as="article" class="preview-panel">
+        <h2>开关和多选</h2>
+        <p>单个开关使用滑动组件，多选菜单继续使用原生复选框。</p>
+        <div class="switch-stack">
+          <BaseSwitch v-model="form.pollEnabled" label="启用轮询" />
+          <BaseSwitch v-model="form.onlyNew" label="只订阅新作" />
+          <BaseSwitch v-model="form.disabledToggle" label="不可编辑" disabled />
+        </div>
+        <div class="checkbox-grid">
+          <label>
+            <input v-model="form.notifyEvents" type="checkbox" value="actress">
+            女优新番号
+          </label>
+          <label>
+            <input v-model="form.notifyEvents" type="checkbox" value="mteam">
+            MTeam 命中
+          </label>
+          <label>
+            <input v-model="form.notifyEvents" type="checkbox" value="jellyfin">
+            Jellyfin 入库
+          </label>
+        </div>
+      </BaseCard>
+
       <BaseCard as="article" class="preview-panel wide">
         <h2>表单和分段</h2>
         <p>表单行、输入框、下拉框、说明文字和 tabs 统一收口。</p>
@@ -79,7 +103,7 @@
 
 <script setup>
 import { reactive, ref } from 'vue'
-import { BaseButton, BaseCard, BaseTabs, FormField, NoticeBanner, PageHeader, StatusPill } from '../components/ui'
+import { BaseButton, BaseCard, BaseSwitch, BaseTabs, FormField, NoticeBanner, PageHeader, StatusPill } from '../components/ui'
 
 const activeTab = ref('buttons')
 const tabs = [
@@ -90,7 +114,11 @@ const tabs = [
 const form = reactive({
   keyword: '',
   type: 'av',
-  note: ''
+  note: '',
+  pollEnabled: true,
+  onlyNew: false,
+  disabledToggle: true,
+  notifyEvents: ['actress', 'mteam']
 })
 </script>
 
@@ -132,11 +160,36 @@ const form = reactive({
 
 .button-stack,
 .pill-stack,
-.notice-stack {
+.notice-stack,
+.switch-stack {
   display: flex;
   flex-wrap: wrap;
   gap: var(--mm-space-3);
   align-items: center;
+}
+
+.switch-stack {
+  display: grid;
+  justify-items: start;
+}
+
+.checkbox-grid {
+  display: grid;
+  gap: var(--mm-space-3);
+}
+
+.checkbox-grid label {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  color: var(--mm-text);
+  font-weight: var(--mm-font-weight-medium);
+}
+
+.checkbox-grid input {
+  width: 18px;
+  height: 18px;
 }
 
 .form-grid {

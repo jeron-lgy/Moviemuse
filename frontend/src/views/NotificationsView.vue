@@ -86,7 +86,7 @@
 
         <template v-if="editingChannel.type === 'serverchan'">
           <FormField label="SendKey" wide>
-            <input v-model.trim="editingChannel.config.send_key" type="password" placeholder="SCT...">
+            <SecretInput v-model.trim="editingChannel.config.send_key" autocomplete="off" placeholder="SCT..." />
           </FormField>
         </template>
 
@@ -95,7 +95,7 @@
             <input v-model.trim="editingChannel.config.url" placeholder="https://gotify.example.com">
           </FormField>
           <FormField label="Token">
-            <input v-model.trim="editingChannel.config.token" type="password">
+            <SecretInput v-model.trim="editingChannel.config.token" autocomplete="off" />
           </FormField>
           <FormField label="优先级">
             <input v-model.number="editingChannel.config.priority" type="number" min="0" max="10">
@@ -107,7 +107,7 @@
             <input v-model.trim="editingChannel.config.corp_id" placeholder="ww...">
           </FormField>
           <FormField label="Corp Secret">
-            <input v-model.trim="editingChannel.config.corp_secret" type="password">
+            <SecretInput v-model.trim="editingChannel.config.corp_secret" autocomplete="off" />
           </FormField>
           <FormField label="Agent ID">
             <input v-model.trim="editingChannel.config.agent_id">
@@ -122,10 +122,10 @@
             <input v-model.trim="editingChannel.config.default_image_url" placeholder="https://example.com/cover.jpg">
           </FormField>
           <FormField label="Callback Token">
-            <input v-model.trim="editingChannel.config.token" type="password">
+            <SecretInput v-model.trim="editingChannel.config.token" autocomplete="off" />
           </FormField>
           <FormField label="Encoding AES Key" wide>
-            <input v-model.trim="editingChannel.config.aes_key" type="password">
+            <SecretInput v-model.trim="editingChannel.config.aes_key" autocomplete="off" />
           </FormField>
           <FormField label="Callback Path">
             <input v-model.trim="editingChannel.config.callback_path" placeholder="/api/v1/message">
@@ -172,7 +172,7 @@
 import { reactive, ref } from 'vue'
 import TaskDialog from '../components/TaskDialog.vue'
 import { api, postJson } from '../lib/api'
-import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader } from '../components/ui'
+import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
 
 defineProps({
   embedded: {
@@ -408,6 +408,7 @@ defineExpose({
 .notifications-view {
   display: grid;
   gap: 24px;
+  --mm-input-radius: 14px;
 }
 
 .section-head {

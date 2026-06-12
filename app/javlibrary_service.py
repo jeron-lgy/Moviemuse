@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,7 +17,8 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.javlibrary.com"
 DEFAULT_FLARESOLVERR_URL = "http://127.0.0.1:8281/v1"
-RETRYABLE_STATUS_CODES = {429, 520, 522, 524}
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 522, 524}
+SESSION_TTL_SECONDS = 45 * 60
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,12 @@ class JavLibraryService:
         self._requests_failed = 0
         self._last_error = ""
         self._last_success_at = 0.0
+        self._session_lock = threading.RLock()
+        self._session_service_url = ""
+        self._session = ""
+        self._session_created_at = 0.0
+        self._session_warmed_at = 0.0
+        self._session_uses = 0
 
     def set_logger(self, logger: Callable[[str, str, str, dict[str, Any] | None], None]) -> None:
         self._logger = logger
@@ -57,16 +65,20 @@ class JavLibraryService:
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "service_url": self._service_url(),
+            "session_active": bool(self._session),
+            "session_age_seconds": max(0, int(time.time() - self._session_created_at)) if self._session_created_at else 0,
+            "session_warmed_at": self._session_warmed_at,
+            "session_uses": self._session_uses,
         }
 
     def actress_url(self, star_id: str, lang: str = "cn") -> str:
         return f"{BASE_URL}/{lang}/vl_star.php?s={star_id}"
 
-    def get_actor_avs(self, star_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def get_actor_avs(self, star_id: str, limit: int = 20, *, retries: int = 3, timeout_ms: int = 120000) -> list[dict[str, Any]]:
         star = str(star_id or "").strip()
         if not star:
             return []
-        return self.get_listing_avs(self.actress_url(star), limit=limit)
+        return self.get_listing_avs(self.actress_url(star), limit=limit, retries=retries, timeout_ms=timeout_ms)
 
     def get_video_actresses(self, av_id: str) -> list[dict[str, str]]:
         code = self.normalize_code(av_id)
@@ -84,11 +96,11 @@ class JavLibraryService:
             return self.parse_video_actresses(detail_html, video.url)
         return []
 
-    def get_listing_avs(self, url: str, limit: int = 20) -> list[dict[str, Any]]:
+    def get_listing_avs(self, url: str, limit: int = 20, *, retries: int = 3, timeout_ms: int = 120000) -> list[dict[str, Any]]:
         target_url = str(url or "").strip()
         if not target_url:
             return []
-        html = self.fetch_with_flaresolverr(target_url)
+        html = self.fetch_with_flaresolverr(target_url, retries=retries, timeout_ms=timeout_ms)
         return [self._video_to_dict(item) for item in self.parse_videos(html, target_url)[: max(1, int(limit or 20))]]
 
     def fetch_with_flaresolverr(
@@ -105,33 +117,31 @@ class JavLibraryService:
         if not service_url:
             raise RuntimeError("JavLibrary FlareSolverr URL is not configured")
         last_error: Exception | None = None
-        for attempt in range(1, retries + 2):
-            session = f"moviemuse-jl-{uuid.uuid4().hex[:10]}"
-            try:
-                self._requests_started += 1
-                self._create_session(service_url, session, timeout_ms)
-                self._request(service_url, f"{BASE_URL}/cn/", session, timeout_ms)
-                html = self._request(service_url, target_url, session, timeout_ms)
-                if cooldown > 0:
-                    time.sleep(cooldown)
-                self._last_success_at = time.time()
-                return html
-            except (RetryableFetchError, JavLibraryChallenge, requests.Timeout) as exc:
-                last_error = exc
-                self._last_error = str(exc)
-                if attempt > retries:
-                    break
-                self._log("warning", "JavLibrary fetch retry", {"stage": "javlibrary_retry", "attempt": attempt, "error": str(exc), "url": target_url})
-                self._backoff(attempt, base_delay, max_delay)
-            except Exception as exc:
-                last_error = exc
-                self._last_error = str(exc)
-                break
-            finally:
+        with self._session_lock:
+            for attempt in range(1, retries + 2):
+                session = ""
                 try:
-                    self._command(service_url, {"cmd": "sessions.destroy", "session": session}, timeout_ms)
-                except Exception:
-                    pass
+                    self._requests_started += 1
+                    session = self._ensure_session(service_url, timeout_ms)
+                    html = self._request(service_url, target_url, session, timeout_ms)
+                    if cooldown > 0:
+                        time.sleep(cooldown)
+                    self._last_success_at = time.time()
+                    self._session_uses += 1
+                    return html
+                except (RetryableFetchError, JavLibraryChallenge, requests.Timeout) as exc:
+                    last_error = exc
+                    self._last_error = str(exc)
+                    self._reset_session(service_url, session, timeout_ms)
+                    if attempt > retries:
+                        break
+                    self._log("warning", "JavLibrary fetch retry", {"stage": "javlibrary_retry", "attempt": attempt, "error": str(exc), "url": target_url})
+                    self._backoff(attempt, base_delay, max_delay)
+                except Exception as exc:
+                    last_error = exc
+                    self._last_error = str(exc)
+                    self._reset_session(service_url, session, timeout_ms)
+                    break
         self._requests_failed += 1
         raise RuntimeError(f"JavLibrary fetch failed: {last_error}") from last_error
 
@@ -224,6 +234,56 @@ class JavLibraryService:
 
     def _create_session(self, service_url: str, session: str, timeout_ms: int) -> None:
         self._command(service_url, {"cmd": "sessions.create", "session": session}, timeout_ms)
+
+    def _ensure_session(self, service_url: str, timeout_ms: int) -> str:
+        now = time.time()
+        if (
+            self._session
+            and self._session_service_url == service_url
+            and now - self._session_created_at < SESSION_TTL_SECONDS
+        ):
+            return self._session
+        if self._session:
+            self._destroy_session(self._session_service_url, self._session, timeout_ms)
+        session = f"moviemuse-jl-{uuid.uuid4().hex[:10]}"
+        started_at = time.time()
+        try:
+            self._create_session(service_url, session, timeout_ms)
+            self._request(service_url, f"{BASE_URL}/cn/", session, timeout_ms)
+        except Exception:
+            self._destroy_session(service_url, session, timeout_ms)
+            raise
+        self._session_service_url = service_url
+        self._session = session
+        self._session_created_at = started_at
+        self._session_warmed_at = time.time()
+        self._session_uses = 0
+        self._log("info", "JavLibrary FlareSolverr session warmed", {
+            "stage": "javlibrary_session_warmed",
+            "session": session,
+            "elapsed": round(self._session_warmed_at - started_at, 3),
+        })
+        return session
+
+    def _reset_session(self, service_url: str, session: str, timeout_ms: int) -> None:
+        target_session = session or self._session
+        target_service_url = service_url or self._session_service_url
+        if target_session:
+            self._destroy_session(target_service_url, target_session, timeout_ms)
+        if not session or session == self._session:
+            self._session_service_url = ""
+            self._session = ""
+            self._session_created_at = 0.0
+            self._session_warmed_at = 0.0
+            self._session_uses = 0
+
+    def _destroy_session(self, service_url: str, session: str, timeout_ms: int) -> None:
+        if not service_url or not session:
+            return
+        try:
+            self._command(service_url, {"cmd": "sessions.destroy", "session": session}, timeout_ms)
+        except Exception:
+            pass
 
     def _request(self, service_url: str, url: str, session: str, timeout_ms: int) -> str:
         data = self._command(
