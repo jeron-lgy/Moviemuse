@@ -554,8 +554,8 @@ p {
   padding: 8px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
-  box-shadow: var(--mm-shadow);
+  background: var(--mm-card-bg);
+  box-shadow: var(--mm-menu-shadow);
 }
 
 .type-menu button {
@@ -569,7 +569,7 @@ p {
 }
 
 .type-menu button:hover {
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
 }
 
@@ -639,7 +639,7 @@ input {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   font: inherit;
 }
@@ -650,7 +650,7 @@ textarea {
   padding: 12px 14px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   font: inherit;
   resize: vertical;

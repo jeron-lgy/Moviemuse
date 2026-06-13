@@ -96,7 +96,7 @@ const sizeClass = computed(() => (props.size === 'sm' ? 'sm' : ''))
   height: var(--switch-height);
   flex: 0 0 var(--switch-width);
   border-radius: 999px;
-  background: #e6e6e6;
+  background: color-mix(in srgb, var(--mm-muted) 22%, var(--mm-control-bg));
   transition: background .18s ease, box-shadow .18s ease;
 }
 
@@ -107,14 +107,14 @@ const sizeClass = computed(() => (props.size === 'sm' ? 'sm' : ''))
   width: var(--switch-thumb);
   height: var(--switch-thumb);
   border-radius: 999px;
-  background: #fff;
+  background: var(--mm-card-bg);
   box-shadow: 0 3px 10px rgba(34, 34, 34, .18);
   transform: translate(0, -50%);
   transition: transform .18s ease, box-shadow .18s ease;
 }
 
 .mm-switch.checked .mm-switch-track {
-  background: color-mix(in srgb, var(--mm-primary) 45%, white);
+  background: color-mix(in srgb, var(--mm-primary) 45%, var(--mm-card-bg));
 }
 
 .mm-switch.checked .mm-switch-thumb {

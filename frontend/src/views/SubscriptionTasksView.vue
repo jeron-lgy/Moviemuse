@@ -466,7 +466,8 @@ h1 {
   padding: 0 12px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
+  color: var(--mm-text);
 }
 
 .task-row p {
@@ -487,12 +488,12 @@ h1 {
   padding: 14px;
   border: 1px solid rgba(18, 184, 134, .22);
   border-radius: 8px;
-  background: #f3fff9;
+  background: var(--mm-success-soft);
 }
 
 .result-summary.failed {
   border-color: rgba(255, 56, 92, .28);
-  background: #fff5f7;
+  background: var(--mm-primary-soft);
 }
 
 .summary-line {
@@ -510,7 +511,7 @@ h1 {
   padding: 3px 9px;
   border-radius: 999px;
   background: rgba(18, 184, 134, .12);
-  color: #087f5b;
+  color: var(--mm-success);
   font-size: 13px;
   font-weight: 650;
 }

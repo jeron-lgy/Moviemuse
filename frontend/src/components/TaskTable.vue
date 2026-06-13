@@ -192,12 +192,12 @@ function progressWidth(job) {
   width: 0;
   height: 100%;
   border-radius: inherit;
-  background: #c8cdd3;
+  background: color-mix(in srgb, var(--mm-muted) 35%, var(--mm-surface));
   transition: width .25s ease;
 }
 
 .progress-track.completed i {
-  background: #c8cdd3;
+  background: color-mix(in srgb, var(--mm-muted) 35%, var(--mm-surface));
 }
 
 .progress-track.failed i {
@@ -206,7 +206,7 @@ function progressWidth(job) {
 
 .progress-track.queued i,
 .progress-track.idle i {
-  background: #d5d9de;
+  background: color-mix(in srgb, var(--mm-muted) 28%, var(--mm-surface));
 }
 
 .progress-cell strong {

@@ -149,7 +149,7 @@ function emitDetail() {
   aspect-ratio: 3 / 2;
   padding: 0;
   border: 0;
-  background: #f6f6f6;
+  background: var(--mm-image-bg);
   color: var(--mm-muted);
   cursor: pointer;
   overflow: hidden;
@@ -161,7 +161,7 @@ function emitDetail() {
   height: 100%;
   object-fit: contain;
   object-position: center;
-  background: #f6f6f6;
+  background: var(--mm-image-bg);
 }
 
 .poster.is-cover img {
@@ -245,7 +245,7 @@ h3 {
   padding: 0 9px;
   border: 0;
   border-radius: 999px;
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
   font-size: var(--mm-font-size-sm);
   font-weight: var(--mm-font-weight-medium);

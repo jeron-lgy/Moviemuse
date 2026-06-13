@@ -1,7 +1,8 @@
 export async function api(path, options = {}) {
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
+  const { skipAuthRedirect, ...fetchOptions } = options
   const response = await fetch(path, {
-    ...options,
+    ...fetchOptions,
     headers: {
       ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(options.headers || {})
@@ -18,13 +19,18 @@ export async function api(path, options = {}) {
   }
   if (!response.ok) {
     const message = data.detail || data.message || response.statusText || '请求失败'
+    if (response.status === 401 && !skipAuthRedirect && typeof window !== 'undefined' && window.location.pathname !== '/login') {
+      const redirect = `${window.location.pathname}${window.location.search}`
+      window.location.href = `/login?redirect=${encodeURIComponent(redirect)}`
+    }
     throw new Error(message)
   }
   return data
 }
 
-export function postJson(path, payload) {
+export function postJson(path, payload, options = {}) {
   return api(path, {
+    ...options,
     method: 'POST',
     body: JSON.stringify(payload || {})
   })

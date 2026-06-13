@@ -1212,7 +1212,7 @@ h1 {
   height: 14px;
   border-radius: 999px;
   background: var(--mm-primary);
-  box-shadow: 0 0 0 10px #fff0f3;
+  box-shadow: 0 0 0 10px var(--mm-primary-soft);
 }
 
 .service-card i.on {
@@ -1265,7 +1265,7 @@ h1 {
 
 .segmented button.active,
 .state-tabs button.active {
-  background: #fff;
+  background: var(--mm-card-bg);
   color: var(--mm-primary);
   box-shadow: var(--mm-shadow);
 }
@@ -1298,7 +1298,7 @@ h1 {
 }
 
 .state-dot.completed {
-  background: #16a34a;
+  background: var(--mm-success);
 }
 
 .empty {
@@ -1418,7 +1418,7 @@ textarea {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
 }
 
@@ -1438,7 +1438,7 @@ input[type="checkbox"] {
   padding: 16px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-control-bg);
   text-align: left;
 }
 
@@ -1458,7 +1458,7 @@ input[type="checkbox"] {
 
 .provider-grid button.active {
   border-color: var(--mm-primary);
-  background: #fff5f7;
+  background: var(--mm-primary-soft);
 }
 
 .ffmpeg-send-panel {
@@ -1498,7 +1498,7 @@ input[type="checkbox"] {
   padding: 16px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   text-align: left;
   cursor: pointer;
@@ -1534,7 +1534,7 @@ input[type="checkbox"] {
   padding: 0 12px;
   border: 1px solid var(--mm-border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--mm-control-bg);
 }
 
 @media (max-width: 1100px) {

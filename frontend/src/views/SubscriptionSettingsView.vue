@@ -411,6 +411,33 @@
       </div>
     </BaseCard>
 
+    <BaseCard v-else-if="activeTab === 'account'" class="setting-panel">
+      <div class="panel-head">
+        <div>
+          <h2>用户设置</h2>
+          <p>修改控制台登录账号。默认账号密码为 admin / admin，建议首次登录后立即修改。</p>
+        </div>
+        <BaseButton type="button" @click="logout">退出登录</BaseButton>
+      </div>
+      <div class="form-grid">
+        <FormField label="用户名">
+          <input v-model.trim="system.auth.username" autocomplete="username">
+        </FormField>
+        <FormField label="新密码" hint="留空则只修改用户名。">
+          <SecretInput v-model="system.auth.password" autocomplete="new-password" />
+        </FormField>
+        <FormField label="确认新密码">
+          <SecretInput v-model="system.auth.confirm_password" autocomplete="new-password" />
+        </FormField>
+      </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存账号' }}
+        </BaseButton>
+      </div>
+    </BaseCard>
+
     <NotificationsView v-else ref="notificationsView" embedded />
   </section>
 </template>
@@ -430,6 +457,7 @@ const tabs = [
   { key: 'makers', label: '常驻厂牌' },
   { key: 'identities', label: '身份锚点' },
   { key: 'network', label: '系统代理' },
+  { key: 'account', label: '用户设置' },
   { key: 'notifications', label: '通知' }
 ]
 tabs.splice(Math.max(0, tabs.length - 1), 0, { key: 'cache', label: '缓存维护' })
@@ -494,7 +522,8 @@ const system = reactive({
   mteam: { site_url: '', mode: 'rss', rss_url: '', api_url: '', api_key: '', enabled: false },
   qbittorrent: { url: '', api_key: '', username: '', password: '', save_path: '', category: '', tags: '' },
   jellyfin: { url: '', api_key: '', username: '', library_id: '', library_name: '', dedupe_enabled: true },
-  network: { proxy_enabled: false, http_proxy: '', https_proxy: '', no_proxy: 'localhost,127.0.0.1', apply_to_javdb: true, flaresolverr_url: '' }
+  network: { proxy_enabled: false, http_proxy: '', https_proxy: '', no_proxy: 'localhost,127.0.0.1', apply_to_javdb: true, flaresolverr_url: '' },
+  auth: { username: 'admin', password: '', confirm_password: '' }
 })
 
 const subscription = reactive({
@@ -551,6 +580,7 @@ async function loadAll() {
     Object.assign(system.qbittorrent, systemPayload.settings?.qbittorrent || {})
     Object.assign(system.jellyfin, systemPayload.settings?.jellyfin || {})
     Object.assign(system.network, systemPayload.settings?.network || {})
+    Object.assign(system.auth, { username: systemPayload.settings?.auth?.username || 'admin', password: '', confirm_password: '' })
     await loadProxyStatus()
     await loadAssetCache()
     await loadActorIdentities()
@@ -579,11 +609,25 @@ async function loadAll() {
 }
 
 async function saveSystemSettings() {
+  if (activeTab.value === 'account') {
+    if (!system.auth.username.trim()) {
+      throw new Error('用户名不能为空')
+    }
+    if (system.auth.password || system.auth.confirm_password) {
+      if (system.auth.password !== system.auth.confirm_password) {
+        throw new Error('两次输入的新密码不一致')
+      }
+    }
+  }
   await postJson('/api/system-settings', {
     mteam: { ...system.mteam },
     qbittorrent: { ...system.qbittorrent },
     jellyfin: { ...system.jellyfin },
-    network: { ...system.network }
+    network: { ...system.network },
+    auth: {
+      username: system.auth.username,
+      password: activeTab.value === 'account' ? system.auth.password : ''
+    }
   })
 }
 
@@ -616,7 +660,13 @@ async function saveAll() {
     }
     syncJellyfinLibrary()
     await Promise.all([saveSystemSettings(), saveSubscriptionSettings()])
-    message.value = '系统设置已保存'
+    if (activeTab.value === 'account') {
+      system.auth.password = ''
+      system.auth.confirm_password = ''
+      message.value = '用户设置已保存'
+    } else {
+      message.value = '系统设置已保存'
+    }
   } catch (err) {
     errorMessage.value = err.message || '保存设置失败'
   } finally {
@@ -634,6 +684,14 @@ async function testIntegration(name) {
     message.value = result.message || result.detail?.message || `${name} 测试完成`
   } catch (err) {
     errorMessage.value = err.message || `${name} 测试失败`
+  }
+}
+
+async function logout() {
+  try {
+    await postJson('/api/auth/logout', {})
+  } finally {
+    window.location.href = '/login'
   }
 }
 
@@ -928,7 +986,7 @@ async function deleteActorIdentity() {
   padding: 0 16px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-muted);
   font: inherit;
   font-weight: var(--mm-font-weight-medium);
@@ -938,7 +996,7 @@ async function deleteActorIdentity() {
 .setting-tabs button.active,
 .setting-tabs button:hover {
   border-color: rgba(255, 56, 92, .35);
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
 }
 
@@ -991,7 +1049,7 @@ async function deleteActorIdentity() {
   padding: 10px 14px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #f8fafc;
+  background: var(--mm-control-muted-bg);
   color: var(--mm-muted);
 }
 
@@ -1014,7 +1072,7 @@ async function deleteActorIdentity() {
   padding: 14px;
   border: 1px solid var(--mm-border);
   border-radius: 12px;
-  background: #f8fafc;
+  background: var(--mm-control-muted-bg);
 }
 
 .cache-summary span,
@@ -1082,7 +1140,7 @@ async function deleteActorIdentity() {
   padding: 12px;
   border: 1px solid var(--mm-border);
   border-radius: 12px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   text-align: left;
   cursor: pointer;
@@ -1090,7 +1148,7 @@ async function deleteActorIdentity() {
 
 .identity-row.active {
   border-color: rgba(255, 56, 92, .5);
-  background: #fff5f7;
+  background: var(--mm-primary-soft);
 }
 
 .identity-row input {
@@ -1151,7 +1209,7 @@ textarea {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   font: inherit;
 }

@@ -28,8 +28,22 @@
   --mm-muted: #6A6A6A;
   --mm-border: #DDDDDD;
   --mm-bg: #FFFFFF;
+  --mm-card-bg: #FFFFFF;
+  --mm-control-bg: #FFFFFF;
+  --mm-control-muted-bg: #F8FAFC;
+  --mm-image-bg: #F6F6F6;
   --mm-surface: #F7F7F7;
   --mm-shadow: 0 2px 8px rgba(0,0,0,.08);
+  --mm-shadow-soft: 0 1px 4px rgba(0,0,0,.08);
+  --mm-menu-shadow: 0 16px 40px rgba(0,0,0,.16);
+  --mm-notice-bg: #FFF5F7;
+  --mm-notice-border: #FFD1DA;
+  --mm-danger-border: #FFB3C0;
+  --mm-success-border: #B7DBC1;
+  --mm-warning: #C27803;
+  --mm-warning-soft: #FFF7DB;
+  --mm-warning-border: #E9D7A8;
+  --mm-overlay-bg: rgba(24,24,27,.46);
   --mm-radius-sm: 8px;
   --mm-radius-md: 14px;
   --mm-radius-lg: 20px;
@@ -58,6 +72,70 @@
   --mm-control-height: 44px;
   --mm-layout-gap: 24px;
   --mm-page-padding: 32px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --mm-primary: #FF5A78;
+  --mm-primary-hover: #FF7891;
+  --mm-primary-soft: rgba(255, 90, 120, .16);
+  --mm-success: #48C774;
+  --mm-success-soft: rgba(72, 199, 116, .16);
+  --mm-danger: #FF6B6B;
+  --mm-danger-soft: rgba(255, 107, 107, .16);
+  --mm-text: #F4F4F5;
+  --mm-muted: #A7A7AD;
+  --mm-border: #34343A;
+  --mm-bg: #131316;
+  --mm-card-bg: #1B1B20;
+  --mm-control-bg: #232329;
+  --mm-control-muted-bg: #202026;
+  --mm-image-bg: #24242A;
+  --mm-surface: #24242A;
+  --mm-shadow: 0 10px 28px rgba(0,0,0,.28);
+  --mm-shadow-soft: 0 4px 12px rgba(0,0,0,.24);
+  --mm-menu-shadow: 0 20px 48px rgba(0,0,0,.38);
+  --mm-notice-bg: rgba(255, 90, 120, .10);
+  --mm-notice-border: rgba(255, 90, 120, .28);
+  --mm-danger-border: rgba(255, 107, 107, .32);
+  --mm-success-border: rgba(72, 199, 116, .32);
+  --mm-warning: #F5B84B;
+  --mm-warning-soft: rgba(245, 184, 75, .16);
+  --mm-warning-border: rgba(245, 184, 75, .32);
+  --mm-overlay-bg: rgba(0,0,0,.62);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --mm-primary: #FF5A78;
+    --mm-primary-hover: #FF7891;
+    --mm-primary-soft: rgba(255, 90, 120, .16);
+    --mm-success: #48C774;
+    --mm-success-soft: rgba(72, 199, 116, .16);
+    --mm-danger: #FF6B6B;
+    --mm-danger-soft: rgba(255, 107, 107, .16);
+    --mm-text: #F4F4F5;
+    --mm-muted: #A7A7AD;
+    --mm-border: #34343A;
+    --mm-bg: #131316;
+    --mm-card-bg: #1B1B20;
+    --mm-control-bg: #232329;
+    --mm-control-muted-bg: #202026;
+    --mm-image-bg: #24242A;
+    --mm-surface: #24242A;
+    --mm-shadow: 0 10px 28px rgba(0,0,0,.28);
+    --mm-shadow-soft: 0 4px 12px rgba(0,0,0,.24);
+    --mm-menu-shadow: 0 20px 48px rgba(0,0,0,.38);
+    --mm-notice-bg: rgba(255, 90, 120, .10);
+    --mm-notice-border: rgba(255, 90, 120, .28);
+    --mm-danger-border: rgba(255, 107, 107, .32);
+    --mm-success-border: rgba(72, 199, 116, .32);
+    --mm-warning: #F5B84B;
+    --mm-warning-soft: rgba(245, 184, 75, .16);
+    --mm-warning-border: rgba(245, 184, 75, .32);
+    --mm-overlay-bg: rgba(0,0,0,.62);
+  }
 }
 
 * {
@@ -96,7 +174,7 @@ input[type="radio"] {
   padding: var(--mm-button-padding-md);
   border: 1px solid var(--mm-border);
   border-radius: var(--mm-radius-sm);
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   font-size: var(--mm-font-size-body);
   font-weight: var(--mm-font-weight-medium);
@@ -165,7 +243,7 @@ input[type="radio"] {
 .mm-card {
   border: 1px solid var(--mm-border);
   border-radius: var(--mm-radius-md);
-  background: #fff;
+  background: var(--mm-card-bg);
   box-shadow: var(--mm-shadow);
 }
 
@@ -227,16 +305,16 @@ input[type="radio"] {
 
 .mm-notice {
   padding: 12px 16px;
-  border: 1px solid #FFD1DA;
+  border: 1px solid var(--mm-notice-border);
   border-radius: var(--mm-radius-sm);
-  background: #FFF5F7;
+  background: var(--mm-notice-bg);
   color: var(--mm-primary);
   font-size: var(--mm-font-size-body);
   font-weight: var(--mm-font-weight-medium);
 }
 
 .mm-notice.error {
-  border-color: #FFB3C0;
+  border-color: var(--mm-danger-border);
   background: var(--mm-danger-soft);
   color: var(--mm-danger);
 }
@@ -256,7 +334,7 @@ input[type="radio"] {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: var(--mm-radius-sm);
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   font-size: var(--mm-font-size-body);
   font-weight: var(--mm-font-weight-regular);

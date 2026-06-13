@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,10 @@ NOTIFICATION_CHANNEL_DEFAULTS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+def password_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -89,6 +94,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         },
         "templates": {},
     },
+    "auth": {
+        "username": "admin",
+        "password_hash": password_hash("admin"),
+    },
 }
 
 
@@ -101,6 +110,7 @@ class SystemSettingsService:
         self.data = self._load()
         self._normalize_network()
         self._normalize_notifications()
+        self._normalize_auth()
 
     def _load(self) -> dict[str, Any]:
         data = json.loads(json.dumps(DEFAULT_SETTINGS))
@@ -118,7 +128,20 @@ class SystemSettingsService:
 
     def get(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self.data))
+            payload = json.loads(json.dumps(self.data))
+            auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+            payload["auth"] = {
+                "username": str(auth.get("username") or "admin"),
+                "password_configured": bool(auth.get("password_hash")),
+            }
+            return payload
+
+    def auth(self) -> dict[str, str]:
+        with self._lock:
+            auth = self.data.setdefault("auth", {})
+            username = str(auth.get("username") or "admin").strip() or "admin"
+            hashed = str(auth.get("password_hash") or password_hash("admin"))
+            return {"username": username, "password_hash": hashed}
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -129,9 +152,19 @@ class SystemSettingsService:
                     for key, item in value.items():
                         if key in DEFAULT_SETTINGS[section]:
                             self.data[section][key] = item
+            auth = payload.get("auth")
+            if isinstance(auth, dict):
+                self.data.setdefault("auth", {})
+                username = str(auth.get("username") or "").strip()
+                password = str(auth.get("password") or "")
+                if username:
+                    self.data["auth"]["username"] = username
+                if password:
+                    self.data["auth"]["password_hash"] = password_hash(password)
             self.data["mteam"]["enabled"] = bool(self.data.get("mteam", {}).get("enabled"))
             self._normalize_network()
             self._normalize_notifications()
+            self._normalize_auth()
             self._save()
             return self.get()
 
@@ -154,6 +187,15 @@ class SystemSettingsService:
         templates = notifications.setdefault("templates", {})
         if not isinstance(templates, dict):
             notifications["templates"] = {}
+
+    def _normalize_auth(self) -> None:
+        auth = self.data.setdefault("auth", {})
+        username = str(auth.get("username") or "admin").strip() or "admin"
+        hashed = str(auth.get("password_hash") or "").strip()
+        legacy_password = str(auth.get("password") or "")
+        auth["username"] = username
+        auth["password_hash"] = hashed or password_hash(legacy_password or "admin")
+        auth.pop("password", None)
 
 
 def merge_dict(target: dict[str, Any], source: dict[str, Any]) -> None:

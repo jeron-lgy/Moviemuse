@@ -57,7 +57,7 @@ function onInput(event) {
   padding: 0 46px 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: var(--mm-input-radius, 8px);
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
   font: inherit;
 }

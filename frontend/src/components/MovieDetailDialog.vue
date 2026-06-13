@@ -431,7 +431,7 @@ function openExternal(link) {
   justify-content: center;
   overflow: auto;
   padding: 32px;
-  background: rgba(24, 24, 27, .46);
+  background: var(--mm-overlay-bg);
 }
 
 .movie-detail-panel {
@@ -442,7 +442,7 @@ function openExternal(link) {
   padding: 28px;
   border: 1px solid var(--mm-border);
   border-radius: var(--mm-radius-lg);
-  background: var(--mm-bg, #fff);
+  background: var(--mm-card-bg);
   box-shadow: 0 28px 90px rgba(0, 0, 0, .24);
 }
 
@@ -455,7 +455,7 @@ function openExternal(link) {
   height: 40px;
   border: 0;
   border-radius: 999px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-muted);
   font-size: 22px;
   cursor: pointer;
@@ -553,7 +553,7 @@ h2 {
   min-height: 28px;
   border: 0;
   border-radius: 999px;
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
   font-size: var(--mm-font-size-sm);
   font-weight: var(--mm-font-weight-medium);

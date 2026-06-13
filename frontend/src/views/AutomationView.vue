@@ -240,7 +240,7 @@ select {
   padding: 0 12px;
   border: 1px solid var(--mm-border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--mm-control-bg);
   font-weight: 500;
 }
 

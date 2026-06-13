@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import json
+import secrets
 import uuid
 import hashlib
 import base64
@@ -604,6 +605,38 @@ if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST), name="frontend-assets")
 move_jobs: dict[str, dict[str, Any]] = {}
 move_jobs_lock = threading.Lock()
+console_sessions: dict[str, dict[str, Any]] = {}
+console_sessions_lock = threading.RLock()
+CONSOLE_SESSION_COOKIE = "moviemuse_session"
+CONSOLE_SESSION_TTL = 7 * 24 * 60 * 60
+CONSOLE_AUTH_OPEN_PREFIXES = (
+    "/api/auth",
+    "/api/subtitle",
+    "/api/transcode",
+    "/api/compute",
+    "/static",
+    "/assets",
+    "/docs",
+    "/openapi.json",
+)
+CONSOLE_AUTH_OPEN_EXACT = {"/api/v1/message"}
+
+
+def console_auth_required_path(path: str) -> bool:
+    if path in CONSOLE_AUTH_OPEN_EXACT:
+        return False
+    if any(path.startswith(prefix) for prefix in CONSOLE_AUTH_OPEN_PREFIXES):
+        return False
+    if path.startswith("/api/postprocess/tasks/") and path.endswith("/worker-done"):
+        return False
+    return path.startswith("/api/")
+
+
+@app.middleware("http")
+async def console_auth_middleware(request: Request, call_next: Callable[[Request], Any]) -> Response:
+    if console_auth_required_path(request.url.path) and not current_console_user(request):
+        return Response('{"detail":"请先登录"}', status_code=401, media_type="application/json")
+    return await call_next(request)
 
 
 def frontend_index_response() -> FileResponse | None:
@@ -1929,6 +1962,13 @@ def dashboard_page(request: Request, legacy: int = 0) -> Response:
     return frontend_app_response()
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request) -> Response:
+    if compute_node_only():
+        return Response("MovieMuse compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
+    return frontend_app_response()
+
+
 @app.get("/api/dashboard")
 def api_dashboard() -> dict[str, Any]:
     return {"dashboard": dashboard_payload()}
@@ -3162,6 +3202,33 @@ def get_system_settings_service() -> SystemSettingsService:
         _, _, data_dir = settings()
         system_settings_service = SystemSettingsService(data_dir)
     return system_settings_service
+
+
+def console_password_hash(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def current_console_user(request: Request) -> str:
+    token = str(request.cookies.get(CONSOLE_SESSION_COOKIE) or "")
+    if not token:
+        return ""
+    now = time.time()
+    with console_sessions_lock:
+        session = console_sessions.get(token)
+        if not session:
+            return ""
+        if now - float(session.get("created_at") or 0) > CONSOLE_SESSION_TTL:
+            console_sessions.pop(token, None)
+            return ""
+        session["last_seen_at"] = now
+        return str(session.get("username") or "")
+
+
+def create_console_session(username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    with console_sessions_lock:
+        console_sessions[token] = {"username": username, "created_at": time.time(), "last_seen_at": time.time()}
+    return token
 
 
 def expire_wash_requests_with_postprocess() -> int:
@@ -10232,6 +10299,45 @@ def api_get_subscription_tasks() -> dict[str, object]:
 @app.post("/api/subscriptions/tasks/{task_id}/run")
 def api_run_subscription_task(task_id: str) -> dict[str, object]:
     return {"status": "ok", "result": run_subscription_task(task_id)}
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request) -> dict[str, object]:
+    username = current_console_user(request)
+    auth = get_system_settings_service().auth()
+    return {
+        "authenticated": bool(username),
+        "username": username or auth["username"],
+    }
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request, response: Response) -> dict[str, object]:
+    payload = await request.json()
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    auth = get_system_settings_service().auth()
+    if username != auth["username"] or not secrets.compare_digest(console_password_hash(password), auth["password_hash"]):
+        raise HTTPException(status_code=401, detail="用户名或密码不正确")
+    token = create_console_session(username)
+    response.set_cookie(
+        CONSOLE_SESSION_COOKIE,
+        token,
+        max_age=CONSOLE_SESSION_TTL,
+        httponly=True,
+        samesite="lax",
+    )
+    return {"status": "ok", "authenticated": True, "username": username}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request, response: Response) -> dict[str, object]:
+    token = str(request.cookies.get(CONSOLE_SESSION_COOKIE) or "")
+    if token:
+        with console_sessions_lock:
+            console_sessions.pop(token, None)
+    response.delete_cookie(CONSOLE_SESSION_COOKIE)
+    return {"status": "ok"}
 
 
 @app.get("/api/system-settings")

@@ -358,7 +358,7 @@ function openMaker(link) {
   border-radius: 8px;
   padding: 0 12px;
   color: var(--mm-text);
-  background: #fff;
+  background: var(--mm-control-bg);
 }
 
 .section-head {

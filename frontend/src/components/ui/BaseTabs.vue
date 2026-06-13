@@ -57,7 +57,7 @@ defineProps({
 
 .base-tabs button.active {
   border-color: rgba(255, 56, 92, .18);
-  background: #fff;
+  background: var(--mm-card-bg);
   color: var(--mm-primary);
   box-shadow: var(--mm-shadow);
 }

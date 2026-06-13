@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const DashboardView = () => import('./views/DashboardView.vue')
+const LoginView = () => import('./views/LoginView.vue')
 const TaskCenterView = () => import('./views/TaskCenterView.vue')
 const CompareView = () => import('./components/CompareView.vue')
 const SubscriptionSearchView = () => import('./views/SubscriptionSearchView.vue')
@@ -17,6 +18,7 @@ const UiPreviewView = () => import('./views/UiPreviewView.vue')
 
 export const routes = [
   { path: '/', redirect: '/dashboard' },
+  { path: '/login', name: 'login', component: LoginView, meta: { title: '登录', public: true, fullBleed: true } },
   { path: '/dashboard', name: 'dashboard', component: DashboardView, meta: { title: '首页' } },
   { path: '/subtitles', name: 'task-center', component: TaskCenterView, meta: { title: '任务中心' } },
   { path: '/subtitles/compare', name: 'subtitle-compare', component: CompareView, meta: { title: '字幕对比', fullBleed: true } },
@@ -33,12 +35,26 @@ export const routes = [
   { path: '/automation', name: 'automation', component: AutomationView, meta: { title: '自动任务' } },
   { path: '/logs', name: 'logs', component: LogsView, meta: { title: '日志系统' } },
   { path: '/scan-api', name: 'scan-api', component: ScanApiView, meta: { title: '扫描 API' } },
-  { path: '/ui-preview', name: 'ui-preview', component: UiPreviewView, meta: { title: 'UI Preview' } }
+  { path: '/ui-preview', name: 'ui-preview', component: UiPreviewView, meta: { title: 'UI Preview', public: true } }
 ]
 
 export const router = createRouter({
   history: createWebHistory(),
   routes
+})
+
+router.beforeEach(async (to) => {
+  if (to.meta.public) return true
+  try {
+    const response = await fetch('/api/auth/me', { headers: { Accept: 'application/json' } })
+    if (response.ok) {
+      const payload = await response.json()
+      if (payload.authenticated) return true
+    }
+  } catch {
+    // Fall through to login.
+  }
+  return { path: '/login', query: { redirect: to.fullPath } }
 })
 
 router.afterEach((to) => {

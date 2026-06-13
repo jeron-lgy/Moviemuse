@@ -112,7 +112,8 @@ select {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
+  color: var(--mm-text);
 }
 
 .log-panel {
@@ -132,7 +133,7 @@ select {
   padding: 14px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-card-bg);
 }
 
 .level {
@@ -141,7 +142,7 @@ select {
 }
 
 .level.error {
-  color: #d92d20;
+  color: var(--mm-danger);
 }
 
 .source,
@@ -163,7 +164,7 @@ time {
   align-items: center;
   padding: 0 10px;
   border-radius: 999px;
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
   font-size: 12px;
   font-weight: 600;

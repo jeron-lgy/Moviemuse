@@ -412,7 +412,7 @@ function formatStatus(status) {
   align-self: end;
   margin-top: 2px;
   border-radius: 999px;
-  background: #eee;
+  background: var(--mm-surface);
 }
 
 .progress-track i {
@@ -494,7 +494,7 @@ function formatStatus(status) {
   padding: 0 10px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
 }
 
 .dir-row input,
@@ -549,7 +549,7 @@ function formatStatus(status) {
   padding: 0 8px;
   border: 1px solid var(--mm-border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--mm-control-bg);
   white-space: nowrap;
 }
 
@@ -586,7 +586,7 @@ function formatStatus(status) {
   padding: 14px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-card-bg);
 }
 
 .group-title {
@@ -617,24 +617,24 @@ function formatStatus(status) {
   gap: 8px;
   min-height: 42px;
   padding: 7px 10px;
-  border: 1px solid #ececec;
+  border: 1px solid var(--mm-border);
   border-radius: 8px;
   background: var(--mm-surface);
 }
 
 .file-row.move-hit {
-  border-color: #FFB3C0;
-  background: #FFF5F7;
+  border-color: var(--mm-danger-border);
+  background: var(--mm-notice-bg);
 }
 
 .file-row.subtitle-hit {
-  border-color: #B7DBC1;
-  background: #F3FBF5;
+  border-color: var(--mm-success-border);
+  background: var(--mm-success-soft);
 }
 
 .file-row.soft-hit {
-  border-color: #E9D7A8;
-  background: #FFFDF4;
+  border-color: var(--mm-warning-border);
+  background: var(--mm-warning-soft);
 }
 
 .file-row.ignored {

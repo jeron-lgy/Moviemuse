@@ -424,8 +424,8 @@ async function runScan() {
 }
 
 .live-dot.warning {
-  background: #c27803;
-  box-shadow: 0 0 0 6px #fff7db;
+  background: var(--mm-warning);
+  box-shadow: 0 0 0 6px var(--mm-warning-soft);
 }
 
 .live-dot.danger {

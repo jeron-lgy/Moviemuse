@@ -239,7 +239,7 @@ onMounted(loadSettings)
   min-height: 100vh;
   padding: 44px 24px 64px;
   color: var(--mm-text);
-  background: #fff;
+  background: var(--mm-bg);
 }
 
 .compare-head {
@@ -317,7 +317,8 @@ input {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
+  color: var(--mm-text);
 }
 
 .segmented {
@@ -340,7 +341,7 @@ input {
 }
 
 .segmented button.active {
-  background: #fff;
+  background: var(--mm-card-bg);
   color: var(--mm-primary);
   box-shadow: var(--mm-shadow);
 }
@@ -365,8 +366,8 @@ input {
   margin-top: 14px;
   padding: 12px 14px;
   border-radius: 8px;
-  color: #087e74;
-  background: #eafaf5;
+  color: var(--mm-success);
+  background: var(--mm-success-soft);
   font-size: 13px;
 }
 
@@ -424,14 +425,14 @@ input {
   margin-top: 9px;
   padding: 8px 10px;
   border-radius: 8px;
-  background: #ecfaf6;
-  color: #17685f;
+  background: var(--mm-success-soft);
+  color: var(--mm-success);
   font-size: 13px;
 }
 
 .sent-source span {
   margin-right: 8px;
-  color: #087e74;
+  color: var(--mm-success);
   font-size: 11px;
   font-weight: 700;
 }

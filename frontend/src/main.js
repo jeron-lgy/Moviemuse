@@ -2,9 +2,12 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import { VueQueryPlugin } from '@tanstack/vue-query'
 import './styles/tokens.css'
+import { initTheme } from './lib/theme'
 import App from './App.vue'
 import { router } from './router'
 import * as uiComponents from './components/ui'
+
+initTheme()
 
 const app = createApp(App)
 

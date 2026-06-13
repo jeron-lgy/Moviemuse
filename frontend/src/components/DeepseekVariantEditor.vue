@@ -77,12 +77,12 @@ function update(key, value) {
   padding: 18px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--mm-card-bg);
 }
 
 .variant-panel.accent {
   border-color: var(--mm-primary);
-  background: #fff5f7;
+  background: var(--mm-primary-soft);
 }
 
 header {
@@ -109,7 +109,7 @@ header h3 {
 header em {
   padding: 4px 10px;
   border-radius: 999px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-primary);
   font-size: 12px;
   font-style: normal;
@@ -129,7 +129,7 @@ textarea {
   padding: 0 12px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
 }
 

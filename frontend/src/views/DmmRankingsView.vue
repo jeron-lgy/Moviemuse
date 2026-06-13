@@ -345,7 +345,7 @@ function formatTime(value) {
   padding: 0 18px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-muted);
   font-weight: 600;
   cursor: pointer;
@@ -353,7 +353,7 @@ function formatTime(value) {
 
 .ranking-tabs button.active {
   border-color: var(--mm-primary);
-  background: #fff5f7;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
 }
 

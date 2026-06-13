@@ -446,7 +446,7 @@ h1 {
   padding: 0 18px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-muted);
   font-weight: 600;
   cursor: pointer;
@@ -454,7 +454,7 @@ h1 {
 
 .maker-tabs button.active {
   border-color: var(--mm-primary);
-  background: #fff5f7;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
 }
 
@@ -478,7 +478,7 @@ h1 {
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-text);
 }
 

@@ -72,9 +72,17 @@
           <span>扫描 API</span>
         </RouterLink>
       </nav>
+
+      <button class="mm-nav-item mm-logout" type="button" title="注销" @click="logout">
+        <LogOut :size="20" />
+        <span>注销</span>
+      </button>
     </aside>
 
     <main class="mm-main" :class="{ full: route.meta.fullBleed }">
+      <div v-if="showThemeToggle" class="mm-app-toolbar">
+        <BaseThemeToggle />
+      </div>
       <RouterView />
     </main>
   </div>
@@ -91,16 +99,20 @@ import {
   FileText,
   LayoutDashboard,
   ListChecks,
+  LogOut,
   PanelTop,
   ScanLine,
   Settings,
   Sparkles
 } from '@lucide/vue'
 import { useUiStore } from './stores/ui'
+import { postJson } from './lib/api'
+import { BaseThemeToggle } from './components/ui'
 
 const ui = useUiStore()
 const route = useRoute()
 const subscriptionsOpen = computed(() => ui.openGroups.subscriptions)
+const showThemeToggle = computed(() => !route.meta.fullBleed && route.name !== 'ui-preview')
 
 watch(
   () => route.meta.module,
@@ -109,6 +121,14 @@ watch(
   },
   { immediate: true }
 )
+
+async function logout() {
+  try {
+    await postJson('/api/auth/logout', {}, { skipAuthRedirect: true })
+  } finally {
+    window.location.href = '/login'
+  }
+}
 </script>
 
 <style scoped>
@@ -118,7 +138,7 @@ watch(
   min-height: 100vh;
   gap: 24px;
   padding: 24px;
-  background: #fff;
+  background: var(--mm-bg);
 }
 
 .mm-shell.sidebar-collapsed {
@@ -129,7 +149,7 @@ watch(
 .mm-main {
   border: 1px solid var(--mm-border);
   border-radius: 20px;
-  background: #fff;
+  background: var(--mm-card-bg);
 }
 
 .mm-sidebar {
@@ -166,7 +186,7 @@ watch(
   height: 36px;
   border: 1px solid var(--mm-border);
   border-radius: var(--mm-radius-sm);
-  background: #fff;
+  background: var(--mm-control-bg);
   color: var(--mm-muted);
   cursor: pointer;
   transition: background .18s ease, border-color .18s ease, color .18s ease;
@@ -185,7 +205,7 @@ watch(
   height: 44px;
   overflow: hidden;
   border-radius: 14px;
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
 }
 
 .mm-brand-icon img {
@@ -215,6 +235,11 @@ watch(
   margin-top: 28px;
 }
 
+.mm-logout {
+  margin-top: auto;
+  color: var(--mm-muted);
+}
+
 .mm-nav-item {
   display: grid;
   grid-template-columns: 24px minmax(0, 1fr) auto;
@@ -225,8 +250,8 @@ watch(
   padding: 0 14px;
   border: 1px solid var(--mm-border);
   border-radius: 14px;
-  background: #fff;
-  color: #3f3f46;
+  background: var(--mm-control-bg);
+  color: var(--mm-text);
   font-size: 15px;
   font-weight: 500;
   text-align: left;
@@ -236,9 +261,10 @@ watch(
 }
 
 .mm-nav-item:hover,
-.mm-nav-item.router-link-active {
+.mm-nav-item.router-link-active,
+.mm-logout:hover {
   border-color: rgba(255, 56, 92, .32);
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
 }
 
@@ -312,12 +338,14 @@ watch(
 
 .mm-sidebar.collapsed .mm-brand-copy,
 .mm-sidebar.collapsed .mm-nav-item span,
+.mm-sidebar.collapsed .mm-logout span,
 .mm-sidebar.collapsed .mm-chevron,
 .mm-sidebar.collapsed .mm-subnav {
   display: none;
 }
 
-.mm-sidebar.collapsed .mm-nav-item {
+.mm-sidebar.collapsed .mm-nav-item,
+.mm-sidebar.collapsed .mm-logout {
   grid-template-columns: 1fr;
   justify-items: center;
   padding: 0;
@@ -327,6 +355,12 @@ watch(
   min-width: 0;
   min-height: calc(100vh - 48px);
   padding: 32px;
+}
+
+.mm-app-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin: -8px 0 18px;
 }
 
 .mm-main.full {
@@ -370,6 +404,10 @@ watch(
     min-width: 0;
     overflow-x: auto;
     padding-bottom: 2px;
+  }
+
+  .mm-logout {
+    margin-top: 10px;
   }
 
   .mm-nav-item {

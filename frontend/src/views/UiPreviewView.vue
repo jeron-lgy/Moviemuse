@@ -6,6 +6,7 @@
       description="临时查看按钮、卡片、表单、标签、提示条和页面标题的统一视觉。"
     >
       <template #actions>
+        <BaseThemeToggle />
         <BaseButton type="button">普通按钮</BaseButton>
         <BaseButton type="button" variant="primary">主按钮</BaseButton>
       </template>
@@ -34,6 +35,18 @@
           <StatusPill tone="primary">等待处理</StatusPill>
           <StatusPill tone="success">已完成</StatusPill>
           <StatusPill tone="danger">失败</StatusPill>
+        </div>
+      </BaseCard>
+
+      <BaseCard as="article" class="preview-panel">
+        <h2>主题</h2>
+        <p>默认跟随系统，也可以手动固定亮色或暗色。</p>
+        <BaseThemeToggle />
+        <div class="theme-swatches">
+          <span class="swatch bg">背景</span>
+          <span class="swatch card">卡片</span>
+          <span class="swatch control">输入</span>
+          <span class="swatch primary">主题</span>
         </div>
       </BaseCard>
 
@@ -103,7 +116,7 @@
 
 <script setup>
 import { reactive, ref } from 'vue'
-import { BaseButton, BaseCard, BaseSwitch, BaseTabs, FormField, NoticeBanner, PageHeader, StatusPill } from '../components/ui'
+import { BaseButton, BaseCard, BaseSwitch, BaseTabs, BaseThemeToggle, FormField, NoticeBanner, PageHeader, StatusPill } from '../components/ui'
 
 const activeTab = ref('buttons')
 const tabs = [
@@ -190,6 +203,41 @@ const form = reactive({
 .checkbox-grid input {
   width: 18px;
   height: 18px;
+}
+
+.theme-swatches {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--mm-space-2);
+}
+
+.swatch {
+  display: grid;
+  place-items: center;
+  min-height: 46px;
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius-sm);
+  color: var(--mm-text);
+  font-size: var(--mm-font-size-sm);
+  font-weight: var(--mm-font-weight-medium);
+}
+
+.swatch.bg {
+  background: var(--mm-bg);
+}
+
+.swatch.card {
+  background: var(--mm-card-bg);
+}
+
+.swatch.control {
+  background: var(--mm-control-bg);
+}
+
+.swatch.primary {
+  border-color: var(--mm-primary);
+  background: var(--mm-primary);
+  color: #fff;
 }
 
 .form-grid {

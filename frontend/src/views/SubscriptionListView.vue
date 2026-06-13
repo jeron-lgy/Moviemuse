@@ -642,15 +642,15 @@ function removeActress(item) {
   overflow: hidden;
   border: 1px solid var(--mm-border);
   border-radius: 12px;
-  background: #fff;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, .16);
+  background: var(--mm-card-bg);
+  box-shadow: var(--mm-menu-shadow);
 }
 
 .more-panel button {
   min-height: 38px;
   padding: 0 14px;
   border: 0;
-  background: #fff;
+  background: var(--mm-card-bg);
   color: var(--mm-text);
   font-size: var(--mm-font-size-sm);
   text-align: left;
@@ -658,7 +658,7 @@ function removeActress(item) {
 }
 
 .more-panel button:hover {
-  background: #fff0f3;
+  background: var(--mm-primary-soft);
   color: var(--mm-primary);
 }
 
@@ -684,7 +684,7 @@ function removeActress(item) {
 .actress-cover img.is-work-cover {
   padding: 10px;
   object-fit: contain;
-  background: #f7f7f8;
+  background: var(--mm-image-bg);
 }
 
 .actress-body p {
