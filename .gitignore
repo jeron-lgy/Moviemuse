@@ -22,6 +22,7 @@ frontend/.vite/
 # Generated packages / temporary work dirs
 /dist/
 /moviemuse-move-*/
+.tmp-*/
 tmp-tests/
 
 # Local OS/editor noise
