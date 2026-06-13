@@ -6,6 +6,7 @@ const CompareView = () => import('./components/CompareView.vue')
 const SubscriptionSearchView = () => import('./views/SubscriptionSearchView.vue')
 const SubscriptionListView = () => import('./views/SubscriptionListView.vue')
 const MakersView = () => import('./views/MakersView.vue')
+const DmmRankingsView = () => import('./views/DmmRankingsView.vue')
 const SubscriptionTasksView = () => import('./views/SubscriptionTasksView.vue')
 const SubscriptionSettingsView = () => import('./views/SubscriptionSettingsView.vue')
 const AutomationView = () => import('./views/AutomationView.vue')
@@ -16,12 +17,13 @@ const UiPreviewView = () => import('./views/UiPreviewView.vue')
 
 export const routes = [
   { path: '/', redirect: '/dashboard' },
-  { path: '/dashboard', name: 'dashboard', component: DashboardView, meta: { title: 'Dashboard' } },
+  { path: '/dashboard', name: 'dashboard', component: DashboardView, meta: { title: '首页' } },
   { path: '/subtitles', name: 'task-center', component: TaskCenterView, meta: { title: '任务中心' } },
   { path: '/subtitles/compare', name: 'subtitle-compare', component: CompareView, meta: { title: '字幕对比', fullBleed: true } },
   { path: '/subscription-search', name: 'subscription-search', component: SubscriptionSearchView, meta: { title: '搜索', module: '订阅管理' } },
   { path: '/subscriptions', name: 'subscriptions', component: SubscriptionListView, meta: { title: '订阅', module: '订阅管理' } },
   { path: '/makers', name: 'makers', component: MakersView, meta: { title: '厂牌发售', module: '订阅管理' } },
+  { path: '/rankings', name: 'rankings', component: DmmRankingsView, meta: { title: 'DMM/FANZA 榜单', module: '订阅管理' } },
   { path: '/subscription-tasks', redirect: '/automation' },
   { path: '/subscription-settings', redirect: '/system' },
   { path: '/subscription-wash', redirect: '/system' },

@@ -199,6 +199,10 @@ def parse_api(payload: Any, keyword: str, limit: int, site_url: str = "") -> lis
         pub_date = pick_text(item, "pubDate", "createdAt", "createdDate", "date", "addedDate")
         labels = normalize_labels(item.get("labelsNew") or item.get("labels") or item.get("tags"))
         size = item.get("size") or item.get("sizeBytes") or item.get("bytes") or ""
+        seeders = pick_text(item, "seeders", "seeds", "seedCount", "seed_count", "uploadCount", "upload_count")
+        status = item.get("status")
+        if not seeders and isinstance(status, dict):
+            seeders = pick_text(status, "seeders", "seeds", "seedCount", "seed_count", "uploadCount", "upload_count")
         if not link:
             link = build_detail_link(site_url, torrent_id)
         results.append({
@@ -210,6 +214,7 @@ def parse_api(payload: Any, keyword: str, limit: int, site_url: str = "") -> lis
             "size": size,
             "smallDescr": pick_text(item, "smallDescr", "description", "descr"),
             "labels": labels,
+            "seeders": seeders,
             "category": pick_text(item, "category"),
             "discount": item.get("discount", ""),
             "standard": pick_text(item, "standard"),

@@ -5,7 +5,7 @@
     </div>
 
     <button :class="posterClasses" type="button" @click="emitDetail">
-      <img v-if="coverUrl" :src="coverUrl" alt="" loading="lazy">
+      <img v-if="coverUrl && !imageFailed" :src="coverUrl" alt="" loading="lazy" @error="imageFailed = true">
       <span v-else>暂无封面</span>
     </button>
 
@@ -38,7 +38,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { BaseCard } from './ui'
 
 const props = defineProps({
@@ -73,6 +73,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['detail', 'poster', 'actor'])
+const imageFailed = ref(false)
 
 const code = computed(() => props.item.id || props.item.code || props.item.name || '未知')
 const date = computed(() => props.item.date || props.item.release_date || '未知日期')
@@ -81,6 +82,10 @@ const title = computed(() => props.item.title || props.item.name || props.item.i
 const cardClasses = computed(() => ['subscription-movie-card', props.variant ? `is-${props.variant}` : ''])
 const posterClasses = computed(() => ['poster', props.posterFit === 'cover' ? 'is-cover' : 'is-contain'])
 const displayNote = computed(() => props.statusNote || sourceNote(props.item))
+
+watch(() => props.coverUrl, () => {
+  imageFailed.value = false
+})
 
 function sourceNote(item) {
   const chain = Array.isArray(item?.source_chain) && item.source_chain.length

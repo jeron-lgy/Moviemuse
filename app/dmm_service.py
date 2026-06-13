@@ -28,6 +28,7 @@ class DMMService:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._search_cache_ttl = int(os.getenv("DMM_SEARCH_CACHE_TTL_SECONDS", "21600"))
         self._maker_cache_ttl = int(os.getenv("DMM_MAKER_CACHE_TTL_SECONDS", "1800"))
+        self._ranking_cache_ttl = int(os.getenv("DMM_RANKING_CACHE_TTL_SECONDS", "86400"))
         self._detail_cache_ttl = int(os.getenv("DMM_DETAIL_CACHE_TTL_SECONDS", "2592000"))
         self._timeout = int(os.getenv("DMM_REQUEST_TIMEOUT_SECONDS", "30"))
         self._last_error = ""
@@ -152,11 +153,180 @@ class DMMService:
             return f"{DMMService.BASE_URL}{url}"
         return url
 
+    @classmethod
+    def _image_url(cls, img: Any) -> str:
+        if not img:
+            return ""
+        candidates: list[str] = []
+        for attr in ("src", "data-src", "data-original", "data-lazy", "data-lazy-src", "data-original-src"):
+            value = str(img.get(attr) or "").strip()
+            if value:
+                candidates.append(value)
+        srcset = str(img.get("srcset") or img.get("data-srcset") or "").strip()
+        if srcset:
+            for part in srcset.split(","):
+                value = part.strip().split(" ")[0]
+                if value:
+                    candidates.append(value)
+        for value in candidates:
+            url = cls._abs_url(value)
+            if "pics.dmm.co.jp" in url:
+                return url
+        return cls._abs_url(candidates[0]) if candidates else ""
+
+    @staticmethod
+    def _ranking_term(value: str) -> str:
+        term = str(value or "").strip().lower()
+        aliases = {
+            "day": "daily",
+            "daily": "daily",
+            "week": "week",
+            "weekly": "week",
+            "month": "monthly",
+            "monthly": "monthly",
+        }
+        return aliases.get(term, "daily")
+
+    @classmethod
+    def _ranking_urls(cls, kind: str, term: str, limit: int) -> list[str]:
+        safe_kind = "actress" if str(kind or "").strip().lower() == "actress" else "movie"
+        safe_term = "monthly" if safe_kind == "actress" else cls._ranking_term(term)
+        rank_segments = ["", "rank=21_40/", "rank=41_60/", "rank=61_80/", "rank=81_100/"]
+        page_count = max(1, min(5, (max(1, int(limit or 20)) + 19) // 20))
+        urls: list[str] = []
+        for segment in rank_segments[:page_count]:
+            if safe_kind == "actress":
+                urls.append(f"{cls.BASE_URL}/mono/dvd/-/ranking/=/mode=actress/{segment}term=monthly/")
+            else:
+                urls.append(f"{cls.BASE_URL}/mono/dvd/-/ranking/=/{segment}term={safe_term}/")
+        return urls
+
+    @classmethod
+    def _ranking_rows(cls, content: str) -> list[Any]:
+        soup = BeautifulSoup(content, "html.parser")
+        rows: list[Any] = []
+        for cell in soup.select("td.bd-b"):
+            if not cell.find("a", href=re.compile(r"/detail/=/cid=")):
+                continue
+            text = cls._compact(cell.get_text(" ", strip=True))
+            if re.match(r"^\d{1,3}\s+", text):
+                rows.append(cell)
+        return rows
+
+    @classmethod
+    def _parse_movie_ranking_row(cls, cell: Any) -> dict[str, Any]:
+        text = cls._compact(cell.get_text(" ", strip=True))
+        rank_match = re.match(r"^(\d{1,3})\s+", text)
+        rank = int(rank_match.group(1)) if rank_match else 0
+        link = cell.find("a", href=re.compile(r"/detail/=/cid="))
+        img = cell.find("img")
+        url = cls._abs_url(link.get("href") if link else "")
+        cid = cls._cid_from_url(url)
+        release = ""
+        release_match = re.search(r"(\d{4}/\d{1,2}/\d{1,2})\s*\u767a\u58f2", text)
+        if release_match:
+            release = cls._normalize_date(release_match.group(1))
+        title = cls._compact(str(img.get("alt") if img else "")).replace("\u3010\u4e88\u7d04\u3011", "")
+        if not title:
+            for candidate_link in cell.find_all("a", href=re.compile(r"/detail/=/cid=")):
+                link_text = cls._compact(candidate_link.get_text(" ", strip=True))
+                if link_text and not re.fullmatch(r"\d{1,3}", link_text):
+                    title = link_text.replace("\u3010\u4e88\u7d04\u3011", "")
+                    break
+        makers: list[dict[str, str]] = []
+        actors: list[dict[str, str]] = []
+        seen_links: set[str] = set()
+        for person_link in cell.find_all("a", href=re.compile(r"article=(?:actress|maker)/id=")):
+            href = cls._abs_url(person_link.get("href") or "")
+            name = cls._compact(person_link.get_text(" ", strip=True))
+            if not href or not name:
+                continue
+            key = href.lower()
+            if key in seen_links:
+                continue
+            seen_links.add(key)
+            item = {"name": name, "url": cls._dated_list_url(href), "source": "dmm", "dmm_name": name}
+            if "article=actress/" in href:
+                actors.append(item)
+            elif "article=maker/" in href:
+                makers.append(item)
+        maker_name = makers[0]["name"] if makers else ""
+        return {
+            "rank": rank,
+            "id": cls.normalize_av_id_from_cid(cid),
+            "title": title,
+            "cover": cls._image_url(img),
+            "date": release,
+            "release_date": release,
+            "actresses": actors,
+            "maker": maker_name,
+            "maker_links": makers,
+            "url": url,
+            "source": "dmm",
+            "source_scope": "ranking",
+            "source_status": "preorder" if "\u4e88\u7d04" in text else "",
+            "cid": cid,
+            "_dmm_text": text,
+        }
+
+    @classmethod
+    def _parse_actress_ranking_row(cls, cell: Any) -> dict[str, Any]:
+        text = cls._compact(cell.get_text(" ", strip=True))
+        rank_match = re.match(r"^(\d{1,3})\s+", text)
+        rank = int(rank_match.group(1)) if rank_match else 0
+        img = cell.find("img")
+        actress_link = cell.find("a", href=re.compile(r"article=actress/id="))
+        latest_link = cell.find("a", href=re.compile(r"/detail/=/cid="))
+        release = ""
+        release_match = re.search(r"\u767a\u58f2\u65e5\s*[:\uff1a]\s*(\d{4}/\d{1,2}/\d{1,2})", text)
+        if release_match:
+            release = cls._normalize_date(release_match.group(1))
+        count = 0
+        count_match = re.search(r"\u5546\u54c1\u6570\s*[:\uff1a]\s*(\d+)", text)
+        if count_match:
+            try:
+                count = int(count_match.group(1))
+            except ValueError:
+                count = 0
+        latest_url = cls._abs_url(latest_link.get("href") if latest_link else "")
+        latest_cid = cls._cid_from_url(latest_url)
+        name = cls._compact(actress_link.get_text(" ", strip=True) if actress_link else "") or cls._compact(str(img.get("alt") if img else ""))
+        if not name:
+            count_index = text.find("\u5546\u54c1\u6570")
+            head = text[:count_index] if count_index >= 0 else text
+            name = re.sub(r"^\d{1,3}\s*", "", head).strip()
+        return {
+            "rank": rank,
+            "id": name,
+            "name": name,
+            "cover": cls._image_url(img),
+            "url": cls._dated_list_url(cls._abs_url(actress_link.get("href") if actress_link else "")),
+            "dmm_name": name,
+            "dmm_url": cls._dated_list_url(cls._abs_url(actress_link.get("href") if actress_link else "")),
+            "latest_title": cls._compact(latest_link.get_text(" ", strip=True) if latest_link else ""),
+            "latest_url": latest_url,
+            "latest_av_id": cls.normalize_av_id_from_cid(latest_cid),
+            "latest_date": release,
+            "latest_release_date": release,
+            "product_count": count,
+            "source": "dmm",
+            "source_scope": "ranking",
+        }
+
+    @classmethod
+    def _parse_ranking_html(cls, content: str, kind: str) -> list[dict[str, Any]]:
+        rows = cls._ranking_rows(content)
+        if str(kind or "").strip().lower() == "actress":
+            return [cls._parse_actress_ranking_row(row) for row in rows]
+        return [cls._parse_movie_ranking_row(row) for row in rows]
+
     @staticmethod
     def normalize_av_id_from_cid(cid: str) -> str:
         raw = str(cid or "").lower().strip()
-        raw = re.sub(r"(?:bod|ec|r)$", "", raw)
+        raw = raw.split("/")[0].split("?")[0]
+        raw = re.sub(r"^(?:h|n)_\d+", "", raw)
         raw = re.sub(r"^\d+", "", raw)
+        raw = re.sub(r"(?:tk\d*|dl|bod|ec|r)$", "", raw)
         for prefix in ("ftkt", "ztkt", "tkt", "tk"):
             if raw.startswith(prefix) and re.fullmatch(rf"{prefix}[a-z]{{2,}}\d{{2,}}", raw):
                 raw = raw[len(prefix) :]
@@ -164,7 +334,8 @@ class DMMService:
         match = re.search(r"([a-z]{2,})(\d{2,})$", raw)
         if not match:
             return raw.upper()
-        return f"{match.group(1).upper()}-{match.group(2)}"
+        number = match.group(2).lstrip("0") or match.group(2)
+        return f"{match.group(1).upper()}-{number}"
 
     @classmethod
     def _clean_actor_names(cls, value: str) -> list[dict[str, str]]:
@@ -469,6 +640,39 @@ class DMMService:
         if include_detail:
             return [self.get_av_detail(item) for item in items]
         return [{key: value for key, value in item.items() if not key.startswith("_")} for item in items]
+
+    def get_ranking(self, kind: str = "movie", term: str = "daily", limit: int = 100, *, force_refresh: bool = False) -> dict[str, Any]:
+        safe_kind = "actress" if str(kind or "").strip().lower() == "actress" else "movie"
+        safe_term = "monthly" if safe_kind == "actress" else self._ranking_term(term)
+        safe_limit = max(1, min(100, int(limit or 100)))
+
+        def fetch() -> dict[str, Any]:
+            session = self._session()
+            self._pass_age_gate(session)
+            items: list[dict[str, Any]] = []
+            seen_ranks: set[int] = set()
+            urls = self._ranking_urls(safe_kind, safe_term, safe_limit)
+            for url in urls:
+                response = self._get(session, url)
+                for item in self._parse_ranking_html(response.text, safe_kind):
+                    rank = int(item.get("rank") or 0)
+                    if rank and rank in seen_ranks:
+                        continue
+                    if rank:
+                        seen_ranks.add(rank)
+                    items.append(item)
+            items = sorted(items, key=lambda item: int(item.get("rank") or 9999))
+            return {
+                "kind": safe_kind,
+                "term": safe_term,
+                "source": "dmm",
+                "fetched_at": time.time(),
+                "items": items[:safe_limit],
+            }
+
+        key = f"dmm_ranking:v1:{safe_kind}:{safe_term}:{safe_limit}"
+        result = self._cached(key, fetch, self._ranking_cache_ttl, force_refresh=force_refresh)
+        return result if isinstance(result, dict) else {"kind": safe_kind, "term": safe_term, "source": "dmm", "items": []}
 
     def stats(self) -> dict[str, Any]:
         try:

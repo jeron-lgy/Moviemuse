@@ -493,6 +493,17 @@ class SubtitleService:
             jobs = sorted(self.jobs.values(), key=lambda job: job.created_at, reverse=True)
             return jobs[:limit] if limit else jobs
 
+    def delete_job(self, job_id: str) -> SubtitleJob:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                raise FileNotFoundError("任务不存在")
+            if job.status in {"queued", "running", "translating"}:
+                raise ValueError("运行中或排队中的任务不能删除，请先等待结束")
+            removed = self.jobs.pop(job_id)
+            self._save_jobs_locked()
+            return removed
+
     def retry_job(self, job_id: str, translate_backend: str | None = None) -> SubtitleJob:
         source = self.get_job(job_id)
         if not source:

@@ -1,8 +1,8 @@
-# Media Toolbox
+# MovieMuse
 
 Unraid 媒体整理控制台 + Windows 字幕算力端。
 
-Media Toolbox 用于扫描 NAS 媒体目录中的重复版本，预览并移动低优先级文件，同时把需要字幕的视频任务发送到 Windows GPU 主机，使用 `faster-whisper` 生成字幕并按配置翻译。
+MovieMuse 用于扫描 NAS 媒体目录中的重复版本，预览并移动低优先级文件，同时把需要字幕的视频任务发送到 Windows GPU 主机，使用 `faster-whisper` 生成字幕并按配置翻译。
 
 ## 部署结构
 
@@ -15,7 +15,7 @@ Media Toolbox 用于扫描 NAS 媒体目录中的重复版本，预览并移动�
 
 ```text
 Unraid /media 下的视频
-    -> Media Toolbox 控制台选择任务
+    -> MovieMuse 控制台选择任务
     -> Windows Worker 通过共享路径读取视频
     -> 生成同目录 .srt 字幕文件
 ```
@@ -48,12 +48,12 @@ requirements.txt
 ```yaml
 volumes:
   - /mnt/user/media:/media
-  - /mnt/user/appdata/media-toolbox/data:/data
+  - /mnt/user/appdata/moviemuse/data:/data
   - /mnt:/unraid
 ```
 
 - `/mnt/user/media:/media`：左侧改为你的真实媒体库目录。
-- `/mnt/user/appdata/media-toolbox/data:/data`：保存设置和任务记录。
+- `/mnt/user/appdata/moviemuse/data:/data`：保存设置和任务记录。
 - `/mnt:/unraid`：用于识别 Unraid 实际磁盘位置，实现同盘快速移动。
 - 回收站默认位于媒体目录下的 `/mnt/user/media/trash`。
 
@@ -62,9 +62,9 @@ volumes:
 控制台容器以 `99:100` 用户运行。以下目录用于保存算力端地址、翻译后端设置和任务数据；如果不可写，会出现“测试联通成功，但保存失败”。
 
 ```bash
-mkdir -p /mnt/user/appdata/media-toolbox/data
-chown -R 99:100 /mnt/user/appdata/media-toolbox/data
-chmod -R u+rwX,g+rwX /mnt/user/appdata/media-toolbox/data
+mkdir -p /mnt/user/appdata/moviemuse/data
+chown -R 99:100 /mnt/user/appdata/moviemuse/data
+chmod -R u+rwX,g+rwX /mnt/user/appdata/moviemuse/data
 ```
 
 完成目录映射与权限初始化后启动：

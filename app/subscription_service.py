@@ -18,6 +18,7 @@ DEFAULT_AV_CRON = "0 22 * * *"
 DEFAULT_WASH_CRON = "0 22 * * *"
 DEFAULT_POSTPROCESS_CRON = "*/5 * * * *"
 DEFAULT_MAKER_CRON = "0 */6 * * *"
+DEFAULT_RANKING_CRON = "30 4 */2 * *"
 DEFAULT_ASSET_CRON = "15 3 * * *"
 DEFAULT_MAX_COACTORS = 2
 DEFAULT_WASH_EXPIRE_DAYS = 90
@@ -183,6 +184,7 @@ class SubscriptionService:
         data["settings"].setdefault("wash_cron", DEFAULT_WASH_CRON)
         data["settings"].setdefault("postprocess_cron", DEFAULT_POSTPROCESS_CRON)
         data["settings"].setdefault("maker_cron", DEFAULT_MAKER_CRON)
+        data["settings"].setdefault("ranking_cron", DEFAULT_RANKING_CRON)
         data["settings"].setdefault("asset_cron", DEFAULT_ASSET_CRON)
         data["settings"].setdefault("asset_cache_max_mb", 2048)
         data["settings"].setdefault("max_coactors", DEFAULT_MAX_COACTORS)
@@ -198,6 +200,8 @@ class SubscriptionService:
         data["settings"].setdefault("last_postprocess_poll_minute", "")
         data["settings"].setdefault("last_maker_poll_at", 0)
         data["settings"].setdefault("last_maker_poll_minute", "")
+        data["settings"].setdefault("last_ranking_poll_at", 0)
+        data["settings"].setdefault("last_ranking_poll_minute", "")
         data["settings"].setdefault("last_asset_poll_at", 0)
         data["settings"].setdefault("last_asset_poll_minute", "")
         data["settings"].setdefault("last_task_results", {})
@@ -557,6 +561,8 @@ class SubscriptionService:
                 settings["postprocess_cron"] = normalize_cron(payload.get("postprocess_cron"), DEFAULT_POSTPROCESS_CRON)
             if "maker_cron" in payload:
                 settings["maker_cron"] = normalize_cron(payload.get("maker_cron"), DEFAULT_MAKER_CRON)
+            if "ranking_cron" in payload:
+                settings["ranking_cron"] = normalize_cron(payload.get("ranking_cron"), DEFAULT_RANKING_CRON)
             if "asset_cron" in payload:
                 settings["asset_cron"] = normalize_cron(payload.get("asset_cron"), DEFAULT_ASSET_CRON)
             if "asset_cache_max_mb" in payload:
@@ -859,6 +865,7 @@ class SubscriptionService:
             "wash_download": ("last_wash_poll_at", "last_wash_poll_minute"),
             "postprocess_qb": ("last_postprocess_poll_at", "last_postprocess_poll_minute"),
             "maker_refresh": ("last_maker_poll_at", "last_maker_poll_minute"),
+            "ranking_refresh": ("last_ranking_poll_at", "last_ranking_poll_minute"),
             "asset_maintenance": ("last_asset_poll_at", "last_asset_poll_minute"),
         }
         if task_id not in keys:

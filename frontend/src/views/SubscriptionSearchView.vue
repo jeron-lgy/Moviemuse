@@ -82,10 +82,7 @@
         <FormField label="限制日期" hint="默认是今天，只处理这个日期之后新增的番号。">
           <input v-model="actressSubscribeForm.since_date" type="date">
         </FormField>
-        <label class="check-row">
-          <span>订阅 VR</span>
-          <input v-model="actressSubscribeForm.include_vr" type="checkbox">
-        </label>
+        <BaseSwitch v-model="actressSubscribeForm.include_vr" label="订阅 VR" />
         <div class="modal-actions">
           <BaseButton type="button" @click="actressSubscribeItem = null">取消</BaseButton>
           <BaseButton variant="primary" type="submit" :disabled="submitting">
@@ -114,7 +111,7 @@ import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
-import { BaseButton, BaseCard, FormField } from '../components/ui'
+import { BaseButton, BaseCard, BaseSwitch, FormField } from '../components/ui'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
 

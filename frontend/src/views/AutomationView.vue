@@ -21,36 +21,22 @@
         <h2>自动化开关</h2>
         <p>这些开关决定订阅下载完成后，是否自动进入后处理队列。</p>
         <div class="toggle-list">
-          <label class="toggle-line">
+          <div class="toggle-line">
             <span>启用自动转码<small>命中后派发转码任务，默认 AV1 NVENC。</small></span>
-            <input v-model="postprocess.auto_transcode_enabled" type="checkbox">
-          </label>
-          <label class="toggle-line">
+            <BaseSwitch v-model="postprocess.auto_transcode_enabled" aria-label="启用自动转码" />
+          </div>
+          <div class="toggle-line">
             <span>启用自动字幕<small>需要字幕的任务会继续进入字幕生成和翻译链路。</small></span>
-            <input v-model="postprocess.auto_subtitle_enabled" type="checkbox">
-          </label>
-          <label class="toggle-line">
+            <BaseSwitch v-model="postprocess.auto_subtitle_enabled" aria-label="启用自动字幕" />
+          </div>
+          <div class="toggle-line">
             <span>算力端上线后自动执行队列<small>等待算力端的任务会自动推进。</small></span>
-            <input v-model="postprocess.worker_auto_run" type="checkbox">
-          </label>
+            <BaseSwitch v-model="postprocess.worker_auto_run" aria-label="算力端上线后自动执行队列" />
+          </div>
         </div>
       </BaseCard>
 
       <BaseCard as="article" class="automation-card">
-        <h2>自动翻译</h2>
-        <p>字幕任务默认翻译后端。API Key 等高级配置在任务中心里维护。</p>
-        <FormField label="默认翻译后端">
-          <select v-model="subtitle.default_translate_backend">
-            <option value="google">Google 免费翻译</option>
-            <option value="deepl">DeepL</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="openai">OpenAI</option>
-            <option value="ollama">Ollama</option>
-          </select>
-        </FormField>
-      </BaseCard>
-
-      <BaseCard as="article" class="automation-card wide">
         <div class="option-head">
           <div>
             <h2>qBittorrent 接管范围</h2>
@@ -87,7 +73,7 @@
 import { computed, reactive, ref } from 'vue'
 import { api, postJson } from '../lib/api'
 import SubscriptionTasksView from './SubscriptionTasksView.vue'
-import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader } from '../components/ui'
+import { BaseButton, BaseCard, BaseSwitch, NoticeBanner, PageHeader } from '../components/ui'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -102,7 +88,6 @@ const postprocess = reactive({
   allowed_categories: [],
   required_tags: []
 })
-const subtitle = reactive({ default_translate_backend: 'google' })
 
 const mergedCategories = computed(() => mergeUnique(qbOptions.categories, postprocess.allowed_categories))
 const mergedTags = computed(() => mergeUnique(qbOptions.tags, postprocess.required_tags))
@@ -113,10 +98,7 @@ async function loadAll() {
   loading.value = true
   errorMessage.value = ''
   try {
-    const [postPayload, consolePayload] = await Promise.all([
-      api('/api/postprocess/settings'),
-      api('/api/subtitle/console')
-    ])
+    const postPayload = await api('/api/postprocess/settings')
     Object.assign(postprocess, {
       auto_transcode_enabled: !!postPayload.settings?.auto_transcode_enabled,
       auto_subtitle_enabled: !!postPayload.settings?.auto_subtitle_enabled,
@@ -124,7 +106,6 @@ async function loadAll() {
       allowed_categories: Array.isArray(postPayload.settings?.allowed_categories) ? postPayload.settings.allowed_categories : [],
       required_tags: Array.isArray(postPayload.settings?.required_tags) ? postPayload.settings.required_tags : []
     })
-    subtitle.default_translate_backend = consolePayload.compute_settings?.default_translate_backend || 'google'
   } catch (error) {
     errorMessage.value = error.message || '读取自动任务配置失败'
   } finally {
@@ -153,16 +134,13 @@ async function saveAutomation() {
   message.value = ''
   errorMessage.value = ''
   try {
-    await Promise.all([
-      postJson('/api/postprocess/settings', {
-        auto_transcode_enabled: postprocess.auto_transcode_enabled,
-        auto_subtitle_enabled: postprocess.auto_subtitle_enabled,
-        worker_auto_run: postprocess.worker_auto_run,
-        allowed_categories: postprocess.allowed_categories,
-        required_tags: postprocess.required_tags
-      }),
-      postJson('/api/subtitle/settings', { default_translate_backend: subtitle.default_translate_backend })
-    ])
+    await postJson('/api/postprocess/settings', {
+      auto_transcode_enabled: postprocess.auto_transcode_enabled,
+      auto_subtitle_enabled: postprocess.auto_subtitle_enabled,
+      worker_auto_run: postprocess.worker_auto_run,
+      allowed_categories: postprocess.allowed_categories,
+      required_tags: postprocess.required_tags
+    })
     message.value = '自动任务策略已保存'
   } catch (error) {
     errorMessage.value = error.message || '保存自动任务失败'
@@ -207,10 +185,6 @@ p {
   align-content: start;
   gap: 16px;
   min-height: 260px;
-}
-
-.automation-card.wide {
-  grid-column: 1 / -1;
 }
 
 .toggle-list {

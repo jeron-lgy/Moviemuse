@@ -95,6 +95,75 @@ class PostprocessFlowTest(unittest.TestCase):
             }
         )
 
+    def test_build_postprocess_output_path_omits_codec_suffix(self) -> None:
+        output_root = self.root / "out"
+        settings = {"output_dir": str(output_root), "target_codec": "h265"}
+
+        subscription = self.main.build_postprocess_output_path(
+            {"av_id": "IPZZ-872", "input_path": str(self.root / "IPZZ-872.mp4"), "target_codec": "av1"},
+            settings,
+        )
+        wash = self.main.build_postprocess_output_path(
+            {"av_id": "ABF-359", "task_type": "wash_chinese", "input_path": str(self.root / "ABF-359.mkv")},
+            settings,
+        )
+
+        self.assertEqual(subscription, str(output_root / "IPZZ-872" / "IPZZ-872.mp4"))
+        self.assertEqual(wash, str(output_root / "ABF-359" / "ABF-359.chinese.mkv"))
+
+    def test_transcode_validation_copies_metadata_sidecars(self) -> None:
+        source_dir = self.root / "study3"
+        source_dir.mkdir(parents=True)
+        input_path = source_dir / "IPZZ-872.mp4"
+        input_path.write_bytes(b"input-video")
+        sidecars = {
+            "nfo": source_dir / "IPZZ-872.nfo",
+            "fanart": source_dir / "IPZZ-872-fanart.jpg",
+            "poster": source_dir / "IPZZ-872-poster.jpg",
+            "thumb": source_dir / "IPZZ-872-thumb.jpg",
+        }
+        for kind, path in sidecars.items():
+            path.write_text(f"{kind}-content", encoding="utf-8")
+        output_path = self.root / "out" / "IPZZ-872" / "IPZZ-872.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"output-video")
+
+        self.configure_postprocess(self.root / "out")
+        post = self.main.get_postprocess_service()
+        task = post.create_task(
+            av_id="IPZZ-872",
+            task_type="subscription",
+            status="worker_done",
+            target_codec="av1",
+        )
+        post.update_task(task["id"], input_path=str(input_path), output_path=str(output_path))
+
+        original_validate = self.main.validate_video_output
+
+        def fake_validate(path: str, **kwargs: object) -> dict[str, object]:
+            return {
+                "ok": True,
+                "path": path,
+                "file_size": Path(path).stat().st_size,
+                "mtime": Path(path).stat().st_mtime,
+                "codec_name": "av1",
+            }
+
+        self.main.validate_video_output = fake_validate
+        try:
+            result = self.main.validate_and_activate_postprocess_task(task["id"], output_path=str(output_path))
+        finally:
+            self.main.validate_video_output = original_validate
+
+        self.assertEqual(result["status"], "completed")
+        for filename in ("IPZZ-872.nfo", "IPZZ-872-fanart.jpg", "IPZZ-872-poster.jpg", "IPZZ-872-thumb.jpg"):
+            self.assertTrue((output_path.parent / filename).exists(), filename)
+        updated = post.get_task(task["id"])
+        assert updated is not None
+        self.assertEqual(updated["data"]["metadata_sidecars"]["status"], "ok")
+        events = post.list_events(task["id"])
+        self.assertTrue(any(event["stage"] == "metadata_sidecars_copied" for event in events))
+
     def test_postprocess_schema_migrates_existing_partial_table(self) -> None:
         from app.postprocess_service import PostprocessService
 
@@ -541,6 +610,28 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(post.get_task(task["id"])["status"], "ignored")
         self.assertEqual(subscription["wash"]["status"], "cancelled")
         self.assertEqual(subscription["wash"]["task_id"], task["id"])
+
+    def test_postprocess_delete_removes_terminal_task_record(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="DELETE-FAILED-001", task_type="subscription", status="failed")
+        post.add_event(task["id"], "error", "failed", "测试失败任务")
+
+        with TestClient(self.main.app) as client:
+            response = client.delete(f"/api/postprocess/tasks/{task['id']}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(post.get_task(task["id"]))
+        self.assertEqual(post.list_events(task["id"]), [])
+
+    def test_postprocess_delete_rejects_active_task(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="DELETE-ACTIVE-001", task_type="subscription", status="ready_to_run")
+
+        with TestClient(self.main.app) as client:
+            response = client.delete(f"/api/postprocess/tasks/{task['id']}")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNotNone(post.get_task(task["id"]))
 
     def test_wash_api_cancel_stops_existing_postprocess_task(self) -> None:
         service = self.main.get_subscription_service()

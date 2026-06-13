@@ -57,7 +57,7 @@ echo Health: shown after the server starts
 echo Web UI: disabled on Windows worker
 echo Manage settings from the Unraid subtitle console.
 echo Model folder: %WHISPER_MODEL_DIR%
-echo Path map: controlled by Media Toolbox console
+echo Path map: controlled by MovieMuse console
 echo.
 echo Make sure Windows can open paths sent by the console, for example: \\UNRAID\media
 echo.

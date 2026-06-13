@@ -112,14 +112,8 @@
           <span>限制日期</span>
           <input v-model="actressForm.since_date" type="date">
         </label>
-        <label class="check-row">
-          <span>启用轮询</span>
-          <input v-model="actressForm.poll_enabled" type="checkbox">
-        </label>
-        <label class="check-row">
-          <span>订阅 VR</span>
-          <input v-model="actressForm.include_vr" type="checkbox">
-        </label>
+        <BaseSwitch v-model="actressForm.poll_enabled" label="启用轮询" />
+        <BaseSwitch v-model="actressForm.include_vr" label="订阅 VR" />
         <div class="modal-actions">
           <BaseButton type="button" @click="configActress = null">取消</BaseButton>
           <BaseButton variant="primary" type="submit" :disabled="busyId === configActress.id">保存</BaseButton>
@@ -136,10 +130,7 @@
           <span>限制日期</span>
           <input v-model="subscribeLatestForm.since_date" type="date">
         </label>
-        <label class="check-row">
-          <span>订阅 VR</span>
-          <input v-model="subscribeLatestForm.include_vr" type="checkbox">
-        </label>
+        <BaseSwitch v-model="subscribeLatestForm.include_vr" label="订阅 VR" />
         <div class="modal-actions">
           <BaseButton type="button" @click="subscribeLatestTarget = null">取消</BaseButton>
           <BaseButton variant="primary" type="submit" :disabled="busyId === subscribeLatestTarget.id">确认订阅</BaseButton>

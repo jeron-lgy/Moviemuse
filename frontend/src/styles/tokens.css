@@ -272,6 +272,10 @@ input[type="radio"] {
   accent-color: var(--mm-primary);
 }
 
+.mm-field .mm-switch {
+  justify-self: start;
+}
+
 .mm-field textarea {
   min-height: 96px;
   padding-top: 12px;

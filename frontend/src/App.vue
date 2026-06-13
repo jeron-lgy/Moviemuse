@@ -21,9 +21,9 @@
       </div>
 
       <nav class="mm-nav" aria-label="MovieMuse navigation">
-        <RouterLink class="mm-nav-item" to="/dashboard" title="Dashboard">
+        <RouterLink class="mm-nav-item" to="/dashboard" title="首页">
           <LayoutDashboard :size="20" />
-          <span>Dashboard</span>
+          <span>首页</span>
         </RouterLink>
 
         <div class="mm-nav-group" :class="{ open: subscriptionsOpen }">
@@ -36,6 +36,7 @@
             <RouterLink to="/subscription-search">搜索</RouterLink>
             <RouterLink to="/subscriptions">订阅</RouterLink>
             <RouterLink to="/makers">厂牌发售</RouterLink>
+            <RouterLink to="/rankings">榜单</RouterLink>
           </div>
         </div>
 

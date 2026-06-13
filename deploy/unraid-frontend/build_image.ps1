@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = Resolve-Path (Join-Path $scriptDir "..\..")
 $dockerfile = Join-Path $scriptDir "Dockerfile"
-$tarPath = Join-Path $scriptDir "media-toolbox-unraid.tar"
+$tarPath = Join-Path $scriptDir "moviemuse-unraid.tar"
 
 $docker = "docker"
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
@@ -17,11 +17,11 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 Write-Host "Checking Docker Engine..."
 & $docker info | Out-Host
 
-Write-Host "Building media-toolbox-unraid:latest..."
-& $docker build -t media-toolbox-unraid:latest -f $dockerfile $projectRoot
+Write-Host "Building moviemuse-unraid:latest..."
+& $docker build -t moviemuse-unraid:latest -f $dockerfile $projectRoot
 
 Write-Host "Saving image to $tarPath..."
-& $docker save -o $tarPath media-toolbox-unraid:latest
+& $docker save -o $tarPath moviemuse-unraid:latest
 
 Write-Host ""
 Write-Host "Done."

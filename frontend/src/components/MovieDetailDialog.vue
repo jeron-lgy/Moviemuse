@@ -18,8 +18,13 @@
               <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', mergedItem)">
                 订阅番号
               </BaseButton>
-              <BaseButton v-if="primaryActor" type="button" :disabled="busyActor === actorKey(primaryActor)" @click.stop="openActorSubscribe(primaryActor)">
-                订阅女优
+              <BaseButton
+                v-if="primaryActor"
+                type="button"
+                :disabled="isActorBusyOrSubscribed(primaryActor)"
+                @click.stop.prevent="openActorSubscribe(primaryActor)"
+              >
+                {{ actorSubscribeLabel(primaryActor) }}
               </BaseButton>
               <BaseButton v-else-if="actors.length > 1 &amp;&amp; actors.length <= 2" type="button" :disabled="busyActor === '__all__'" @click.stop="subscribeAllActors">
                 订阅全部女优
@@ -30,6 +35,7 @@
             </div>
 
             <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
+            <NoticeBanner v-else-if="successMessage">{{ successMessage }}</NoticeBanner>
             <NoticeBanner v-else-if="loading">正在读取 JavDB 详情...</NoticeBanner>
 
             <div class="info-grid">
@@ -71,10 +77,10 @@
                     <button
                       class="actor-subscribe-button"
                       type="button"
-                      :disabled="busyActor === actorKey(actor)"
-                      @click.stop="openActorSubscribe(actor)"
+                      :disabled="isActorBusyOrSubscribed(actor)"
+                      @click.stop.prevent="openActorSubscribe(actor)"
                     >
-                      订阅女优
+                      {{ actorSubscribeLabel(actor) }}
                     </button>
                   </span>
                 </div>
@@ -134,28 +140,26 @@
           <BaseCard v-else class="empty-media">暂无推荐</BaseCard>
         </section>
 
-        <div v-if="actorSubscribeTarget" class="actor-subscribe-mask" @click.self="closeActorSubscribe">
-          <BaseCard as="form" class="actor-subscribe-dialog" @submit.prevent="confirmActorSubscribe">
-            <button class="modal-close" type="button" @click="closeActorSubscribe">x</button>
-            <h3>订阅 {{ actorSubscribeTarget.name }}</h3>
-            <p>默认只订阅今天之后新增的作品，不订阅 VR。</p>
-            <label>
-              限制日期
-              <input v-model="actorSubscribeForm.since_date" type="date">
-            </label>
-            <label class="check-row">
-              <span>订阅 VR</span>
-              <input v-model="actorSubscribeForm.include_vr" type="checkbox">
-            </label>
-            <div class="modal-actions">
-              <BaseButton type="button" @click="closeActorSubscribe">取消</BaseButton>
-              <BaseButton variant="primary" type="submit" :disabled="busyActor === actorKey(actorSubscribeTarget)">
-                {{ busyActor === actorKey(actorSubscribeTarget) ? '订阅中' : '确认订阅' }}
-              </BaseButton>
-            </div>
-          </BaseCard>
-        </div>
       </section>
+
+      <div v-if="actorSubscribeTarget" class="actor-subscribe-mask" @click.self="closeActorSubscribe">
+        <BaseCard as="form" class="actor-subscribe-dialog" @submit.prevent="confirmActorSubscribe">
+          <button class="modal-close" type="button" @click="closeActorSubscribe">x</button>
+          <h3>订阅 {{ actorSubscribeTarget.name }}</h3>
+          <p>默认只订阅今天之后新增的作品，不订阅 VR。确认后会写入女优订阅列表，并把最新番号扫描放到后台。</p>
+          <label>
+            限制日期
+            <input v-model="actorSubscribeForm.since_date" type="date">
+          </label>
+          <BaseSwitch v-model="actorSubscribeForm.include_vr" label="订阅 VR" />
+          <div class="modal-actions">
+            <BaseButton type="button" @click="closeActorSubscribe">取消</BaseButton>
+            <BaseButton variant="primary" type="submit" :disabled="busyActor === actorKey(actorSubscribeTarget)">
+              {{ busyActor === actorKey(actorSubscribeTarget) ? '订阅中' : '确认订阅' }}
+            </BaseButton>
+          </div>
+        </BaseCard>
+      </div>
     </div>
   </Teleport>
 </template>
@@ -166,7 +170,7 @@ import { useQueryClient } from '@tanstack/vue-query'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl, mediaProxyUrl } from '../lib/images'
 import SubscriptionMovieCard from './SubscriptionMovieCard.vue'
-import { BaseButton, BaseCard, NoticeBanner } from './ui'
+import { BaseButton, BaseCard, BaseSwitch, NoticeBanner } from './ui'
 
 const props = defineProps({
   item: {
@@ -181,8 +185,10 @@ const queryClient = useQueryClient()
 const detail = ref({})
 const loading = ref(false)
 const errorMessage = ref('')
+const successMessage = ref('')
 const busyActor = ref('')
 const actorSubscribeTarget = ref(null)
+const subscribedActorKeys = ref(new Set())
 const actorSubscribeForm = reactive({
   since_date: new Date().toISOString().slice(0, 10),
   include_vr: false
@@ -212,6 +218,7 @@ watch(
 async function loadDetail() {
   detail.value = {}
   errorMessage.value = ''
+  successMessage.value = ''
   if (!props.item?.url) return
   loading.value = true
   try {
@@ -277,6 +284,45 @@ function actorKey(actor) {
   return actor.id || actor.url || actor.name
 }
 
+function actorIdentityKeys(actor) {
+  const keys = new Set()
+  const add = (value) => {
+    const text = String(value || '').trim().toLowerCase()
+    if (text) keys.add(text)
+  }
+  add(actor?.id)
+  add(actor?.javdb_id)
+  add(actor?.javlibrary_star_id)
+  add(actor?.dmm_name)
+  add(actor?.name)
+  add(actor?.url)
+  return keys
+}
+
+function isActorSubscribed(actor) {
+  const known = subscribedActorKeys.value
+  for (const key of actorIdentityKeys(actor)) {
+    if (known.has(key)) return true
+  }
+  const current = queryClient.getQueryData(['subscriptions', 'actress'])
+  const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+  return rows.some((row) => {
+    for (const key of actorIdentityKeys(row)) {
+      if (actorIdentityKeys(actor).has(key)) return true
+    }
+    return false
+  })
+}
+
+function isActorBusyOrSubscribed(actor) {
+  return busyActor.value === actorKey(actor) || isActorSubscribed(actor)
+}
+
+function actorSubscribeLabel(actor) {
+  if (busyActor.value === actorKey(actor)) return '订阅中'
+  return isActorSubscribed(actor) ? '已订阅' : '订阅女优'
+}
+
 function actorPayload(actor) {
   return {
     id: actor.id || actor.name,
@@ -293,6 +339,12 @@ function actorPayload(actor) {
 }
 
 function openActorSubscribe(actor) {
+  if (isActorSubscribed(actor)) {
+    successMessage.value = `${actor.name} 已在女优订阅列表里`
+    return
+  }
+  errorMessage.value = ''
+  successMessage.value = ''
   actorSubscribeTarget.value = actor
   actorSubscribeForm.since_date = new Date().toISOString().slice(0, 10)
   actorSubscribeForm.include_vr = false
@@ -311,9 +363,12 @@ async function subscribeActress(actor) {
   const key = actorKey(actor)
   busyActor.value = key
   errorMessage.value = ''
+  successMessage.value = ''
   try {
     const payload = await postJson('/api/subscriptions/actress', actorPayload(actor))
     updateActressSubscriptionCache(payload.subscription)
+    markActorSubscribed(payload.subscription || actor)
+    successMessage.value = `${actor.name} 已加入女优订阅，后台扫描已入队`
     closeActorSubscribe()
   } catch (error) {
     errorMessage.value = error.message || '订阅女优失败'
@@ -325,17 +380,27 @@ async function subscribeActress(actor) {
 async function subscribeAllActors() {
   busyActor.value = '__all__'
   errorMessage.value = ''
+  successMessage.value = ''
   try {
     for (const actor of actors.value) {
+      if (isActorSubscribed(actor)) continue
       const payload = await postJson('/api/subscriptions/actress', actorPayload(actor))
       updateActressSubscriptionCache(payload.subscription)
+      markActorSubscribed(payload.subscription || actor)
     }
+    successMessage.value = '女优订阅已写入，后台扫描已入队'
     closeActorSubscribe()
   } catch (error) {
     errorMessage.value = error.message || '订阅女优失败'
   } finally {
     busyActor.value = ''
   }
+}
+
+function markActorSubscribed(actor) {
+  const next = new Set(subscribedActorKeys.value)
+  for (const key of actorIdentityKeys(actor)) next.add(key)
+  subscribedActorKeys.value = next
 }
 
 function updateActressSubscriptionCache(item) {
@@ -371,6 +436,7 @@ function openExternal(link) {
 
 .movie-detail-panel {
   position: relative;
+  z-index: 1;
   width: min(1200px, 100%);
   margin: 0 auto;
   padding: 28px;
@@ -580,7 +646,7 @@ video {
 .actor-subscribe-mask {
   position: fixed;
   inset: 0;
-  z-index: 1;
+  z-index: 3;
   display: grid;
   place-items: center;
   padding: 24px;

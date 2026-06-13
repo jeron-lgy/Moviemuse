@@ -1,12 +1,14 @@
+name: moviemuse-ui-test
+
 services:
-  media-toolbox-ui-test:
+  moviemuse-ui-test:
     build:
       context: ../..
       dockerfile: deploy/unraid-frontend/Dockerfile
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
-    image: media-toolbox-unraid-ui-test:latest
-    container_name: media-toolbox-ui-test
+    image: moviemuse-unraid-ui-test:latest
+    container_name: moviemuse-ui-test
     user: "99:100"
 
     ports:
@@ -44,7 +46,7 @@ services:
     volumes:
       # 第一次字幕联调保持只读；验证移动前去掉 :ro，并且只选测试目录。
       - /mnt/user/media:/media:ro
-      - /mnt/user/appdata/media-toolbox-ui-test/data:/data
+      - /mnt/user/appdata/moviemuse-ui-test/data:/data
       - /mnt:/unraid:ro
 
     command: >

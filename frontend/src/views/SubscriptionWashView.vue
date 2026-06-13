@@ -17,14 +17,14 @@
       <BaseCard as="article" class="wash-card" >
         <h2>跟踪策略</h2>
         <p>控制是否自动保留洗版请求，以及到期后是否自动取消。</p>
-        <label class="toggle-line">
+        <div class="toggle-line">
           <span>启用洗版跟踪<small>允许已入库番号进入中文或 4K 洗版轮询。</small></span>
-          <input v-model="wash.enabled" type="checkbox">
-        </label>
-        <label class="toggle-line">
+          <BaseSwitch v-model="wash.enabled" aria-label="启用洗版跟踪" />
+        </div>
+        <div class="toggle-line">
           <span>到期自动取消<small>超过期限仍未匹配资源时自动结束请求。</small></span>
-          <input v-model="wash.auto_cancel_expired" type="checkbox">
-        </label>
+          <BaseSwitch v-model="wash.auto_cancel_expired" aria-label="到期自动取消" />
+        </div>
       </BaseCard>
 
       <BaseCard as="article" class="wash-card" >
@@ -47,22 +47,22 @@
         <h2>洗版类型</h2>
         <p>勾选需要关注的版本类型，并设置命中多个资源时的偏好。</p>
         <div class="option-grid">
-          <label class="toggle-line">
+          <div class="toggle-line">
             <span>检查中文<small>关注中文字幕、中文命名或相关资源。</small></span>
-            <input v-model="wash.check_chinese" type="checkbox">
-          </label>
-          <label class="toggle-line">
+            <BaseSwitch v-model="wash.check_chinese" aria-label="检查中文" />
+          </div>
+          <div class="toggle-line">
             <span>检查 4K<small>关注 4K / UHD 资源。</small></span>
-            <input v-model="wash.check_4k" type="checkbox">
-          </label>
-          <label class="toggle-line">
+            <BaseSwitch v-model="wash.check_4k" aria-label="检查 4K" />
+          </div>
+          <div class="toggle-line">
             <span>优先中文<small>中文和普通资源同时命中时优先中文。</small></span>
-            <input v-model="wash.prefer_chinese" type="checkbox">
-          </label>
-          <label class="toggle-line">
+            <BaseSwitch v-model="wash.prefer_chinese" aria-label="优先中文" />
+          </div>
+          <div class="toggle-line">
             <span>优先 4K<small>4K 和普通资源同时命中时优先 4K。</small></span>
-            <input v-model="wash.prefer_4k" type="checkbox">
-          </label>
+            <BaseSwitch v-model="wash.prefer_4k" aria-label="优先 4K" />
+          </div>
         </div>
       </BaseCard>
     </section>

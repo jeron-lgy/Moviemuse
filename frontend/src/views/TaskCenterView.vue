@@ -34,23 +34,11 @@
     <NoticeBanner v-if="notice" >{{ notice }}</NoticeBanner>
     <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
 
-    <BaseCard class="task-panel" >
+    <BaseCard class="task-panel" padding="none">
       <div class="panel-head">
         <div>
           <h2>任务管理</h2>
           <p>每 4 秒自动刷新；选择状态查看队列，勾选任务后可批量重试。</p>
-        </div>
-        <div class="metric-strip">
-          <div><span>当前队列</span><strong>{{ queueCount }}</strong><em>{{ runningCount }} 运行 / {{ waitingCount }} 等待</em></div>
-          <div><span>今日完成</span><strong>{{ todayCompleted }}</strong><em>{{ failedCount }} 个失败待处理</em></div>
-          <div><span>转码任务</span><strong>{{ postprocessCount }}</strong><em>{{ transcodeRunningCount }} 转码中 / {{ subtitleProcessingCount }} 生成字幕中</em></div>
-        </div>
-      </div>
-
-      <div class="toolbar">
-        <div class="segmented">
-          <button type="button" :class="{ active: taskTab === 'current' }" @click="taskTab = 'current'">当前任务</button>
-          <button type="button" :class="{ active: taskTab === 'history' }" @click="taskTab = 'history'">历史任务</button>
         </div>
         <div class="bulk-actions">
           <span v-if="selectedJobs.length">已选择 {{ selectedJobs.length }} 个任务</span>
@@ -61,13 +49,22 @@
           <BaseButton variant="primary"  type="button" :disabled="!selectedJobs.length || retryingSelected" @click="retrySelected">
             {{ retryingSelected ? '重试中' : '批量重试' }}
           </BaseButton>
+          <BaseButton variant="danger" type="button" :disabled="!deletableSelectedJobs.length || deletingSelected" @click="deleteSelected">
+            {{ deletingSelected ? '删除中' : '批量删除' }}
+          </BaseButton>
         </div>
       </div>
 
-      <div v-if="taskTab === 'current'" class="state-tabs">
-        <button v-for="state in statusTabs" :key="state.key" type="button" :class="{ active: taskStatusTab === state.key }" @click="taskStatusTab = state.key">
-          <span :class="['state-dot', state.key]"></span>{{ state.label }} <em>{{ state.count }}</em>
-        </button>
+      <div class="toolbar">
+        <div class="segmented">
+          <button type="button" :class="{ active: taskTab === 'current' }" @click="taskTab = 'current'">当前任务</button>
+          <button type="button" :class="{ active: taskTab === 'history' }" @click="taskTab = 'history'">历史任务</button>
+        </div>
+        <div v-if="taskTab === 'current'" class="state-tabs">
+          <button v-for="state in statusTabs" :key="state.key" type="button" :class="{ active: taskStatusTab === state.key }" @click="taskStatusTab = state.key">
+            <span :class="['state-dot', state.key]"></span>{{ state.label }} <em>{{ state.count }}</em>
+          </button>
+        </div>
       </div>
 
       <TaskTable
@@ -90,10 +87,7 @@
     <TaskDialog v-if="computeDialog" title="Windows 算力端" @close="computeDialog = false">
       <div class="compute-settings">
         <section class="settings-section">
-          <label class="compute-toggle">
-            <input v-model="computeEnabled" type="checkbox">
-            <span>启用 Windows 算力端</span>
-          </label>
+          <BaseSwitch v-model="computeEnabled" label="启用 Windows 算力端" />
           <div class="form-grid compact-grid">
             <FormField label="算力端地址">
               <input v-model.trim="connection.subtitle_backend_url" placeholder="http://WINDOWS-IP:18181">
@@ -271,7 +265,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import CompareView from '../components/CompareView.vue'
 import TaskDialog from '../components/TaskDialog.vue'
 import TaskTable from '../components/TaskTable.vue'
-import { api, postJson } from '../lib/api'
+import { api, deleteJson, postJson } from '../lib/api'
 
 const isCompareView = window.location.pathname === '/subtitles/compare'
 const PAGE_SIZE = 20
@@ -282,7 +276,7 @@ const loading = ref(false)
 const notice = ref('')
 const errorMessage = ref('')
 const taskTab = ref('current')
-const taskStatusTab = ref('running')
+const taskStatusTab = ref('all')
 const page = ref(1)
 const jobs = ref([])
 const postprocessTasks = ref([])
@@ -298,6 +292,7 @@ const loadingQbOptions = ref(false)
 const qbOptionState = ref('')
 const retryingSelected = ref(false)
 const runningSelected = ref(false)
+const deletingSelected = ref(false)
 const autoRunningQueue = ref(false)
 const retryingJob = reactive({})
 const selectedIds = reactive(new Set())
@@ -417,17 +412,9 @@ const historyJobs = computed(() => adaptedJobs.value.filter((job) => ['completed
 const runningCount = computed(() => runningJobs.value.length)
 const waitingCount = computed(() => waitingJobs.value.length)
 const failedCount = computed(() => failedJobs.value.length)
-const queueCount = computed(() => activeJobs.value.length)
-const postprocessCount = computed(() => adaptedPostprocessJobs.value.length)
-const transcodeRunningCount = computed(() => adaptedPostprocessJobs.value.filter((job) => job.phase === 'transcode' && job.statusKey === 'running').length)
-const subtitleProcessingCount = computed(() => adaptedPostprocessJobs.value.filter((job) => job.phase === 'subtitle' && ['running', 'translating'].includes(job.statusKey)).length)
 const activePostprocessCount = computed(() => adaptedPostprocessJobs.value.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)).length)
-const todayCompleted = computed(() => {
-  const start = new Date()
-  start.setHours(0, 0, 0, 0)
-  return completedJobs.value.filter((job) => Number(job.finishedAt || job.updatedAt || 0) * 1000 >= start.getTime()).length
-})
 const statusTabs = computed(() => [
+  { key: 'all', label: '全部', count: activeJobs.value.length, items: activeJobs.value },
   { key: 'running', label: '运行中', count: runningCount.value, items: runningJobs.value },
   { key: 'waiting', label: '等待中', count: waitingCount.value, items: waitingJobs.value },
   { key: 'failed', label: '失败', count: failedCount.value, items: failedJobs.value },
@@ -438,6 +425,7 @@ const pageCount = computed(() => Math.max(1, Math.ceil(visibleJobs.value.length 
 const visiblePagedJobs = computed(() => visibleJobs.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE))
 const selectedJobs = computed(() => adaptedJobs.value.filter((job) => selectedIds.has(job.id)))
 const runnableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canRun))
+const deletableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canDelete))
 const runnableQueueJobs = computed(() => adaptedPostprocessJobs.value.filter((job) => job.canRun))
 const allVisibleSelected = computed(() => visiblePagedJobs.value.length > 0 && visiblePagedJobs.value.every((job) => selectedIds.has(job.id)))
 const memoryLabel = computed(() => {
@@ -780,6 +768,40 @@ async function runSelected() {
   }
 }
 
+async function deleteSelected() {
+  const deletable = deletableSelectedJobs.value
+  if (!deletable.length) {
+    notice.value = '选中的任务里没有可删除的已结束任务。'
+    return
+  }
+  const skipped = selectedJobs.value.length - deletable.length
+  const names = deletable.slice(0, 5).map((job) => job.title).join('、')
+  const targetLabel = `${deletable.length} 个已结束任务`
+  const skippedLabel = skipped > 0 ? `\n其中 ${skipped} 个运行中或等待中的任务会保留。` : ''
+  const ok = window.confirm(`将删除 ${targetLabel} 的任务记录${names ? `：${names}` : ''}。不会删除媒体文件或字幕结果。${skippedLabel}\n继续吗？`)
+  if (!ok) return
+  deletingSelected.value = true
+  errorMessage.value = ''
+  try {
+    let deleted = 0
+    for (const job of deletable) {
+      if (job.sourceType === 'postprocess') {
+        await deleteJson(`/api/postprocess/tasks/${job.rawId}`)
+      } else {
+        await deleteJson(`/api/subtitle/jobs/${job.fileId}`)
+      }
+      selectedIds.delete(job.id)
+      deleted += 1
+    }
+    notice.value = `已删除 ${deleted} 个任务记录。`
+    await refreshAll()
+  } catch (error) {
+    errorMessage.value = error.message || '批量删除失败'
+  } finally {
+    deletingSelected.value = false
+  }
+}
+
 async function cancelJob(job) {
   if (job.sourceType !== 'postprocess') return
   await postJson(`/api/postprocess/tasks/${job.rawId}/cancel`, {})
@@ -802,12 +824,14 @@ function adaptSubtitleJob(job) {
     path,
     statusKey,
     statusLabel: statusLabel(statusKey),
+    progressTone: progressTone(statusKey),
     createdLabel: formatTime(job.created_at),
     createdAt: job.created_at,
     updatedAt: job.updated_at,
     finishedAt: job.finished_at,
     modelLabel: `${job.model || 'large-v3'} / ${job.source_language || 'auto'} => ${job.target_language || 'zh'}`,
     canRetry: ['failed', 'completed'].includes(statusKey),
+    canDelete: ['failed', 'completed'].includes(statusKey),
     canCancel: false,
     resultSrt: job.translated_srt || job.bilingual_srt
   }
@@ -820,17 +844,19 @@ function adaptPostprocessJob(task) {
   const workerJob = findTranscodeJob(task)
   const progressInfo = postprocessProgressInfo(task, phase, statusKey, workerJob)
   const waitingDetail = postprocessWaitingDetail(task, statusKey)
+  const displayPath = postprocessDisplayPath(task, waitingDetail)
   return {
     raw: task,
     id: `postprocess:${task.id}`,
     rawId: task.id,
     sourceType: 'postprocess',
     phase,
-    phaseLabel: phase === 'transcode' ? '转码' : phase === 'subtitle' ? '字幕' : '后处理',
+    phaseLabel: postprocessPhaseLabel(task, phase),
     title: phase === 'subtitle' ? `${avId} · 生成字幕` : phase === 'transcode' ? `${avId} · 转码` : avId,
-    path: task.input_path || task.output_path || waitingDetail || task.error_message || '等待链路写入输入文件',
+    path: displayPath,
     statusKey,
     statusLabel: postprocessStatusLabel(task.status, phase, statusKey),
+    progressTone: postprocessProgressTone(task.status, statusKey),
     createdLabel: formatTime(task.created_at),
     createdAt: task.created_at,
     updatedAt: task.updated_at || task.created_at,
@@ -840,6 +866,7 @@ function adaptPostprocessJob(task) {
     progressDetail: progressInfo.progressDetail || waitingDetail,
     canRun: ['waiting_worker', 'ready_to_run'].includes(String(task.status || '')),
     canRetry: ['failed', 'ignored', 'conflict', 'expired'].includes(String(task.status || '')),
+    canDelete: ['completed', 'failed', 'ignored', 'conflict', 'expired'].includes(String(task.status || '')),
     canCancel: !['completed', 'ignored'].includes(String(task.status || '')),
     resultSrt: ''
   }
@@ -852,8 +879,25 @@ function findTranscodeJob(task) {
 }
 
 function postprocessProgressInfo(task, phase, statusKey, workerJob) {
+  const status = String(task?.status || '')
+  if (status === 'downloading') {
+    const progress = clampPercent(Number(task?.data?.qb_progress || 0))
+    const percent = Math.round(progress * 100)
+    return {
+      showProgress: percent > 0,
+      progressPercent: percent,
+      progressLabel: percent > 0 ? `${percent}%` : '',
+      progressDetail: percent > 0 ? `qB 下载中 ${percent}%` : 'qB 下载中'
+    }
+  }
   if (phase !== 'transcode' && statusKey !== 'translating') {
-    return { showProgress: false, progressPercent: 0, progressLabel: '', progressDetail: '' }
+    const completed = statusKey === 'completed'
+    return {
+      showProgress: completed,
+      progressPercent: completed ? 100 : 0,
+      progressLabel: completed ? '100%' : '',
+      progressDetail: ''
+    }
   }
   const subtitleStatus = task?.data?.subtitle_status || {}
   const rawProgress = Number(workerJob?.progress ?? subtitleStatus.progress ?? task?.data?.worker_result?.progress ?? task?.data?.transcode_progress)
@@ -878,6 +922,15 @@ function postprocessProgressInfo(task, phase, statusKey, workerJob) {
     progressLabel: `${percent}%`,
     progressDetail: detail
   }
+}
+
+function postprocessPhaseLabel(task, phase) {
+  const taskType = String(task?.task_type || '')
+  if (phase === 'transcode') return '转码'
+  if (phase === 'subtitle') return '字幕'
+  if (taskType.startsWith('wash_')) return '洗版'
+  if (taskType === 'subscription') return '订阅'
+  return '后处理'
 }
 
 function transcodeProgressDetail(job) {
@@ -922,7 +975,7 @@ function postprocessStatusLabel(status, phase, statusKey) {
     if (value === 'waiting_worker') return '等待算力端'
     if (value === 'ready_to_run') return '等待队列'
     if (['torrent_pushed', 'downloading'].includes(value)) return '等待下载'
-    if (value === 'created') return '等待创建'
+    if (value === 'created') return '未接管'
     return '等待中'
   }
   if (statusKey === 'failed') return '失败'
@@ -943,8 +996,29 @@ function postprocessWaitingDetail(task, statusKey) {
     const progress = Number(task?.data?.qb_progress)
     return Number.isFinite(progress) && progress > 0 ? `qB 下载中 ${Math.round(progress * 100)}%` : 'qB 下载中'
   }
-  if (status === 'created') return '等待订阅筛选和推送下载'
+  if (status === 'created') return '未匹配到 qB 的 moviemuse 标签下载；如果文件已在媒体库，请手动触发后处理。'
   return task?.error_message || ''
+}
+
+function postprocessDisplayPath(task, waitingDetail) {
+  const status = String(task?.status || '')
+  if (task?.input_path) return task.input_path
+  if (task?.output_path) return task.output_path
+  if (status === 'created') return '未接管下载文件'
+  if (status === 'ready_to_run') return '等待输入文件'
+  return task?.error_message || waitingDetail || '等待链路写入输入文件'
+}
+
+function progressTone(statusKey) {
+  if (statusKey === 'completed') return 'completed'
+  if (statusKey === 'failed') return 'failed'
+  if (['running', 'translating'].includes(statusKey)) return 'running'
+  return 'queued'
+}
+
+function postprocessProgressTone(status, statusKey) {
+  if (String(status || '') === 'created') return 'idle'
+  return progressTone(statusKey)
 }
 
 function statusLabel(status) {
@@ -1102,15 +1176,13 @@ h1 {
   cursor: pointer;
 }
 
-.service-card span,
-.metric-strip span {
+.service-card span {
   color: var(--mm-muted);
   font-size: 14px;
   line-height: 1.35;
 }
 
-.service-card strong,
-.metric-strip strong {
+.service-card strong {
   display: block;
   margin-top: 12px;
   font-size: 28px;
@@ -1118,8 +1190,7 @@ h1 {
   line-height: 1.16;
 }
 
-.service-card em,
-.metric-strip em {
+.service-card em {
   display: block;
   margin-top: 8px;
   color: var(--mm-primary);
@@ -1150,28 +1221,25 @@ h1 {
 }
 
 .task-panel {
-  padding: 24px;
+  --task-panel-gutter: 24px;
+  overflow: hidden;
+  padding: 0;
 }
 
-.metric-strip {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
-  gap: 12px;
-  min-width: min(680px, 100%);
-}
-
-.metric-strip div {
-  min-height: 112px;
-  padding: 16px;
-  border: 1px solid var(--mm-border);
-  border-radius: 14px;
+.panel-head {
+  align-items: flex-start;
+  padding: var(--task-panel-gutter);
 }
 
 .toolbar {
   align-items: center;
-  margin-top: 22px;
-  padding-top: 18px;
+  padding: 16px var(--task-panel-gutter);
   border-top: 1px solid var(--mm-border);
+}
+
+.task-panel :deep(.task-table) {
+  width: calc(100% - (var(--task-panel-gutter) * 2));
+  margin: 0 var(--task-panel-gutter) var(--task-panel-gutter);
 }
 
 .segmented,
@@ -1203,7 +1271,7 @@ h1 {
 }
 
 .state-tabs {
-  margin: 18px 0 14px;
+  margin: 0;
 }
 
 .state-tabs em {
@@ -1218,6 +1286,10 @@ h1 {
   margin-right: 8px;
   border-radius: 999px;
   background: var(--mm-muted);
+}
+
+.state-dot.all {
+  background: var(--mm-primary);
 }
 
 .state-dot.running,
@@ -1240,7 +1312,8 @@ h1 {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  margin-top: 18px;
+  padding: 18px 24px 24px;
+  border-top: 1px solid var(--mm-border);
 }
 
 .form-grid,
@@ -1478,6 +1551,10 @@ input[type="checkbox"] {
   .toolbar,
   .qb-option-head {
     display: grid;
+  }
+
+  .task-panel {
+    --task-panel-gutter: 16px;
   }
 }
 </style>

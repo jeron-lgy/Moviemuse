@@ -92,7 +92,7 @@
 
       <BaseCard as="article" class="preview-panel sample-card">
         <h2>业务卡片示例</h2>
-        <p>模拟 Dashboard / 任务页这类信息卡。</p>
+        <p>模拟首页 / 任务页这类信息卡。</p>
         <strong>29</strong>
         <span>当前订阅总数</span>
         <StatusPill tone="primary">本周 +3</StatusPill>

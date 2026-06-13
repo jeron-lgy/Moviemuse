@@ -26,7 +26,7 @@ NOTIFICATION_CHANNEL_DEFAULTS: dict[str, dict[str, Any]] = {
             "proxy": "",
             "touser": "@all",
             "default_image_url": "",
-            "cover_enabled": True,
+            "cover_enabled": False,
             "token": "",
             "aes_key": "",
             "callback_path": "/api/v1/message",
@@ -83,6 +83,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             "scan_completed": False,
             "subtitle_completed": False,
             "subtitle_failed": True,
+            "automation_actress_poll": True,
+            "automation_av_download": True,
+            "automation_wash_download": True,
         },
         "templates": {},
     },
@@ -230,7 +233,7 @@ def normalize_notification_channel(item: dict[str, Any], index: int) -> dict[str
         except (TypeError, ValueError):
             merged_config["priority"] = 5
     if channel_type == "wechat_work":
-        merged_config["cover_enabled"] = bool(merged_config.get("cover_enabled", True))
+        merged_config["cover_enabled"] = bool(merged_config.get("cover_enabled", False))
         for key in ("corp_id", "corp_secret", "agent_id", "proxy", "touser", "default_image_url", "token", "aes_key", "callback_path"):
             merged_config[key] = str(merged_config.get(key) or "").strip()
         if not merged_config["touser"]:

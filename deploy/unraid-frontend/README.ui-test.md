@@ -7,16 +7,16 @@
 将本分支的 `app/`、`frontend/dist/`、`deploy/unraid-frontend/` 按原目录结构拷贝到：
 
 ```text
-/mnt/user/appdata/media-toolbox-ui-test
+/mnt/user/appdata/moviemuse-ui-test
 ```
 
 在 Unraid 执行：
 
 ```bash
-cd /mnt/user/appdata/media-toolbox-ui-test
-mkdir -p /mnt/user/appdata/media-toolbox-ui-test/data
-chown -R nobody:users /mnt/user/appdata/media-toolbox-ui-test/data
-chmod -R u+rwX,g+rwX /mnt/user/appdata/media-toolbox-ui-test/data
+cd /mnt/user/appdata/moviemuse-ui-test
+mkdir -p /mnt/user/appdata/moviemuse-ui-test/data
+chown -R nobody:users /mnt/user/appdata/moviemuse-ui-test/data
+chmod -R u+rwX,g+rwX /mnt/user/appdata/moviemuse-ui-test/data
 docker compose -f deploy/unraid-frontend/docker-compose.ui-test.yml up -d --build
 ```
 

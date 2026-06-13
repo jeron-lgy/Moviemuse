@@ -76,6 +76,11 @@ function onInput(event) {
   background: transparent;
   color: var(--mm-muted);
   cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.mm-secret-toggle svg {
+  display: block;
 }
 
 .mm-secret-toggle:hover {

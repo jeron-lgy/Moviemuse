@@ -361,6 +361,69 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
 
         self.assertEqual(results, [])
 
+    def test_dmm_movie_ranking_html_parser_extracts_rows(self) -> None:
+        from app.dmm_service import DMMService
+
+        html = """
+        <table>
+          <tr><td class="bd-b">
+            1
+            <a href="/mono/dvd/-/detail/=/cid=h_068mxgs1437dl/"><img src="/digital/video/common/blank.gif" data-src="https://pics.dmm.co.jp/mono/movie/adult/h_068mxgs1437dl/h_068mxgs1437dlpl.jpg" alt="【数量限定】河北彩花の尊い美顔を心おきなく拝みたい。"></a>
+            <a href="/mono/dvd/-/list/=/article=maker/id=123/">ナンバーワンスタイル</a> /
+            <a href="/mono/dvd/-/list/=/article=actress/id=1044864/">河北彩花（河北彩伽）</a>
+            2026/06/24発売
+          </td></tr>
+        </table>
+        """
+
+        rows = DMMService._parse_ranking_html(html, "movie")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rank"], 1)
+        self.assertEqual(rows[0]["id"], "MXGS-1437")
+        self.assertIn("h_068mxgs1437dlpl.jpg", rows[0]["cover"])
+        self.assertEqual(rows[0]["release_date"], "2026-06-24")
+        self.assertEqual(rows[0]["maker"], "ナンバーワンスタイル")
+        self.assertEqual(rows[0]["actresses"][0]["name"], "河北彩花（河北彩伽）")
+
+    def test_dmm_ranking_normalizes_prefixed_limited_cids(self) -> None:
+        from app.dmm_service import DMMService
+
+        cases = {
+            "h_346rebd1046tk1": "REBD-1046",
+            "n_709maraa244tk": "MARAA-244",
+            "ipzz00895": "IPZZ-895",
+            "k9snos275": "SNOS-275",
+        }
+        for cid, expected in cases.items():
+            with self.subTest(cid=cid):
+                self.assertEqual(DMMService.normalize_av_id_from_cid(cid), expected)
+
+    def test_dmm_actress_ranking_html_parser_extracts_latest_work(self) -> None:
+        from app.dmm_service import DMMService
+
+        html = """
+        <table>
+          <tr><td class="bd-b">
+            4
+            <a href="/mono/dvd/-/list/=/article=actress/id=1044864/">河北彩花（河北彩伽）<img src="/digital/video/common/blank.gif" data-original="https://pics.dmm.co.jp/mono/actjpgs/medium/kawakita_saika.jpg" alt=""></a>
+            最新作 ： <a href="/mono/dvd/-/detail/=/cid=k9snos275/">【予約】 河北彩花の尊い美顔を心おきなく拝みたい。</a>
+            発売日 ： 2026/06/24
+            商品数 ： 328
+          </td></tr>
+        </table>
+        """
+
+        rows = DMMService._parse_ranking_html(html, "actress")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rank"], 4)
+        self.assertEqual(rows[0]["name"], "河北彩花（河北彩伽）")
+        self.assertIn("kawakita_saika.jpg", rows[0]["cover"])
+        self.assertEqual(rows[0]["latest_av_id"], "SNOS-275")
+        self.assertEqual(rows[0]["latest_release_date"], "2026-06-24")
+        self.assertEqual(rows[0]["product_count"], 328)
+
 
 if __name__ == "__main__":
     unittest.main()

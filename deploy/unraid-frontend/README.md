@@ -19,15 +19,15 @@ WebUI, set `CONSOLE_PUBLIC_URL` from “Windows 算力端 -> Unraid 回调地址
 Copy the project root to:
 
 ```text
-/mnt/user/appdata/media-toolbox
+/mnt/user/appdata/moviemuse
 ```
 
 Then run from the project root:
 
 ```bash
-mkdir -p /mnt/user/appdata/media-toolbox/data
-chown -R 99:100 /mnt/user/appdata/media-toolbox/data
-chmod -R u+rwX,g+rwX /mnt/user/appdata/media-toolbox/data
+mkdir -p /mnt/user/appdata/moviemuse/data
+chown -R 99:100 /mnt/user/appdata/moviemuse/data
+chmod -R u+rwX,g+rwX /mnt/user/appdata/moviemuse/data
 docker compose -f deploy/unraid-frontend/docker-compose.yml up -d --build
 ```
 

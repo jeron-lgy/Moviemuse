@@ -1,38 +1,30 @@
 <template>
   <section class="duplicates-view">
-    <PageHeader
-      kicker="媒体扫描"
-      title="重复视频"
-      description="扫描重复视频，批量移动或发送字幕。"
-    >
-      <template #actions>
-        <BaseButton type="button" :disabled="loading" @click="loadScan">刷新</BaseButton>
-        <BaseButton variant="primary" type="button" :disabled="running" @click="runScan">
-          {{ running ? '扫描中' : '开始扫描' }}
-        </BaseButton>
-      </template>
-    </PageHeader>
-
     <NoticeBanner v-if="message">{{ message }}</NoticeBanner>
     <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
 
-    <BaseCard class="status-card">
-      <div class="status-head">
-        <div>
-          <h2>状态栏</h2>
-          <p>{{ scan.current_path || '等待扫描。' }}</p>
-        </div>
-        <span class="mm-pill">{{ formatStatus(scan.status) }}</span>
-      </div>
+    <BaseCard class="hero-card">
+      <PageHeader
+        kicker="媒体扫描"
+        title="重复视频"
+        description="扫描重复视频，批量移动或发送字幕。"
+      >
+        <template #actions>
+          <BaseButton type="button" :disabled="loading" @click="loadScan">刷新</BaseButton>
+          <BaseButton variant="primary" type="button" :disabled="running" @click="runScan">
+            {{ running ? '扫描中' : '开始扫描' }}
+          </BaseButton>
+        </template>
+      </PageHeader>
       <div class="status-metrics">
         <article v-for="item in statusItems" :key="item.label">
           <span>{{ item.label }}</span>
           <strong>{{ item.value }}</strong>
           <em>{{ item.detail }}</em>
+          <div v-if="item.progress" class="progress-track" aria-label="扫描进度">
+            <i :style="{ width: `${percent}%` }"></i>
+          </div>
         </article>
-      </div>
-      <div class="progress-track" aria-label="扫描进度">
-        <i :style="{ width: `${percent}%` }"></i>
       </div>
     </BaseCard>
 
@@ -54,127 +46,79 @@
         <div v-if="!(scan.selectable_scan_dirs || []).length" class="compact-empty">没有可扫描目录。</div>
       </BaseCard>
 
-      <div class="right-stack">
-        <BaseCard class="rules-card">
-          <div class="panel-head">
-            <div>
-              <h2>批量操作菜单</h2>
-              <p>批量勾选后再执行。</p>
-            </div>
-            <span class="mm-pill">{{ selectedActionCount }} 个已选</span>
-          </div>
-
-          <div class="batch-actions">
-            <BaseButton
-              type="button"
-              :variant="autoRules.move ? 'danger' : ''"
-              @click="toggleBatch('move')"
-            >
-              批量重复
-            </BaseButton>
-            <BaseButton
-              type="button"
-              :variant="autoRules.subtitle ? 'primary' : ''"
-              @click="toggleBatch('subtitle')"
-            >
-              批量字幕
-            </BaseButton>
-            <BaseButton
-              variant="danger"
-              type="button"
-              :disabled="!moveSelection.length || submittingAction"
-              @click="submitPaths('/move/jobs', moveSelection)"
-            >
-              移动选中
-            </BaseButton>
-            <BaseButton
-              variant="primary"
-              type="button"
-              :disabled="!subtitleSelection.length || submittingAction"
-              @click="submitPaths('/scan/subtitles', subtitleSelection)"
-            >
-              发送到字幕
-            </BaseButton>
-          </div>
-        </BaseCard>
-
-        <BaseCard class="groups-card">
-          <div class="panel-head groups-head">
+      <BaseCard class="groups-card" padding="none">
+        <div class="groups-toolbar">
+          <div class="groups-copy">
             <div>
               <h2>重复组数据</h2>
               <p>移动优先于字幕。</p>
             </div>
-            <div class="head-tools">
-              <BaseButton type="button" size="sm" :disabled="!groups.length" @click="clearManualSelection">清空手动选择</BaseButton>
-              <span class="mm-pill">{{ groups.length }} 组</span>
+            <div class="selection-summary">
+              <span class="count-pill">待移动 <strong>{{ moveSelection.length }}</strong></span>
+              <span class="count-pill">待字幕 <strong>{{ subtitleSelection.length }}</strong></span>
+              <span class="count-pill">已选择 <strong>{{ selectedActionCount }}</strong></span>
+              <span class="count-pill">总计 <strong>{{ groups.length }}</strong> 组</span>
             </div>
           </div>
-          <div class="selection-summary">
-            <article>
-              <span>待移动</span>
-              <strong>{{ moveSelection.length }}</strong>
-            </article>
-            <article>
-              <span>待字幕</span>
-              <strong>{{ subtitleSelection.length }}</strong>
-            </article>
-            <article>
-              <span>已选择</span>
-              <strong>{{ selectedActionCount }}</strong>
-            </article>
+          <div class="batch-actions">
+            <BaseButton type="button" size="sm" :variant="autoRules.move ? 'danger' : ''" @click="toggleBatch('move')">批量重复</BaseButton>
+            <BaseButton type="button" size="sm" :variant="autoRules.subtitle ? 'primary' : ''" @click="toggleBatch('subtitle')">批量字幕</BaseButton>
+            <BaseButton variant="danger" type="button" size="sm" :disabled="!moveSelection.length || submittingAction" @click="submitPaths('/move/jobs', moveSelection)">移动选中</BaseButton>
+            <BaseButton variant="primary" type="button" size="sm" :disabled="!subtitleSelection.length || submittingAction" @click="submitPaths('/scan/subtitles', subtitleSelection)">发送到字幕</BaseButton>
+            <BaseButton type="button" size="sm" :disabled="!groups.length" @click="clearManualSelection">清空选择</BaseButton>
           </div>
+        </div>
 
-          <div v-if="groups.length" class="group-list">
-            <article v-for="group in groups" :key="group.key" class="group-row">
-              <div class="group-title">
-                <div>
-                  <strong>{{ group.title || group.files?.[0]?.name || group.key }}</strong>
-                  <span>{{ group.source || '重复组' }} · {{ group.files?.length || 0 }} 个文件</span>
+        <div v-if="groups.length" class="group-list">
+          <article v-for="group in groups" :key="group.key" class="group-row">
+            <div class="group-title">
+              <div>
+                <strong>{{ group.title || group.files?.[0]?.name || group.key }}</strong>
+                <span>{{ group.source || '重复组' }} · {{ group.files?.length || 0 }} 个文件</span>
+              </div>
+              <span class="mm-pill">{{ group.year || '未知年份' }}</span>
+            </div>
+
+            <div class="file-list">
+              <article
+                v-for="file in group.files || []"
+                :key="file.path"
+                class="file-row"
+                :class="fileRowClass(group, file)"
+              >
+                <label class="file-check" title="移动">
+                  <input
+                    type="checkbox"
+                    :checked="manualMove.has(file.path)"
+                    @change="setManualAction(file.path, 'move', $event.target.checked)"
+                  >
+                  <span>移</span>
+                </label>
+                <label class="file-check" title="发送到字幕">
+                  <input
+                    type="checkbox"
+                    :checked="manualSubtitle.has(file.path)"
+                    @change="setManualAction(file.path, 'subtitle', $event.target.checked)"
+                  >
+                  <span>字</span>
+                </label>
+                <div class="file-main">
+                  <strong>{{ file.name || file.path }}</strong>
+                  <span>{{ file.path }}</span>
                 </div>
-                <span class="mm-pill">{{ group.year || '未知年份' }}</span>
-              </div>
-
-              <div class="file-list">
-                <article
-                  v-for="file in group.files || []"
-                  :key="file.path"
-                  class="file-row"
-                  :class="fileRowClass(group, file)"
-                >
-                  <label class="file-check" title="移动">
-                    <input
-                      type="checkbox"
-                      :checked="manualMove.has(file.path)"
-                      @change="setManualAction(file.path, 'move', $event.target.checked)"
-                    >
-                    <span>移</span>
-                  </label>
-                  <label class="file-check" title="发送到字幕">
-                    <input
-                      type="checkbox"
-                      :checked="manualSubtitle.has(file.path)"
-                      @change="setManualAction(file.path, 'subtitle', $event.target.checked)"
-                    >
-                    <span>字</span>
-                  </label>
-                  <div class="file-main">
-                    <strong>{{ file.name || file.path }}</strong>
-                    <span>{{ file.path }}</span>
-                  </div>
-                  <div class="file-meta">
-                    <span>{{ formatSize(file.size_bytes) }}</span>
-                    <span>{{ file.resolution || '未知' }}</span>
-                    <span>{{ file.subtitle_label || '无字幕' }}</span>
-                    <span v-if="file.uncensored">无码</span>
-                  </div>
-                  <em v-if="hitLabel(group, file)" class="hit-badge">{{ hitLabel(group, file) }}</em>
-                </article>
-              </div>
-            </article>
-          </div>
-          <div v-else class="empty-state">当前没有重复组数据。</div>
-        </BaseCard>
-      </div>
+                <div class="file-meta">
+                  <span>{{ formatSize(file.size_bytes) }}</span>
+                  <span>{{ file.resolution || '未知' }}</span>
+                  <span>{{ file.subtitle_label || '无字幕' }}</span>
+                  <span v-if="file.uncensored">无码</span>
+                </div>
+                <em v-if="hitLabel(group, file)" class="hit-badge">{{ hitLabel(group, file) }}</em>
+              </article>
+            </div>
+          </article>
+        </div>
+        <div v-else class="empty-state">当前没有重复组数据。</div>
+      </BaseCard>
     </section>
   </section>
 </template>
@@ -212,7 +156,7 @@ const subtitleSelection = computed(() => {
 })
 const selectedActionCount = computed(() => moveSelection.value.length + subtitleSelection.value.length)
 const statusItems = computed(() => [
-  { label: '进度', value: `${percent.value}%`, detail: `${scan.value.processed_files || 0} / ${scan.value.scan_total_files || 0}` },
+  { label: '扫描进度', value: `${percent.value}%`, detail: `${scan.value.processed_files || 0} / ${scan.value.scan_total_files || 0}`, progress: true },
   { label: '重复组', value: scan.value.duplicate_groups || 0, detail: `${scan.value.total_files || 0} 个媒体文件` },
   { label: '重复文件', value: scan.value.duplicate_files || 0, detail: `${scan.value.single_files?.length || 0} 个单文件` },
   { label: '待处理', value: selectedActionCount.value, detail: `${moveSelection.value.length} 移动 / ${subtitleSelection.value.length} 字幕` }
@@ -388,74 +332,42 @@ function formatStatus(status) {
 <style scoped>
 .duplicates-view {
   display: grid;
-  gap: 24px;
+  gap: 12px;
 }
 
-.status-card,
+.hero-card,
 .scan-card,
-.rules-card,
 .groups-card {
   min-width: 0;
 }
 
-.status-card {
+.hero-card {
   display: grid;
   gap: 18px;
+  border-radius: 16px;
 }
 
-.status-head,
-.panel-head,
-.groups-head,
-.group-title {
-  display: flex;
+.hero-card :deep(.mm-page-head) {
   align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.scan-card .panel-head {
-  display: grid;
-  grid-template-columns: 1fr;
-}
-
-.scan-card .panel-head .mm-pill {
-  justify-self: start;
-}
-
-.status-head h2,
-.status-head p,
-.panel-head h2,
-.panel-head p,
-.group-title strong,
-.group-title span {
   margin: 0;
 }
 
-.status-head h2,
-.panel-head h2 {
-  font-size: 20px;
-  font-weight: 650;
-}
-
-.status-head p,
-.panel-head p {
-  margin-top: 8px;
-  color: var(--mm-muted);
-  line-height: 1.6;
+.hero-card :deep(.mm-page-description) {
+  margin-top: 6px;
 }
 
 .status-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
+  gap: 8px;
 }
 
 .status-metrics article {
   display: grid;
-  min-height: 116px;
-  align-content: space-between;
-  gap: 8px;
-  padding: 16px;
+  min-height: 86px;
+  align-content: start;
+  gap: 4px;
+  padding: 14px 16px 12px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
   background: var(--mm-surface);
@@ -463,22 +375,25 @@ function formatStatus(status) {
 
 .status-metrics span,
 .status-metrics em,
+.panel-head p,
+.groups-copy p,
 .group-title span,
 .file-main span,
 .file-meta,
-.selection-summary span {
+.selection-summary {
   color: var(--mm-muted);
 }
 
 .status-metrics span {
+  font-size: 13px;
   font-weight: 550;
 }
 
 .status-metrics strong {
   overflow: hidden;
-  font-size: 30px;
+  font-size: 28px;
   font-weight: 650;
-  line-height: 1.12;
+  line-height: 1.05;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -492,10 +407,12 @@ function formatStatus(status) {
 }
 
 .progress-track {
-  height: 8px;
+  height: 6px;
   overflow: hidden;
+  align-self: end;
+  margin-top: 2px;
   border-radius: 999px;
-  background: var(--mm-surface);
+  background: #eee;
 }
 
 .progress-track i {
@@ -508,44 +425,73 @@ function formatStatus(status) {
 
 .workbench-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
   gap: 12px;
   align-items: stretch;
 }
 
-.right-stack {
+.scan-card {
   display: grid;
-  grid-column: 2 / -1;
-  min-width: 0;
-  gap: 16px;
-  grid-template-rows: auto minmax(420px, 1fr);
+  align-content: start;
+  min-height: 640px;
+  border-radius: 14px;
 }
 
-.scan-card {
-  min-height: 680px;
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.scan-card .panel-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.panel-head h2,
+.panel-head p,
+.groups-copy h2,
+.groups-copy p,
+.group-title strong,
+.group-title span {
+  margin: 0;
+}
+
+.panel-head h2,
+.groups-copy h2 {
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.panel-head p,
+.groups-copy p {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 .dir-list,
 .group-list,
 .file-list {
   display: grid;
-  gap: 12px;
+  gap: 8px;
 }
 
 .dir-list {
-  max-height: 580px;
-  margin-top: 18px;
+  max-height: 560px;
+  margin-top: 14px;
   overflow: auto;
-  padding-right: 4px;
+  padding-right: 2px;
 }
 
 .dir-row {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  grid-template-columns: 20px minmax(0, 1fr);
   align-items: center;
-  min-height: 48px;
-  gap: 10px;
-  padding: 0 14px;
+  min-height: 38px;
+  gap: 8px;
+  padding: 0 10px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
   background: #fff;
@@ -563,95 +509,102 @@ function formatStatus(status) {
   white-space: nowrap;
 }
 
-.rules-card {
+.groups-card {
   display: grid;
-  align-content: start;
-  gap: 18px;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 640px;
+  overflow: hidden;
+  border-radius: 14px;
+}
+
+.groups-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 20px 20px 14px;
+  border-bottom: 1px solid var(--mm-border);
+}
+
+.groups-copy {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.selection-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.count-pill,
+.hit-badge,
+.file-meta span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--mm-border);
+  border-radius: 999px;
+  background: #fff;
+  white-space: nowrap;
+}
+
+.count-pill {
+  gap: 4px;
+  background: var(--mm-surface);
+  border-color: transparent;
+}
+
+.count-pill strong {
+  color: var(--mm-text);
+  font-weight: 650;
 }
 
 .batch-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-}
-
-.groups-card {
-  display: grid;
-  align-content: start;
-}
-
-.groups-head {
-  align-items: center;
-}
-
-.head-tools {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.selection-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 18px;
-}
-
-.selection-summary article {
-  display: grid;
-  gap: 6px;
-  min-height: 78px;
-  align-content: center;
-  padding: 14px 16px;
-  border: 1px solid var(--mm-border);
-  border-radius: 8px;
-  background: var(--mm-surface);
-}
-
-.selection-summary span {
-  color: var(--mm-muted);
-  font-size: 13px;
-  font-weight: 550;
-}
-
-.selection-summary strong {
-  font-size: 26px;
-  font-weight: 650;
-  line-height: 1.1;
-}
-
-.status-head .mm-pill,
-.panel-head .mm-pill,
-.head-tools .mm-pill {
-  white-space: nowrap;
+  justify-content: flex-end;
+  justify-self: end;
+  gap: 8px;
+  min-width: 0;
 }
 
 .group-list {
-  max-height: 860px;
-  margin-top: 18px;
+  max-height: 640px;
   overflow: auto;
-  padding-right: 4px;
+  padding: 12px 20px 20px;
 }
 
 .group-row {
   display: grid;
-  gap: 14px;
-  padding: 16px;
+  gap: 10px;
+  padding: 14px;
   border: 1px solid var(--mm-border);
   border-radius: 8px;
   background: #fff;
 }
 
+.group-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .group-title div {
   display: grid;
   min-width: 0;
-  gap: 5px;
+  gap: 4px;
 }
 
 .group-title strong {
   overflow: hidden;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -659,12 +612,12 @@ function formatStatus(status) {
 
 .file-row {
   display: grid;
-  grid-template-columns: 40px 40px minmax(0, 1.35fr) minmax(220px, .85fr) auto;
+  grid-template-columns: 34px 34px minmax(0, 1fr) minmax(240px, auto) auto;
   align-items: center;
-  gap: 10px;
-  min-height: 64px;
-  padding: 10px 12px;
-  border: 1px solid var(--mm-border);
+  gap: 8px;
+  min-height: 42px;
+  padding: 7px 10px;
+  border: 1px solid #ececec;
   border-radius: 8px;
   background: var(--mm-surface);
 }
@@ -691,22 +644,25 @@ function formatStatus(status) {
 .file-check {
   display: grid;
   place-items: center;
-  gap: 4px;
-  min-width: 36px;
+  min-width: 30px;
   color: var(--mm-muted);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 650;
+  line-height: 1.05;
 }
 
 .file-check input {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+  margin: 0 0 2px;
 }
 
 .file-main {
   display: grid;
+  grid-template-columns: minmax(160px, .7fr) minmax(180px, 1fr);
+  align-items: center;
   min-width: 0;
-  gap: 4px;
+  gap: 12px;
 }
 
 .file-main strong,
@@ -732,17 +688,6 @@ function formatStatus(status) {
   font-size: 12px;
 }
 
-.file-meta span,
-.hit-badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 24px;
-  padding: 0 8px;
-  border: 1px solid var(--mm-border);
-  border-radius: 999px;
-  background: #fff;
-}
-
 .hit-badge {
   border-color: transparent;
   background: var(--mm-text);
@@ -750,12 +695,11 @@ function formatStatus(status) {
   font-size: 12px;
   font-style: normal;
   font-weight: 650;
-  white-space: nowrap;
 }
 
 .empty-state,
 .compact-empty {
-  padding: 28px;
+  padding: 24px;
   border: 1px dashed var(--mm-border);
   border-radius: 8px;
   color: var(--mm-muted);
@@ -763,7 +707,12 @@ function formatStatus(status) {
 }
 
 .compact-empty {
-  margin-top: 18px;
+  margin-top: 14px;
+}
+
+.groups-card > .empty-state {
+  align-self: start;
+  margin: 12px 20px 20px;
 }
 
 @media (max-width: 1180px) {
@@ -773,10 +722,10 @@ function formatStatus(status) {
 
   .workbench-grid {
     grid-template-columns: 1fr;
-    margin-inline: 0;
   }
 
-  .scan-card {
+  .scan-card,
+  .groups-card {
     min-height: auto;
   }
 
@@ -785,12 +734,21 @@ function formatStatus(status) {
     max-height: none;
   }
 
-  .right-stack {
-    grid-template-rows: auto;
+  .groups-toolbar {
+    display: grid;
+  }
+
+  .batch-actions {
+    justify-content: flex-start;
   }
 
   .file-row {
-    grid-template-columns: 36px 36px minmax(0, 1fr) auto;
+    grid-template-columns: 34px 34px minmax(0, 1fr) auto;
+  }
+
+  .file-main {
+    grid-template-columns: 1fr;
+    gap: 2px;
   }
 
   .file-meta {
@@ -800,27 +758,23 @@ function formatStatus(status) {
 }
 
 @media (max-width: 760px) {
-  .status-head,
+  .hero-card :deep(.mm-page-head),
   .status-metrics,
   .panel-head,
   .group-title,
-  .groups-head,
-  .head-tools,
-  .batch-actions,
-  .selection-summary {
+  .selection-summary,
+  .batch-actions {
     display: grid;
     grid-template-columns: 1fr;
     justify-content: stretch;
   }
 
-  .status-head .mm-pill,
-  .panel-head .mm-pill,
-  .head-tools .mm-pill {
-    justify-self: start;
+  .status-metrics {
+    grid-template-columns: 1fr;
   }
 
   .file-row {
-    grid-template-columns: 36px 36px minmax(0, 1fr);
+    grid-template-columns: 32px 32px minmax(0, 1fr);
   }
 
   .hit-badge {

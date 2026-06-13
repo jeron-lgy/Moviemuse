@@ -24,8 +24,8 @@
         <BaseButton type="button" @click="testIntegration('mteam')">测试连接</BaseButton>
       </div>
       <div class="form-grid">
-        <FormField label="启用" wide>
-          <input v-model="system.mteam.enabled" type="checkbox">
+        <FormField as="div" label="启用" wide>
+          <BaseSwitch v-model="system.mteam.enabled" aria-label="启用 MTeam" />
         </FormField>
         <FormField label="网址">
           <input v-model.trim="system.mteam.site_url" placeholder="https://zp.m-team.io/">
@@ -132,8 +132,8 @@
         <FormField label="媒体库名称">
           <input v-model.trim="system.jellyfin.library_name">
         </FormField>
-        <FormField label="启用查重">
-          <input v-model="system.jellyfin.dedupe_enabled" type="checkbox">
+        <FormField as="div" label="启用查重">
+          <BaseSwitch v-model="system.jellyfin.dedupe_enabled" aria-label="启用 Jellyfin 查重" />
         </FormField>
       </div>
       <div class="panel-footer">
@@ -152,26 +152,26 @@
         </div>
       </div>
       <div class="form-grid">
-        <FormField label="启用订阅轮询">
-          <input v-model="subscription.poll_enabled" type="checkbox">
+        <FormField as="div" label="启用订阅轮询">
+          <BaseSwitch v-model="subscription.poll_enabled" aria-label="启用订阅轮询" />
         </FormField>
         <FormField label="最大共演人数">
           <input v-model.number="subscription.max_coactors" type="number" min="1" max="2">
         </FormField>
-        <FormField label="启用 JavDB 实时抓取">
-          <input v-model="subscription.javdb_source_enabled" type="checkbox">
+        <FormField as="div" label="启用 JavDB 实时抓取">
+          <BaseSwitch v-model="subscription.javdb_source_enabled" aria-label="启用 JavDB 实时抓取" />
         </FormField>
-        <FormField label="洗版启用">
-          <input v-model="subscription.wash.enabled" type="checkbox">
+        <FormField as="div" label="洗版启用">
+          <BaseSwitch v-model="subscription.wash.enabled" aria-label="洗版启用" />
         </FormField>
         <FormField label="洗版过期天数">
           <input v-model.number="subscription.wash.expire_days" type="number" min="1">
         </FormField>
-        <FormField label="洗版检查中文">
-          <input v-model="subscription.wash.check_chinese" type="checkbox">
+        <FormField as="div" label="洗版检查中文">
+          <BaseSwitch v-model="subscription.wash.check_chinese" aria-label="洗版检查中文" />
         </FormField>
-        <FormField label="洗版检查 4K">
-          <input v-model="subscription.wash.check_4k" type="checkbox">
+        <FormField as="div" label="洗版检查 4K">
+          <BaseSwitch v-model="subscription.wash.check_4k" aria-label="洗版检查 4K" />
         </FormField>
       </div>
       <div class="panel-footer">
@@ -280,8 +280,8 @@
             <FormField label="JavLibrary Star ID">
               <input v-model.trim="identityForm.javlibrary_star_id" placeholder="例如 aeqfy">
             </FormField>
-            <FormField label="锁定人工锚点">
-              <input v-model="identityForm.locked" type="checkbox">
+            <FormField as="div" label="锁定人工锚点">
+              <BaseSwitch v-model="identityForm.locked" aria-label="锁定人工锚点" />
             </FormField>
             <FormField label="别名" wide>
               <textarea v-model="identityAliasText" placeholder="每行一个别名，或用逗号分隔"></textarea>
@@ -326,11 +326,11 @@
         <strong>{{ proxyStatus.flaresolverr_url || '未配置' }}</strong>
       </div>
       <div class="form-grid">
-        <FormField label="启用自定义代理">
-          <input v-model="system.network.proxy_enabled" type="checkbox">
+        <FormField as="div" label="启用自定义代理">
+          <BaseSwitch v-model="system.network.proxy_enabled" aria-label="启用自定义代理" />
         </FormField>
-        <FormField label="JavDB 使用代理">
-          <input v-model="system.network.apply_to_javdb" type="checkbox">
+        <FormField as="div" label="JavDB 使用代理">
+          <BaseSwitch v-model="system.network.apply_to_javdb" aria-label="JavDB 使用代理" />
         </FormField>
         <FormField label="HTTP 代理">
           <input v-model.trim="system.network.http_proxy" placeholder="http://host.docker.internal:7897">
@@ -420,7 +420,7 @@ import { reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, postJson } from '../lib/api'
 import NotificationsView from './NotificationsView.vue'
-import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
+import { BaseButton, BaseCard, BaseSwitch, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
 
 const tabs = [
   { key: 'mteam', label: 'MTeam' },

@@ -74,10 +74,7 @@
     </div>
 
     <TaskDialog v-if="editingChannel" :title="`配置 ${editingChannel.name}`" @close="editingChannel = null">
-      <label class="enable-row">
-        <input v-model="editingChannel.enabled" type="checkbox">
-        <span>启用</span>
-      </label>
+      <BaseSwitch v-model="editingChannel.enabled" label="启用" />
 
       <div class="form-grid">
         <FormField label="名称">
@@ -130,15 +127,20 @@
           <FormField label="Callback Path">
             <input v-model.trim="editingChannel.config.callback_path" placeholder="/api/v1/message">
           </FormField>
-          <label class="enable-row">
-            <input v-model="editingChannel.config.cover_enabled" type="checkbox">
-            <span>Cover push</span>
-          </label>
+          <BaseSwitch v-model="editingChannel.config.cover_enabled" label="发送封面图" />
         </template>
       </div>
 
       <template #actions>
         <BaseButton type="button" @click="testChannel(editingChannel)">测试</BaseButton>
+        <BaseButton
+          v-if="editingChannel.type === 'wechat_work'"
+          type="button"
+          :disabled="sendingWechatTest"
+          @click="testWechatSuite(editingChannel)"
+        >
+          {{ sendingWechatTest ? '发送中' : '发送全部微信测试' }}
+        </BaseButton>
         <BaseButton v-if="editingChannel.type === 'wechat_work'" type="button" @click="createWechatMenu(editingChannel)">Create menu</BaseButton>
         <BaseButton type="button" @click="editingChannel = null">取消</BaseButton>
         <BaseButton variant="primary" type="button" @click="commitChannel">确认</BaseButton>
@@ -172,7 +174,7 @@
 import { reactive, ref } from 'vue'
 import TaskDialog from '../components/TaskDialog.vue'
 import { api, postJson } from '../lib/api'
-import { BaseButton, BaseCard, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
+import { BaseButton, BaseCard, BaseSwitch, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
 
 defineProps({
   embedded: {
@@ -193,7 +195,7 @@ const channelTypes = {
       proxy: '',
       touser: '@all',
       default_image_url: '',
-      cover_enabled: true,
+      cover_enabled: false,
       token: '',
       aes_key: '',
       callback_path: '/api/v1/message'
@@ -205,6 +207,7 @@ const saving = ref(false)
 const message = ref('')
 const errorMessage = ref('')
 const showTypeMenu = ref(false)
+const sendingWechatTest = ref(false)
 const channels = ref([])
 const events = ref([])
 const eventStates = reactive({})
@@ -282,6 +285,22 @@ async function testChannel(channel) {
   }
 }
 
+async function testWechatSuite(channel) {
+  message.value = ''
+  errorMessage.value = ''
+  sendingWechatTest.value = true
+  try {
+    const result = await postJson('/api/notifications/wechat-work/test-suite', { channel: normalizeChannel(channel) })
+    const sent = result.sent ?? 0
+    const total = result.total ?? 0
+    message.value = `企业微信全部测试已发送：${sent}/${total}`
+  } catch (error) {
+    errorMessage.value = error.message || '发送企业微信测试失败'
+  } finally {
+    sendingWechatTest.value = false
+  }
+}
+
 async function createWechatMenu(channel) {
   message.value = ''
   errorMessage.value = ''
@@ -334,7 +353,17 @@ function normalizeChannel(channel) {
 }
 
 function defaultEventEnabled(key) {
-  return ['actress_new_av', 'av_subscribed', 'mteam_found', 'torrent_sent', 'jellyfin_in_library', 'task_failed'].includes(key)
+  return [
+    'actress_new_av',
+    'av_subscribed',
+    'mteam_found',
+    'torrent_sent',
+    'jellyfin_in_library',
+    'task_failed',
+    'automation_actress_poll',
+    'automation_av_download',
+    'automation_wash_download'
+  ].includes(key)
 }
 
 function defaultTemplate(event) {

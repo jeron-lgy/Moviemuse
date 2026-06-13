@@ -443,6 +443,18 @@ def remote_post_json(path: str, payload: dict[str, Any], timeout: float = 30) ->
         raise HTTPException(status_code=502, detail=f"无法连接字幕后端: {exc}") from exc
 
 
+def remote_delete(path: str, timeout: float = 30) -> dict[str, Any]:
+    try:
+        with remote_http_client(timeout=timeout) as client:
+            response = client.delete(f"{backend_url()}{path}", headers=backend_headers())
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise_remote_error(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"无法连接字幕后端: {exc}") from exc
+
+
 def compute_settings_payload(settings_obj: Any, config: dict[str, Any] | None = None) -> dict[str, object]:
     config = config or {}
     def value(key: str, attr: str, default: object) -> object:
@@ -1715,6 +1727,8 @@ def task_label(task_id: str) -> str:
         "wash_download": "洗版轮询",
         "postprocess_qb": "后处理下载检查",
         "maker_refresh": "厂牌发售更新",
+        "ranking_refresh": "DMM/FANZA 榜单更新",
+        "asset_maintenance": "资产缓存维护",
     }
     return labels.get(task_id, task_id or "自动任务")
 
@@ -1754,6 +1768,7 @@ def dashboard_payload() -> dict[str, Any]:
     system_data = get_system_settings_service().get()
     post = get_postprocess_service()
     post_settings = post.get_settings()
+    post_tasks = post.list_tasks(limit=200)
     logs = get_app_log_service().recent(120)
 
     now = time.time()
@@ -1801,8 +1816,28 @@ def dashboard_payload() -> dict[str, Any]:
         },
     ]
 
+    queue_running_statuses = {
+        "downloading",
+        "sent_to_worker",
+        "transcoding",
+        "worker_done",
+        "transcode_validating",
+        "subtitle_processing",
+        "subtitle_validating",
+        "transcode_done",
+    }
+    queue_waiting_statuses = {"created", "torrent_pushed", "waiting_worker", "ready_to_run"}
+    queue_failed_statuses = {"failed", "ignored", "conflict", "expired"}
+    queue = {
+        "running": sum(1 for task in post_tasks if str(task.get("status") or "") in queue_running_statuses),
+        "waiting": sum(1 for task in post_tasks if str(task.get("status") or "") in queue_waiting_statuses),
+        "completed": sum(1 for task in post_tasks if str(task.get("status") or "") == "completed"),
+        "failed": sum(1 for task in post_tasks if str(task.get("status") or "") in queue_failed_statuses),
+        "total": len(post_tasks),
+    }
+
     recent_tasks: list[dict[str, Any]] = []
-    for task in post.list_tasks(limit=10):
+    for task in post_tasks[:10]:
         status = str(task.get("status") or "")
         stage = "生成字幕" if status in {"subtitle_processing", "subtitle_validating", "transcode_done"} else "转码" if status in {"sent_to_worker", "transcoding", "worker_done", "transcode_validating"} else "后处理"
         recent_tasks.append(
@@ -1870,7 +1905,9 @@ def dashboard_payload() -> dict[str, Any]:
             {"name": "女优订阅轮询", "cron": settings_data.get("actress_cron", ""), "last": dashboard_time(settings_data.get("last_poll_at"))},
             {"name": "番号下载检查", "cron": settings_data.get("av_cron", ""), "last": dashboard_time(settings_data.get("last_av_poll_at"))},
             {"name": "厂牌更新", "cron": settings_data.get("maker_cron", ""), "last": dashboard_time(settings_data.get("last_maker_poll_at"))},
+            {"name": "榜单更新", "cron": settings_data.get("ranking_cron", ""), "last": dashboard_time(settings_data.get("last_ranking_poll_at"))},
         ],
+        "queue": queue,
         "integrations": integrations,
         "automation": {
             "auto_transcode_enabled": bool(post_settings.get("auto_transcode_enabled")),
@@ -2736,6 +2773,19 @@ async def api_retry_subtitle_job(job_id: str, request: Request) -> dict[str, obj
     return {"status": "ok", "job": job_payload(job)}
 
 
+@app.delete("/api/subtitle/jobs/{job_id}", dependencies=[Depends(require_subtitle_token)])
+def api_delete_subtitle_job(job_id: str) -> dict[str, object]:
+    if backend_url():
+        return remote_delete(f"/api/subtitle/jobs/{job_id}")
+    try:
+        job = get_subtitle_service().delete_job(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", "deleted": job_payload(job)}
+
+
 @app.post("/api/subtitle/upload", dependencies=[Depends(require_subtitle_token)])
 async def api_upload_subtitle_job(
     file: UploadFile = File(...),
@@ -2973,6 +3023,7 @@ METADATA_DETAIL_TTL = int(os.getenv("SUBSCRIPTION_METADATA_DETAIL_TTL_SECONDS", 
 METADATA_PROFILE_TTL = int(os.getenv("SUBSCRIPTION_METADATA_PROFILE_TTL_SECONDS", "604800"))
 METADATA_LISTING_TTL = int(os.getenv("SUBSCRIPTION_METADATA_LISTING_TTL_SECONDS", "43200"))
 METADATA_MAKER_LISTING_TTL = int(os.getenv("SUBSCRIPTION_MAKER_LISTING_TTL_SECONDS", "21600"))
+METADATA_DMM_RANKING_TTL = int(os.getenv("SUBSCRIPTION_DMM_RANKING_TTL_SECONDS", "172800"))
 MAKER_REFRESH_PREWARM_LIMIT = int(os.getenv("SUBSCRIPTION_MAKER_REFRESH_PREWARM_LIMIT", "60"))
 MAKER_REFRESH_COVER_PREWARM_LIMIT = int(os.getenv("SUBSCRIPTION_MAKER_REFRESH_COVER_PREWARM_LIMIT", "28"))
 ASSET_IMAGE_MAX_BYTES = int(os.getenv("SUBSCRIPTION_ASSET_IMAGE_MAX_BYTES", str(12 * 1024 * 1024)))
@@ -3161,6 +3212,8 @@ def notify_from_app_log(level: str, source: str, message: str, data: dict[str, A
     stage = str(data.get("stage") or "")
     av_id = str(data.get("av_id") or "")
     title = str(data.get("title") or data.get("mteam_torrent_title") or av_id or message)
+    if stage == "mteam_search_empty":
+        return
     if message in {"自动订阅新增番号", "女优一键订阅新增番号"} or stage == "actress_subscribe_latest_added":
         sender("av_subscribed", {
             "status": data.get("status") or "subscribed",
@@ -3168,6 +3221,8 @@ def notify_from_app_log(level: str, source: str, message: str, data: dict[str, A
             "detail": f"已订阅 {av_id}：{title}".strip(),
             "av_id": av_id,
             "actress": data.get("actress") or data.get("name") or "",
+            "cover": data.get("cover") or data.get("cover_url") or "",
+            "release_date": data.get("release_date") or "",
         })
     elif stage == "download_done":
         status = str(data.get("status") or "")
@@ -3178,8 +3233,14 @@ def notify_from_app_log(level: str, source: str, message: str, data: dict[str, A
             "detail": str(data.get("message") or message),
             "av_id": av_id,
             "torrent_id": data.get("torrent_id", ""),
+            "torrent_title": data.get("torrent_title", ""),
+            "site": data.get("site", ""),
+            "size": data.get("size", ""),
+            "seeders": data.get("seeders", ""),
+            "downloader": data.get("downloader", ""),
+            "cover": data.get("cover") or data.get("cover_url") or "",
         })
-    elif stage in {"mteam_search_empty", "download_error", "download_qb_hash_conflict", "mteam_missing_id"}:
+    elif stage in {"download_error", "download_qb_hash_conflict", "mteam_missing_id"}:
         sender("task_failed", {
             "status": str(data.get("status") or "failed"),
             "title": f"{message}：{av_id}" if av_id else message,
@@ -3200,6 +3261,9 @@ def notify_from_app_log(level: str, source: str, message: str, data: dict[str, A
             "detail": f"{av_id} 已在 Jellyfin 媒体库中",
             "av_id": av_id,
             "path": data.get("path", ""),
+            "file_name": notification_filename(data.get("path"), av_id),
+            "save_path": notification_parent_path(data.get("path"), ""),
+            "cover": data.get("cover") or data.get("cover_url") or "",
         })
     elif level == "error" and source in {"subscription", "download", "mteam", "qbittorrent", "task", "wash", "postprocess"}:
         sender("task_failed", {
@@ -4953,6 +5017,90 @@ def cached_listing(page_url: str, limit: int = 60, *, force_refresh: bool = Fals
     return items[:safe_limit]
 
 
+def normalize_dmm_ranking_kind(value: object) -> str:
+    return "actress" if str(value or "").strip().lower() == "actress" else "movie"
+
+
+def normalize_dmm_ranking_term(kind: str, value: object) -> str:
+    if kind == "actress":
+        return "monthly"
+    term = str(value or "").strip().lower()
+    aliases = {
+        "day": "daily",
+        "daily": "daily",
+        "week": "week",
+        "weekly": "week",
+        "month": "monthly",
+        "monthly": "monthly",
+    }
+    return aliases.get(term, "daily")
+
+
+def public_dmm_ranking(payload: dict[str, Any], *, cached: bool = False) -> dict[str, Any]:
+    kind = normalize_dmm_ranking_kind(payload.get("kind"))
+    term = normalize_dmm_ranking_term(kind, payload.get("term"))
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items: list[dict[str, Any]] = []
+    if kind == "actress":
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            row = normalize_image_fields({key: value for key, value in item.items() if not str(key).startswith("_")})
+            row["source"] = str(row.get("source") or "dmm")
+            row["source_scope"] = str(row.get("source_scope") or "ranking")
+            row = explain_match(row, default_reason="dmm_actress_ranking", default_confidence="medium")
+            items.append(row)
+    else:
+        rows = [
+            public_metadata_item(explain_match(append_source_chain(item, "dmm"), default_reason="dmm_ranking", default_confidence="medium"))
+            for item in raw_items
+            if isinstance(item, dict) and canonical_av_id(item.get("id")) and re.fullmatch(r"[A-Z]{2,10}-\d{2,5}", canonical_av_id(item.get("id")))
+        ]
+        items = filter_avs_by_actor_limit(rows, context="dmm_ranking")
+    return {
+        "kind": kind,
+        "term": term,
+        "source": "dmm",
+        "cached": cached,
+        "fetched_at": payload.get("fetched_at", 0),
+        "items": items,
+    }
+
+
+def cached_dmm_ranking(kind: str = "movie", term: str = "daily", limit: int = 100, *, force_refresh: bool = False) -> dict[str, Any]:
+    safe_kind = normalize_dmm_ranking_kind(kind)
+    safe_term = normalize_dmm_ranking_term(safe_kind, term)
+    safe_limit = max(1, min(100, int(limit or 100)))
+    key = metadata_cache_key("v2", safe_kind, safe_term, safe_limit)
+    if force_refresh:
+        payload = dmm.get_ranking(safe_kind, safe_term, safe_limit, force_refresh=True)
+        if payload.get("items"):
+            cache_set("dmm_ranking", key, payload, METADATA_DMM_RANKING_TTL)
+            if safe_kind == "movie":
+                remember_av_summaries([item for item in payload.get("items", []) if isinstance(item, dict)])
+        return public_dmm_ranking(payload, cached=False)
+    cached = cache_get("dmm_ranking", key)
+    if isinstance(cached, dict) and cached.get("items"):
+        app_log("info", "metadata-cache", "DMM 榜单命中 SQLite 缓存", {
+            "stage": "dmm_ranking_cache_hit",
+            "kind": safe_kind,
+            "term": safe_term,
+            "limit": safe_limit,
+        })
+        return public_dmm_ranking(cached, cached=True)
+    payload = cached_metadata(
+        "dmm_ranking",
+        key,
+        METADATA_DMM_RANKING_TTL,
+        lambda: dmm.get_ranking(safe_kind, safe_term, safe_limit, force_refresh=False),
+    )
+    if isinstance(payload, dict):
+        if safe_kind == "movie":
+            remember_av_summaries([item for item in payload.get("items", []) if isinstance(item, dict)])
+        return public_dmm_ranking(payload, cached=False)
+    return {"kind": safe_kind, "term": safe_term, "source": "dmm", "cached": False, "fetched_at": 0, "items": []}
+
+
 def cached_detail_for_url(url: str) -> dict[str, Any]:
     target_url = str(url or "").strip()
     if not target_url:
@@ -5182,7 +5330,14 @@ def poll_subscriptions_once() -> dict[str, Any]:
                 apply_jellyfin_status(payload)
                 saved = service.subscribe_av(payload)
                 added.append(saved)
-                app_log("info", "subscription", "自动订阅新增番号", {"av_id": av_id, "status": saved.get("status"), "actress": actress.get("name", "")})
+                app_log("info", "subscription", "自动订阅新增番号", {
+                    "av_id": av_id,
+                    "title": saved.get("title", ""),
+                    "status": saved.get("status"),
+                    "actress": actress.get("name", ""),
+                    "cover": saved.get("cover") or saved.get("cover_url") or "",
+                    "release_date": av.get("date", ""),
+                })
                 send_notification_event("actress_new_av", {
                     "status": saved.get("status") or "subscribed",
                     "title": str(saved.get("title") or av_id),
@@ -5190,6 +5345,7 @@ def poll_subscriptions_once() -> dict[str, Any]:
                     "av_id": av_id,
                     "actress": actress.get("name", ""),
                     "release_date": av.get("date", ""),
+                    "cover": saved.get("cover") or saved.get("cover_url") or "",
                 })
                 new_count += 1
             service.mark_actress_polled(actress_id, new_count)
@@ -5280,6 +5436,8 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                 "actress_id": actress_id,
                 "actress": actress.get("name", ""),
                 "av_id": av_id,
+                "title": saved.get("title", ""),
+                "cover": saved.get("cover") or saved.get("cover_url") or "",
                 "release_date": release_date,
                 "status": saved.get("status"),
             })
@@ -5291,6 +5449,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                     "av_id": av_id,
                     "actress": actress.get("name", ""),
                     "release_date": release_date,
+                    "cover": saved.get("cover") or saved.get("cover_url") or "",
                 })
             if download and saved.get("status") != "in_library":
                 download_av_from_mteam(saved)
@@ -5588,6 +5747,61 @@ def maintain_asset_cache(max_bytes: int | None = None) -> dict[str, Any]:
     return result
 
 
+def refresh_dmm_rankings() -> dict[str, Any]:
+    targets = (
+        ("movie", "week", "作品周榜"),
+        ("movie", "monthly", "作品月榜"),
+        ("actress", "monthly", "女优榜"),
+    )
+    refreshed: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    app_log("info", "ranking", "开始刷新 DMM/FANZA 榜单", {
+        "stage": "ranking_refresh_start",
+        "count": len(targets),
+        "limit": 100,
+    })
+    for kind, term, label in targets:
+        started_at = time.time()
+        try:
+            ranking = cached_dmm_ranking(kind, term, 100, force_refresh=True)
+            items = ranking.get("items") if isinstance(ranking.get("items"), list) else []
+            missing_covers = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                cover_url = str(item.get("cover") or item.get("image") or item.get("latest_cover") or "").strip()
+                if not cover_url or dmm_cover_url_is_placeholder(cover_url):
+                    missing_covers += 1
+            item_result = {
+                "label": label,
+                "kind": kind,
+                "term": term,
+                "count": len(items),
+                "missing_covers": missing_covers,
+                "elapsed": round(time.time() - started_at, 2),
+            }
+            refreshed.append(item_result)
+            app_log("info", "ranking", "DMM/FANZA 榜单刷新完成", {"stage": "ranking_refresh_item_done", **item_result})
+        except Exception as exc:
+            errors.append({"label": label, "kind": kind, "term": term, "error": str(exc)})
+            app_log("error", "ranking", "DMM/FANZA 榜单刷新失败", {
+                "stage": "ranking_refresh_item_error",
+                "label": label,
+                "kind": kind,
+                "term": term,
+                "error": str(exc),
+            })
+    result = {
+        "refreshed": refreshed,
+        "errors": errors,
+        "refreshed_count": len(refreshed),
+        "error_count": len(errors),
+        "metadata_cache": get_subscription_service().metadata_cache_stats(),
+    }
+    app_log("info", "ranking", "DMM/FANZA 榜单刷新结束", {"stage": "ranking_refresh_done", **result})
+    return result
+
+
 def subscription_tasks_payload() -> list[dict[str, Any]]:
     sub_settings = get_subscription_service().get_settings()
     last_results = sub_settings.get("last_task_results") if isinstance(sub_settings.get("last_task_results"), dict) else {}
@@ -5633,6 +5847,14 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
             "description": "刷新订阅设置中常驻厂牌的最近发售缓存。",
         },
         {
+            "id": "ranking_refresh",
+            "name": "DMM/FANZA 榜单更新",
+            "cron": sub_settings.get("ranking_cron") or "30 4 */2 * *",
+            "last_run_at": sub_settings.get("last_ranking_poll_at") or 0,
+            "last_result": last_results.get("ranking_refresh") or {},
+            "description": "每 2 天低频刷新作品周榜、作品月榜和女优榜，只缓存榜单信息和封面 URL。",
+        },
+        {
             "id": "asset_maintenance",
             "name": "资产缓存维护",
             "cron": sub_settings.get("asset_cron") or "15 3 * * *",
@@ -5641,6 +5863,68 @@ def subscription_tasks_payload() -> list[dict[str, Any]]:
             "description": "冻结已发售番号封面，清理缺失记录，并按容量回收非冻结资产。",
         },
     ]
+
+
+AUTOMATION_NOTIFICATION_EVENTS: dict[str, str] = {
+    "actress_poll": "automation_actress_poll",
+    "av_download": "automation_av_download",
+    "wash_download": "automation_wash_download",
+}
+
+
+def automation_result_status(result: dict[str, Any]) -> str:
+    errors = result.get("errors")
+    if isinstance(errors, list) and errors:
+        return "completed_with_errors"
+    try:
+        if int(errors or 0) > 0:
+            return "completed_with_errors"
+    except (TypeError, ValueError):
+        pass
+    return "completed"
+
+
+def automation_task_notification_detail(task_id: str, result: dict[str, Any]) -> str:
+    checked = int(result.get("checked") or 0)
+    run_time = datetime.now().strftime("%H:%M:%S")
+    if task_id == "actress_poll":
+        added = len(result.get("added") or [])
+        errors = result.get("errors") or []
+        error_count = len(errors) if isinstance(errors, list) else int(errors or 0)
+        return f"检查女优：{checked} 个\n新增番号：{added} 个\n错误：{error_count} 个\n执行时间：{run_time}"
+    if task_id == "av_download":
+        results = result.get("results") if isinstance(result.get("results"), list) else []
+        not_found = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "not_found")
+        errors = sum(1 for item in results if isinstance(item, dict) and item.get("status") in {"error", "failed", "conflict"})
+        return f"检查订阅番号：{checked} 个\n推送下载：{int(result.get('sent') or 0)} 个\n未找到资源：{not_found} 个\n错误：{errors} 个\n执行时间：{run_time}"
+    if task_id == "wash_download":
+        return (
+            f"检查洗版番号：{checked} 个\n"
+            f"推送下载：{int(result.get('sent') or 0)} 个\n"
+            f"未匹配：{int(result.get('not_found') or 0)} 个\n"
+            f"过期：{int(result.get('expired') or 0)} 个\n"
+            f"错误：{int(result.get('errors') or 0)} 个\n"
+            f"执行时间：{run_time}"
+        )
+    return f"任务已完成\n执行时间：{run_time}"
+
+
+def notify_automation_task_completed(task_id: str, result: dict[str, Any]) -> None:
+    event_key = AUTOMATION_NOTIFICATION_EVENTS.get(task_id)
+    if not event_key:
+        return
+    label = task_label(task_id)
+    send_notification_event(event_key, {
+        "status": automation_result_status(result),
+        "title": f"{label}完成",
+        "detail": automation_task_notification_detail(task_id, result),
+        "task": task_id,
+        "task_name": label,
+        "checked": result.get("checked", 0),
+        "sent": result.get("sent", 0),
+        "added": len(result.get("added") or []),
+        "errors": len(result.get("errors") or []) if isinstance(result.get("errors"), list) else int(result.get("errors") or 0),
+    })
 
 
 def run_subscription_task(task_id: str, *, minute_key: str | None = None) -> dict[str, Any]:
@@ -5657,6 +5941,8 @@ def run_subscription_task(task_id: str, *, minute_key: str | None = None) -> dic
             result = poll_postprocess_once()
         elif task_id == "maker_refresh":
             result = refresh_pinned_makers()
+        elif task_id == "ranking_refresh":
+            result = refresh_dmm_rankings()
         elif task_id == "asset_maintenance":
             result = maintain_asset_cache()
         else:
@@ -5677,6 +5963,7 @@ def run_subscription_task(task_id: str, *, minute_key: str | None = None) -> dic
         })
         raise
     service.mark_task_poll(task_id, minute_key, result)
+    notify_automation_task_completed(task_id, result)
     app_log("info", "task", "定时任务执行完成", {"stage": "task_done", "task_id": task_id})
     return result
 
@@ -5695,6 +5982,7 @@ def subscription_poll_loop() -> None:
                     ("wash_download", "wash_cron", "last_wash_poll_minute"),
                     ("postprocess_qb", "postprocess_cron", "last_postprocess_poll_minute"),
                     ("maker_refresh", "maker_cron", "last_maker_poll_minute"),
+                    ("ranking_refresh", "ranking_cron", "last_ranking_poll_minute"),
                     ("asset_maintenance", "asset_cron", "last_asset_poll_minute"),
                 )
                 for task_id, cron_key, last_minute_key in schedules:
@@ -5776,6 +6064,9 @@ def refresh_subscription_library_status(av: dict[str, Any]) -> dict[str, Any]:
                 "detail": f"{probe.get('id', '')} 已在 Jellyfin 媒体库中",
                 "av_id": probe.get("id", ""),
                 "path": probe.get("jellyfin_path", ""),
+                "file_name": notification_filename(probe.get("jellyfin_path"), str(probe.get("id") or "")),
+                "save_path": notification_parent_path(probe.get("jellyfin_path"), ""),
+                "cover": probe.get("cover") or probe.get("cover_url") or "",
             })
         return saved or probe
     return av
@@ -5984,12 +6275,6 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         app_log("error", "mteam", "MTeam 未找到资源", {"stage": "mteam_search_empty", "av_id": av_id, "message": message, "raw_count": len(torrents_all)})
         if save_to_subscription:
             service.update_av_download(av_id, {"download_status": "not_found", "download_message": message})
-        send_notification_event("task_failed", {
-            "status": "not_found",
-            "title": f"MTeam 未找到资源：{av_id}",
-            "detail": message,
-            "av_id": av_id,
-        })
         return {"av_id": av_id, "status": "not_found", "message": message}
 
     torrent = choose_mteam_torrent(av_id, torrents)
@@ -6096,7 +6381,20 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         }
         if save_to_subscription:
             service.update_av_download(av_id, payload)
-        app_log("info", "download", "下载链路完成", {"stage": "download_done", "av_id": av_id, "torrent_id": torrent_id, "status": qb_status, "message": payload["download_message"]})
+        app_log("info", "download", "下载链路完成", {
+            "stage": "download_done",
+            "av_id": av_id,
+            "title": str(av.get("title") or av_id),
+            "torrent_id": torrent_id,
+            "torrent_title": torrent_title,
+            "status": qb_status,
+            "message": payload["download_message"],
+            "site": "馒头",
+            "size": format_wechat_mteam_size(torrent.get("size")),
+            "seeders": torrent.get("seeders", ""),
+            "downloader": "qbittorrent",
+            "cover": av.get("cover") or av.get("cover_url") or "",
+        })
         if qb_accepted:
             send_notification_event("torrent_sent", {
                 "status": qb_status,
@@ -6105,7 +6403,12 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
                 "av_id": av_id,
                 "torrent_id": torrent_id,
                 "torrent_title": torrent_title,
+                "site": "馒头",
+                "size": format_wechat_mteam_size(torrent.get("size")),
+                "seeders": torrent.get("seeders", ""),
+                "downloader": "qbittorrent",
                 "qb_hash": qb_result.get("hash", ""),
+                "cover": av.get("cover") or av.get("cover_url") or "",
             })
         else:
             send_notification_event("task_failed", {
@@ -6373,6 +6676,7 @@ def summarize_mteam_candidates(torrents: list[dict[str, Any]], limit: int = 6) -
             "labels": item.get("labels", []),
             "smallDescr": item.get("smallDescr", ""),
             "size": item.get("size", ""),
+            "seeders": item.get("seeders", ""),
             "standard": item.get("standard", ""),
             "videoCodec": item.get("videoCodec", ""),
         })
@@ -6918,7 +7222,6 @@ def worker_is_offline() -> bool:
 def build_postprocess_output_path(task: dict[str, Any], settings_payload: dict[str, Any]) -> str:
     input_path = Path(str(task.get("input_path") or ""))
     av_id = str(task.get("av_id") or input_path.stem or "unknown").upper()
-    codec = str(task.get("target_codec") or settings_payload.get("target_codec") or "av1").lower()
     suffix = input_path.suffix if input_path.suffix.lower() in VIDEO_EXTENSIONS else ".mkv"
     task_type = str(task.get("task_type") or "")
     variant = ""
@@ -6927,7 +7230,7 @@ def build_postprocess_output_path(task: dict[str, Any], settings_payload: dict[s
     elif task_type == "wash_4k":
         variant = ".4k"
     output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
-    return str(output_dir / f"{av_id}{variant}.{codec}{suffix}")
+    return str(output_dir / f"{av_id}{variant}{suffix}")
 
 
 def build_postprocess_original_output_path(task: dict[str, Any], settings_payload: dict[str, Any], source_path: str) -> str:
@@ -7016,6 +7319,90 @@ def ensure_managed_subtitle_product(subtitle_path: str, product_path: str) -> st
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(subtitle, target)
     return str(target)
+
+
+POSTPROCESS_METADATA_IMAGE_SUFFIXES = ("fanart", "poster", "thumb")
+POSTPROCESS_METADATA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def copy_postprocess_metadata_sidecars(task: dict[str, Any], product_path: str) -> dict[str, Any]:
+    source = Path(str(task.get("input_path") or ""))
+    product = Path(product_path)
+    payload: dict[str, Any] = {
+        "source": str(source),
+        "target_dir": str(product.parent),
+        "copied": [],
+        "skipped": [],
+        "missing": [],
+    }
+    if not source.parent.exists() or not product.parent.exists():
+        payload["status"] = "skipped"
+        payload["reason"] = "source_or_target_dir_missing"
+        return payload
+
+    av_id = str(task.get("av_id") or source.stem or product.stem or "").upper()
+    prefixes: list[str] = []
+    for prefix in (source.stem, av_id):
+        prefix = str(prefix or "").strip()
+        if prefix and prefix not in prefixes:
+            prefixes.append(prefix)
+
+    wanted: list[tuple[str, str, tuple[str, ...]]] = [("nfo", "", (".nfo",))]
+    wanted.extend((kind, f"-{kind}", POSTPROCESS_METADATA_IMAGE_EXTENSIONS) for kind in POSTPROCESS_METADATA_IMAGE_SUFFIXES)
+
+    for kind, name_suffix, extensions in wanted:
+        found: Path | None = None
+        for prefix in prefixes:
+            for extension in extensions:
+                candidate = source.parent / f"{prefix}{name_suffix}{extension}"
+                if candidate.exists() and candidate.is_file():
+                    found = candidate
+                    break
+            if found:
+                break
+        if not found:
+            payload["missing"].append(kind)
+            continue
+
+        target = product.parent / f"{product.stem}{name_suffix}{found.suffix}"
+        try:
+            if found.resolve() == target.resolve():
+                payload["skipped"].append({"kind": kind, "path": str(found), "reason": "already_in_place"})
+                continue
+        except OSError:
+            pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(found, target)
+        payload["copied"].append({"kind": kind, "source": str(found), "target": str(target)})
+
+    payload["status"] = "ok" if payload["copied"] or payload["skipped"] else "missing"
+    return payload
+
+
+def record_postprocess_metadata_sidecars(task_id: str, task: dict[str, Any], product_path: str) -> dict[str, Any]:
+    post = get_postprocess_service()
+    try:
+        payload = copy_postprocess_metadata_sidecars(task, product_path)
+        post.update_task(task_id, data={"metadata_sidecars": payload})
+        post.add_event(
+            task_id,
+            "info",
+            "metadata_sidecars_copied",
+            "刮削元数据已同步到转码目录",
+            payload,
+        )
+        return payload
+    except Exception as exc:
+        payload = {"status": "failed", "error": str(exc), "output_path": product_path}
+        post.update_task(task_id, data={"metadata_sidecars": payload})
+        post.add_event(
+            task_id,
+            "error",
+            "metadata_sidecars_failed",
+            "刮削元数据同步失败，视频成品继续进入后处理链路",
+            payload,
+        )
+        return payload
 
 
 def subtitle_job_from_worker_result(worker_result: dict[str, Any] | None) -> dict[str, Any]:
@@ -7422,6 +7809,17 @@ def postprocess_unraid_relative(root: Path, kind: str) -> Path:
     configured = str(os.getenv(env_key, "") or "").strip().strip("/\\")
     if configured:
         return Path(configured)
+    root_text = str(root).replace("\\", "/").rstrip("/")
+    media_dirs, _, _ = settings()
+    for media_dir in media_dirs or [Path("/media")]:
+        media_text = str(media_dir).replace("\\", "/").rstrip("/")
+        if not media_text:
+            continue
+        if root_text == media_text:
+            return Path(media_dir.name)
+        if root_text.startswith(media_text + "/"):
+            suffix = root_text[len(media_text) :].strip("/")
+            return Path(media_dir.name, *suffix.split("/")) if suffix else Path(media_dir.name)
     if kind == "output" and root.name == "压制":
         return Path("media") / root.name
     return Path(root.name)
@@ -7578,6 +7976,8 @@ def validate_and_activate_postprocess_task(
     subtitle_failure = dict(subtitle_error or {})
     if subtitle_failure:
         post.add_event(task_id, "error", "subtitle_failed", "字幕阶段失败，继续保留并激活视频成品", subtitle_failure)
+    task_data = task.get("data") if isinstance(task.get("data"), dict) else {}
+    metadata_sidecars = task_data.get("metadata_sidecars") if isinstance(task_data.get("metadata_sidecars"), dict) else {}
     if bool(settings_payload.get("auto_transcode_enabled")):
         post.update_task(task_id, status="transcode_validating", output_path=chosen_output)
         validation = validate_video_output(
@@ -7590,8 +7990,10 @@ def validate_and_activate_postprocess_task(
             post.update_task(task_id, status="failed", error_code="transcode_validation_failed", error_message=str(validation.get("reason") or "转码校验失败"))
             return {"status": "failed", "validation": validation}
         product_path = str(validation.get("path") or chosen_output)
+        if not subtitle_path:
+            metadata_sidecars = record_postprocess_metadata_sidecars(task_id, task, product_path)
         if bool(settings_payload.get("auto_subtitle_enabled")) and bool(task.get("needs_subtitle")) and not subtitle_path and not subtitle_failure:
-            post.update_task(task_id, status="transcode_done", output_path=product_path, data={"transcode_validation": validation})
+            post.update_task(task_id, status="transcode_done", output_path=product_path, data={"transcode_validation": validation, "metadata_sidecars": metadata_sidecars})
             post.add_event(task_id, "info", "transcode_done", "转码校验通过，继续派发字幕任务", {"output_path": product_path})
             return submit_postprocess_subtitle_task({**task, "output_path": product_path}, product_path)
         has_chinese_subtitle = False
@@ -7673,6 +8075,7 @@ def validate_and_activate_postprocess_task(
             "validation": validation,
             "subtitle_validation": subtitle_validation or {},
             "subtitle_failure": subtitle_failure,
+            "metadata_sidecars": metadata_sidecars,
         },
     )
     trash_payload: dict[str, Any] | None = None
@@ -7787,6 +8190,7 @@ def validate_and_activate_postprocess_task(
             "subtitle_failure": subtitle_failure,
             "old_version_trash_failure": old_version_trash_failure,
             "source_trash_failure": source_trash_failure,
+            "metadata_sidecars": metadata_sidecars,
         },
     )
     post.add_event(task_id, "info", "completed", completion_message, {
@@ -7798,6 +8202,7 @@ def validate_and_activate_postprocess_task(
         "subtitle_failure": subtitle_failure,
         "old_version_trash_failure": old_version_trash_failure,
         "source_trash_failure": source_trash_failure,
+        "metadata_sidecars": metadata_sidecars,
     })
     if subtitle_failure and source_trash_failure:
         user_message = "后处理完成，字幕失败，源文件清理失败"
@@ -7826,6 +8231,22 @@ def validate_and_activate_postprocess_task(
             "download_message": user_message,
             "downloaded_at": time.time(),
         })
+    av_id_for_notice = str(task.get("av_id") or "")
+    subscription_for_notice = next(
+        (item for item in get_subscription_service().get_subscribed_av() if str(item.get("id") or "") == av_id_for_notice),
+        {},
+    )
+    send_notification_event("jellyfin_in_library", {
+        "status": "completed",
+        "title": str(subscription_for_notice.get("title") or av_id_for_notice or task_id),
+        "detail": f"{av_id_for_notice or task_id} 已完成后处理并刷新 Jellyfin",
+        "av_id": av_id_for_notice,
+        "task_id": task_id,
+        "path": product_path,
+        "file_name": notification_filename(product_path, av_id_for_notice or task_id),
+        "save_path": notification_parent_path(product_path, ""),
+        "cover": subscription_for_notice.get("cover") or subscription_for_notice.get("cover_url") or "",
+    })
     if bool(task.get("needs_subtitle")):
         if subtitle_failure:
             send_notification_event("subtitle_failed", {
@@ -8212,6 +8633,13 @@ def makers_page(request: Request, legacy: int = 0) -> Response:
     return frontend_app_response()
 
 
+@app.get("/rankings", response_class=HTMLResponse)
+def rankings_page(request: Request, legacy: int = 0) -> Response:
+    if compute_node_only():
+        return Response("MovieMuse compute node is running.", media_type="text/plain")
+    return frontend_app_response()
+
+
 @app.get("/subscription-tasks", response_class=HTMLResponse)
 def subscription_tasks_page(request: Request, legacy: int = 0) -> Response:
     if compute_node_only():
@@ -8367,6 +8795,18 @@ def api_cancel_postprocess_task(task_id: str) -> dict[str, object]:
     sync_wash_status_for_postprocess_task(task, "cancelled", "用户手动取消后处理任务")
     post.add_event(task_id, "info", "task_cancelled", "用户手动取消后处理任务", {"previous_status": task.get("status", "")})
     return {"status": "ignored", "task": updated}
+
+
+@app.delete("/api/postprocess/tasks/{task_id}")
+def api_delete_postprocess_task(task_id: str) -> dict[str, object]:
+    post = get_postprocess_service()
+    task = post.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="后处理任务不存在")
+    if not postprocess_task_is_terminal(task):
+        raise HTTPException(status_code=400, detail="运行中或排队中的后处理任务不能删除，请先取消或等待结束")
+    deleted = post.delete_task(task_id)
+    return {"status": "ok", "deleted": deleted}
 
 
 @app.post("/api/postprocess/tasks/{task_id}/worker-done", dependencies=[Depends(require_subtitle_token)])
@@ -8865,6 +9305,9 @@ NOTIFICATION_EVENTS: tuple[dict[str, str], ...] = (
     {"key": "scan_completed", "name": "重复视频扫描完成", "description": "重复视频扫描结束后发送摘要。"},
     {"key": "subtitle_completed", "name": "字幕任务完成", "description": "字幕生成或翻译完成后发送。"},
     {"key": "subtitle_failed", "name": "字幕任务失败", "description": "字幕生成、翻译失败后发送。"},
+    {"key": "automation_actress_poll", "name": "女优订阅轮询完成", "description": "自动任务：女优订阅轮询执行完成后发送摘要。"},
+    {"key": "automation_av_download", "name": "番号订阅下载完成", "description": "自动任务：订阅番号下载检查执行完成后发送摘要。"},
+    {"key": "automation_wash_download", "name": "洗版轮询完成", "description": "自动任务：洗版资源轮询执行完成后发送摘要。"},
 )
 
 
@@ -8899,6 +9342,25 @@ async def api_test_notification_payload(request: Request) -> dict[str, object]:
         "notification",
         "测试通知通道",
         {"channel": payload["channel"].get("type", ""), **result},
+    )
+    return result
+
+
+@app.post("/api/notifications/wechat-work/test-suite")
+async def api_wechat_work_test_suite(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    channel = payload.get("channel") if isinstance(payload, dict) else None
+    if not isinstance(channel, dict):
+        saved_channel = first_wechat_work_channel()
+        if not saved_channel:
+            raise HTTPException(status_code=400, detail="未找到已启用的企业微信通知通道")
+        channel = saved_channel
+    result = send_wechat_work_test_suite(channel)
+    app_log(
+        "info" if result.get("status") == "ok" else "error",
+        "notification",
+        "企业微信三类测试通知",
+        {"channel": channel.get("id") or channel.get("type") or "", **result},
     )
     return result
 
@@ -9011,6 +9473,8 @@ async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) 
         "title": str(result.get("title") or result.get("id") or ""),
         "detail": f"已订阅 {result.get('id', '')}：{result.get('title') or ''}".strip(),
         "av_id": result.get("id", ""),
+        "cover": result.get("cover") or result.get("cover_url") or "",
+        "release_date": result.get("date") or result.get("release_date") or "",
     })
     if result.get("status") == "in_library":
         send_notification_event("jellyfin_in_library", {
@@ -9019,6 +9483,9 @@ async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) 
             "detail": f"{result.get('id', '')} 已在 Jellyfin 媒体库中",
             "av_id": result.get("id", ""),
             "path": result.get("jellyfin_path", ""),
+            "file_name": notification_filename(result.get("jellyfin_path"), str(result.get("id") or "")),
+            "save_path": notification_parent_path(result.get("jellyfin_path"), ""),
+            "cover": result.get("cover") or result.get("cover_url") or "",
         })
     app_log("info", "subscription", "订阅番号已写入，后台检查已入队", {"stage": "subscribe_queued", "av_id": result.get("id"), "status": result.get("status"), "download_status": download_result.get("status")})
     return {"status": "ok", "subscription": result, "download": download_result}
@@ -9651,6 +10118,17 @@ def api_get_javdb_listing(url: str = "", force: bool = False, limit: int = 16, n
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/dmm/ranking")
+def api_get_dmm_ranking(kind: str = "movie", term: str = "daily", force: bool = False, limit: int = 100) -> dict[str, object]:
+    try:
+        safe_limit = max(1, min(100, int(limit or 100)))
+        ranking = cached_dmm_ranking(kind, term, safe_limit, force_refresh=force)
+        return {"status": "ok", "ranking": ranking}
+    except Exception as e:
+        print(f"[API] get_dmm_ranking error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/javdb/status")
 def api_get_javdb_status() -> dict[str, object]:
     return {
@@ -10006,6 +10484,28 @@ def notification_safe_text(value: object, fallback: str) -> str:
     return text
 
 
+def notification_short_text(value: object, fallback: str = "-") -> str:
+    text = notification_safe_text(value, fallback)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or fallback
+
+
+def notification_filename(path: object, fallback: str = "-") -> str:
+    text = str(path or "").strip()
+    if not text:
+        return fallback
+    return Path(text.replace("\\", "/")).name or fallback
+
+
+def notification_parent_path(path: object, fallback: str = "-") -> str:
+    text = str(path or "").strip()
+    if not text:
+        return fallback
+    normalized = text.replace("\\", "/")
+    parent = str(Path(normalized).parent).replace("\\", "/")
+    return parent if parent and parent != "." else fallback
+
+
 def notification_dedupe_key(event_key: str, data: dict[str, Any]) -> str:
     identity = (
         data.get("av_id")
@@ -10087,25 +10587,104 @@ def send_wechat_work_payload(config: dict[str, Any], payload: dict[str, Any]) ->
     return {"status": "ok", "message": "企业微信通知已发送", "detail": result}
 
 
-def wechat_work_message_payload(config: dict[str, Any], title: str, message: str) -> dict[str, Any]:
+def wechat_notification_cover_url(config: dict[str, Any], payload: dict[str, Any]) -> str:
+    for key in ("cover", "cover_url", "cover_proxy", "latest_cover", "image", "poster", "picurl"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return str(config.get("default_image_url") or "").strip()
+
+
+def wechat_notification_article_url(config: dict[str, Any], payload: dict[str, Any], image_url: str = "") -> str:
+    for value in (
+        config.get("article_url"),
+        payload.get("article_url"),
+        payload.get("url"),
+        payload.get("page_url"),
+        payload.get("detail_url"),
+        payload.get("dmm_url"),
+        payload.get("javdb_url"),
+        image_url,
+    ):
+        text = str(value or "").strip()
+        if text.startswith(("http://", "https://")):
+            return text
+    return "https://work.weixin.qq.com"
+
+
+def wechat_force_news_event(event_key: str) -> bool:
+    return event_key in {"actress_new_av", "av_subscribed", "torrent_sent", "jellyfin_in_library"}
+
+
+def wechat_text_only_event(event_key: str) -> bool:
+    return event_key in {"automation_actress_poll", "automation_av_download", "automation_wash_download"}
+
+
+def wechat_notification_text(event_key: str, title: str, message: str, payload: dict[str, Any]) -> tuple[str, str, str]:
+    av_id = notification_short_text(payload.get("av_id") or payload.get("id"), "")
+    item_title = notification_short_text(payload.get("title") or title, av_id or "MovieMuse")
+    if event_key in {"av_subscribed", "actress_new_av"}:
+        heading = f"番号{av_id}已完成订阅" if av_id else "番号已完成订阅"
+        body = item_title if item_title and item_title != av_id else notification_short_text(payload.get("detail") or message, "")
+        content = f"{heading}\n\n{body}".strip()
+        return heading, body, content
+    if event_key == "torrent_sent":
+        heading = f"番号{av_id}开始下载" if av_id else "番号开始下载"
+        site = notification_short_text(payload.get("site") or payload.get("source") or "馒头")
+        size = notification_short_text(payload.get("size") or payload.get("size_text") or payload.get("torrent_size"), "-")
+        seeders = notification_short_text(payload.get("seeders") or payload.get("seed_count") or payload.get("seeds"), "-")
+        downloader = notification_short_text(payload.get("downloader") or "qbittorrent")
+        body = "\n".join([
+            f"站点：{site}",
+            f"标题：{item_title}",
+            f"大小：{size}",
+            f"做种：{seeders}",
+            f"下载器：{downloader}",
+        ])
+        return heading, body, f"{heading}\n\n{body}"
+    if event_key == "jellyfin_in_library":
+        heading = f"番号{av_id}入库成功" if av_id else "入库成功"
+        path = payload.get("path") or payload.get("output_path") or payload.get("jellyfin_path") or ""
+        file_name = notification_short_text(payload.get("file_name") or notification_filename(path, ""), "-")
+        save_path = notification_short_text(payload.get("save_path") or notification_parent_path(path, ""), "-")
+        body = "\n".join([
+            f"文件名称：{file_name}",
+            f"保存路径：{save_path}",
+        ])
+        return heading, body, f"{heading}\n\n{body}"
+    fallback = f"{title}\n\n{message}".strip()
+    return title, message, fallback
+
+
+def wechat_work_message_payload(
+    config: dict[str, Any],
+    title: str,
+    message: str,
+    *,
+    event_key: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     agent_id = int(str(config.get("agent_id") or "0") or 0)
     touser = str(config.get("touser") or "@all").strip() or "@all"
-    image_url = str(config.get("default_image_url") or "").strip()
-    if bool(config.get("cover_enabled", True)) and image_url:
+    payload = payload if isinstance(payload, dict) else {}
+    wechat_title, wechat_description, content = wechat_notification_text(event_key, title, message, payload)
+    image_url = wechat_notification_cover_url(config, payload)
+    force_news = wechat_force_news_event(event_key)
+    text_only = wechat_text_only_event(event_key)
+    cover_enabled = bool(config.get("cover_enabled", False))
+    if not text_only and (force_news or (cover_enabled and image_url)):
+        article = {
+            "title": wechat_title[:128],
+            "description": wechat_description[:512],
+            "url": wechat_notification_article_url(config, payload, image_url),
+        }
+        if cover_enabled and image_url:
+            article["picurl"] = image_url
         return {
             "touser": touser,
             "msgtype": "news",
             "agentid": agent_id,
-            "news": {
-                "articles": [
-                    {
-                        "title": title[:128],
-                        "description": message[:512],
-                        "url": str(config.get("article_url") or image_url),
-                        "picurl": image_url,
-                    }
-                ]
-            },
+            "news": {"articles": [article]},
             "safe": 0,
             "enable_id_trans": 0,
             "enable_duplicate_check": 0,
@@ -10114,7 +10693,7 @@ def wechat_work_message_payload(config: dict[str, Any], title: str, message: str
         "touser": touser,
         "msgtype": "text",
         "agentid": agent_id,
-        "text": {"content": f"{title}\n\n{message}"[:2048]},
+        "text": {"content": content[:2048]},
         "safe": 0,
         "enable_id_trans": 0,
         "enable_duplicate_check": 0,
@@ -10731,7 +11310,14 @@ def process_wechat_callback_message(config: dict[str, Any], payload: dict[str, s
     return "已收到。请发送番号搜索 MTeam，或发送女优名进行搜索。"
 
 
-def send_notification_channel_message(channel_config: dict[str, Any], title: str, message: str) -> dict[str, object]:
+def send_notification_channel_message(
+    channel_config: dict[str, Any],
+    title: str,
+    message: str,
+    *,
+    event_key: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, object]:
     channel_type = str(channel_config.get("type") or "").strip().lower()
     config = channel_config.get("config") if isinstance(channel_config.get("config"), dict) else channel_config
     if channel_type == "serverchan":
@@ -10769,7 +11355,10 @@ def send_notification_channel_message(channel_config: dict[str, Any], title: str
         if not wechat_work_configured(config):
             return {"status": "error", "message": "未配置企业微信 CorpID、Secret 或应用 ID"}
         try:
-            return send_wechat_work_payload(config, wechat_work_message_payload(config, title, message))
+            return send_wechat_work_payload(
+                config,
+                wechat_work_message_payload(config, title, message, event_key=event_key, payload=payload or {}),
+            )
         except Exception as exc:
             return {"status": "error", "message": f"企业微信发送失败: {exc}"}
     return {"status": "error", "message": "未知通知通道"}
@@ -10805,7 +11394,7 @@ def send_notification_event(event_key: str, data: dict[str, Any] | None = None) 
 
     results: list[dict[str, Any]] = []
     for channel in channels:
-        result = send_notification_channel_message(channel, title, message)
+        result = send_notification_channel_message(channel, title, message, event_key=event_key, payload=payload)
         results.append({"channel": channel.get("id") or channel.get("type"), **result})
     ok = any(item.get("status") == "ok" for item in results)
     app_log("info" if ok else "error", "notification", f"通知事件：{event_name}", {"event": event_key, "results": results, "payload": payload})
@@ -10846,9 +11435,208 @@ def send_test_notification_channel(channel_config: dict[str, Any]) -> dict[str, 
     result = send_notification_channel_message(channel_config, title, message)
     if result.get("status") == "ok":
         channel_type = str(channel_config.get("type") or "").strip().lower()
-        label = "Gotify" if channel_type == "gotify" else "Server 酱" if channel_type == "serverchan" else "通知"
+        label = "Gotify" if channel_type == "gotify" else "Server 酱" if channel_type == "serverchan" else "企业微信" if channel_type == "wechat_work" else "通知"
         return {"status": "ok", "message": f"{label} 测试通知已发送"}
     return result
+
+
+def wechat_work_test_suite_samples() -> list[dict[str, Any]]:
+    cover = "https://pics.dmm.co.jp/mono/movie/adult/ipzz828/ipzz828pl.jpg"
+    sample_title = "IPZZ-828 露出水着で晒された水泳部顧問の肉感健康的ボディ"
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return [
+        {
+            "event_key": "actress_new_av",
+            "payload": {
+                "status": "subscribed",
+                "title": sample_title,
+                "detail": "订阅女优 长浜みつり 发现新番号 IPZZ-828",
+                "av_id": "IPZZ-828",
+                "actress": "长浜みつり",
+                "release_date": "2026-06-12",
+                "cover": cover,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "av_subscribed",
+            "payload": {
+                "status": "subscribed",
+                "title": sample_title,
+                "detail": sample_title,
+                "av_id": "IPZZ-828",
+                "cover": cover,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "mteam_found",
+            "payload": {
+                "status": "found",
+                "title": sample_title,
+                "detail": "MTeam 命中 3 个候选资源，已按做种数排序。",
+                "av_id": "IPZZ-828",
+                "site": "馒头",
+                "size": "5993.0MB",
+                "seeders": "90",
+                "cover": cover,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "torrent_sent",
+            "payload": {
+                "status": "sent",
+                "title": sample_title,
+                "detail": "测试种子已推送到 qBittorrent",
+                "av_id": "IPZZ-828",
+                "site": "馒头",
+                "size": "5993.0MB",
+                "seeders": "90",
+                "downloader": "qbittorrent",
+                "cover": cover,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "jellyfin_in_library",
+            "payload": {
+                "status": "completed",
+                "title": sample_title,
+                "detail": "IPZZ-828 已完成后处理并刷新 Jellyfin",
+                "av_id": "IPZZ-828",
+                "path": "/media/study3/IPZZ-828.mp4",
+                "file_name": "IPZZ-828.mp4",
+                "save_path": "/media/study3",
+                "cover": cover,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "task_failed",
+            "payload": {
+                "status": "failed",
+                "title": "任务失败告警",
+                "detail": "测试失败通知：下载器连接异常。",
+                "av_id": "IPZZ-999",
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "scan_completed",
+            "payload": {
+                "status": "completed",
+                "title": "重复视频扫描完成",
+                "detail": "扫描 128 个媒体文件，发现重复组 2 个。",
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "subtitle_completed",
+            "payload": {
+                "status": "completed",
+                "title": "字幕任务完成",
+                "detail": "IPZZ-828 字幕生成完成，已保存到媒体目录。",
+                "av_id": "IPZZ-828",
+                "path": "/media/study3/IPZZ-828.srt",
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "subtitle_failed",
+            "payload": {
+                "status": "failed",
+                "title": "字幕任务失败",
+                "detail": "IPZZ-828 字幕生成失败：测试错误消息。",
+                "av_id": "IPZZ-828",
+                "path": "/media/study3/IPZZ-828.mp4",
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "automation_actress_poll",
+            "payload": {
+                "status": "completed",
+                "title": "女优订阅轮询完成",
+                "detail": "检查女优：7 个\n新增番号：1 个\n错误：0 个",
+                "task": "actress_poll",
+                "task_name": "女优订阅轮询",
+                "checked": 7,
+                "added": 1,
+                "errors": 0,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "automation_av_download",
+            "payload": {
+                "status": "completed",
+                "title": "番号订阅下载完成",
+                "detail": "检查订阅番号：12 个\n推送下载：2 个\n未找到资源：3 个\n错误：0 个",
+                "task": "av_download",
+                "task_name": "番号订阅下载",
+                "checked": 12,
+                "sent": 2,
+                "errors": 0,
+                "time": now_text,
+            },
+        },
+        {
+            "event_key": "automation_wash_download",
+            "payload": {
+                "status": "completed",
+                "title": "洗版轮询完成",
+                "detail": "检查洗版番号：5 个\n推送下载：1 个\n未匹配：2 个\n过期：0 个\n错误：0 个",
+                "task": "wash_download",
+                "task_name": "洗版轮询",
+                "checked": 5,
+                "sent": 1,
+                "errors": 0,
+                "time": now_text,
+            },
+        },
+    ]
+
+
+def send_wechat_work_test_suite(channel_config: dict[str, Any]) -> dict[str, object]:
+    channel_type = str(channel_config.get("type") or "").strip().lower()
+    if channel_type != "wechat_work":
+        return {"status": "error", "message": "请选择企业微信通知通道", "sent": 0, "total": 0, "results": []}
+    results: list[dict[str, Any]] = []
+    notifications = get_system_settings_service().get().get("notifications", {})
+    templates = notifications.get("templates") if isinstance(notifications, dict) and isinstance(notifications.get("templates"), dict) else {}
+    for sample in wechat_work_test_suite_samples():
+        event_key = str(sample.get("event_key") or "")
+        event_name = notification_event_name(event_key)
+        payload = sample.get("payload") if isinstance(sample.get("payload"), dict) else {}
+        payload = dict(payload)
+        payload.setdefault("event_name", event_name)
+        payload.setdefault("status", "ok")
+        payload.setdefault("title", event_name)
+        payload.setdefault("detail", notification_detail(payload))
+        payload.setdefault("time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        template = templates.get(event_key) if isinstance(templates.get(event_key), dict) else default_notification_template(event_key)
+        if notification_template_looks_broken(template):
+            template = default_notification_template(event_key)
+        title = render_notification_template(str(template.get("title") or ""), payload)
+        message = render_notification_template(str(template.get("message") or ""), payload)
+        result = send_notification_channel_message(
+            channel_config,
+            title,
+            message,
+            event_key=event_key,
+            payload=payload,
+        )
+        results.append({"event": event_key, **result})
+    sent = sum(1 for item in results if item.get("status") == "ok")
+    total = len(results)
+    return {
+        "status": "ok" if sent == total else "error",
+        "message": f"企业微信测试通知已发送 {sent}/{total}",
+        "sent": sent,
+        "total": total,
+        "results": results,
+    }
 
 
 def test_qbittorrent(config: dict[str, Any]) -> dict[str, object]:
@@ -11004,7 +11792,32 @@ def fetch_image_bytes(url: str) -> tuple[bytes, str]:
                 if total > ASSET_IMAGE_MAX_BYTES:
                     raise HTTPException(status_code=413, detail="图片超过本地缓存大小限制")
                 chunks.append(chunk)
-    return b"".join(chunks), media_type
+    content = b"".join(chunks)
+    if dmm_placeholder_image(url, content):
+        raise HTTPException(status_code=404, detail="DMM 当前只返回占位封面")
+    return content, media_type
+
+
+def dmm_placeholder_image(url: str, content: bytes) -> bool:
+    target = str(url or "").lower()
+    if "pics.dmm.co.jp/mono/movie/adult/" not in target:
+        return False
+    return len(content or b"") <= 4096
+
+
+def dmm_cover_url_is_placeholder(url: str) -> bool:
+    target = str(url or "").strip().lower()
+    if "pics.dmm.co.jp/mono/movie/adult/" not in target:
+        return False
+    try:
+        with httpx.Client(timeout=8, follow_redirects=True) as client:
+            response = client.head(str(url), headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+            content_length = int(response.headers.get("content-length") or 0)
+            return content_type.startswith("image/") and 0 < content_length <= 4096
+    except Exception:
+        return False
 
 
 def fetch_media_bytes(url: str) -> tuple[bytes, str]:
@@ -11030,6 +11843,11 @@ def fetch_media_bytes(url: str) -> tuple[bytes, str]:
 def serve_asset_record(data_dir: Path, asset: dict[str, Any]) -> FileResponse | None:
     asset_path = asset_file_from_record(data_dir, asset)
     if not asset_path:
+        return None
+    try:
+        if dmm_placeholder_image(str(asset.get("source_url") or ""), asset_path.read_bytes()):
+            return None
+    except Exception:
         return None
     return FileResponse(
         asset_path,

@@ -391,6 +391,16 @@ class PostprocessService:
             conn.execute(f"UPDATE postprocess_tasks SET {', '.join(assignments)} WHERE id = ?", params)
         return self.get_task(task_id)
 
+    def delete_task(self, task_id: str) -> dict[str, Any] | None:
+        current = self.get_task(task_id)
+        if not current:
+            return None
+        with self._connect() as conn:
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM qb_torrents WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM postprocess_tasks WHERE id = ?", (task_id,))
+        return current
+
     def bind_qb_torrent(
         self,
         *,
