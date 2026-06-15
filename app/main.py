@@ -6081,7 +6081,7 @@ def subscription_poll_loop() -> None:
                         run_subscription_task(task_id, minute_key=minute_key)
         except Exception as exc:
             print(f"[SubscriptionPoll] error: {exc}", flush=True)
-        subscription_poll_stop.wait(300)
+        subscription_poll_stop.wait(30)
 
 
 def cron_matches(expression: str, moment: datetime) -> bool:
@@ -8607,6 +8607,46 @@ def poll_subtitle_postprocess_once() -> dict[str, Any]:
     return {"checked": len(tasks), "results": results}
 
 
+def sync_completed_wash_postprocess_tasks(limit: int = 200) -> dict[str, Any]:
+    post = get_postprocess_service()
+    service = get_subscription_service()
+    subscriptions = {
+        str(item.get("id") or ""): item
+        for item in service.get_subscribed_av()
+        if isinstance(item, dict)
+    }
+    checked = 0
+    synced: list[dict[str, str]] = []
+    for task in post.list_tasks(statuses=["completed"], limit=limit):
+        mode = wash_mode_from_task_type(str(task.get("task_type") or ""))
+        av_id = str(task.get("av_id") or "")
+        if not mode or not av_id:
+            continue
+        checked += 1
+        output_path = str(task.get("output_path") or "")
+        wash = subscriptions.get(av_id, {}).get("wash")
+        wash = wash if isinstance(wash, dict) else {}
+        if wash.get("status") == "completed" and str(wash.get("new_path") or "") == output_path:
+            continue
+        updated = service.update_av_wash(av_id, {
+            "mode": mode,
+            "status": "completed",
+            "download_status": "completed",
+            "download_message": "洗版后处理完成",
+            "new_path": output_path,
+            "task_id": str(task.get("id") or ""),
+            "qb_hash": str(task.get("torrent_hash") or ""),
+        })
+        if updated:
+            post.add_event(str(task.get("id") or ""), "info", "wash_status_synced", "洗版订阅状态已同步为完成", {
+                "av_id": av_id,
+                "mode": mode,
+                "new_path": output_path,
+            })
+            synced.append({"task_id": str(task.get("id") or ""), "av_id": av_id, "mode": mode})
+    return {"checked": checked, "synced": synced}
+
+
 def refresh_worker_queue_readiness(worker_status: dict[str, Any] | None = None) -> dict[str, Any]:
     post = get_postprocess_service()
     status_payload = worker_status or subtitle_backend_status()
@@ -8625,6 +8665,7 @@ def refresh_worker_queue_readiness(worker_status: dict[str, Any] | None = None) 
 def poll_postprocess_once() -> dict[str, Any]:
     qb_result = poll_qb_postprocess_once()
     subtitle_result = poll_subtitle_postprocess_once()
+    wash_sync_result = sync_completed_wash_postprocess_tasks()
     queue_result: dict[str, Any] | None = None
     post = get_postprocess_service()
     post_settings = post.get_settings()
@@ -8638,7 +8679,7 @@ def poll_postprocess_once() -> dict[str, Any]:
                 "status": queue_result.get("status"),
                 "updated": queue_result.get("updated"),
             })
-    return {"qb": qb_result, "subtitle": subtitle_result, "worker_queue": worker_queue, "queue_auto_run": queue_result}
+    return {"qb": qb_result, "subtitle": subtitle_result, "wash_sync": wash_sync_result, "worker_queue": worker_queue, "queue_auto_run": queue_result}
 
 
 def torrent_info_hash(torrent_bytes: bytes) -> str:

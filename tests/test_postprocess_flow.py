@@ -708,6 +708,27 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(subscription["wash"]["status"], "cancelled")
         self.assertEqual(subscription["wash"]["task_id"], task["id"])
 
+    def test_completed_wash_postprocess_syncs_subscription_status(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "TEST-WASH-SYNC"
+        output_path = str(self.root / "out" / av_id / f"{av_id}.chinese.mp4")
+        service.subscribe_av({"id": av_id, "title": "wash sync", "status": "in_library"})
+        task = post.create_task(av_id=av_id, task_type="wash_chinese", status="completed")
+        post.update_task(task["id"], output_path=output_path)
+        service.update_av_wash(av_id, {"mode": "chinese", "status": "downloading", "task_id": task["id"]})
+
+        result = self.main.sync_completed_wash_postprocess_tasks()
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["checked"], 1)
+        self.assertEqual(result["synced"][0]["task_id"], task["id"])
+        self.assertEqual(subscription["wash"]["status"], "completed")
+        self.assertEqual(subscription["wash"]["download_status"], "completed")
+        self.assertEqual(subscription["wash"]["new_path"], output_path)
+        self.assertEqual(subscription["wash"]["task_id"], task["id"])
+        self.assertTrue(any(event["stage"] == "wash_status_synced" for event in post.list_events(task["id"])))
+
     def test_postprocess_delete_removes_terminal_task_record(self) -> None:
         post = self.main.get_postprocess_service()
         task = post.create_task(av_id="DELETE-FAILED-001", task_type="subscription", status="failed")
