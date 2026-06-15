@@ -1,5 +1,5 @@
 <template>
-  <section class="makers-view">
+  <section class="makers-view" @click="closeMenus">
     <PageHeader
       kicker="订阅管理"
       :title="activeMaker?.name || '厂牌发售'"
@@ -57,9 +57,21 @@
           poster-fit="contain"
           @detail="openDetail"
         >
+          <template v-if="isMovieSubscribed(item)" #menu>
+            <div class="more-menu" @click.stop>
+              <button class="more-trigger" type="button" aria-label="更多操作" @click.stop="toggleMovieMenu(item)">
+                <span></span><span></span><span></span>
+              </button>
+              <div v-if="movieMenuId === movieKey(item)" class="more-panel" @click.stop>
+                <button type="button" @click="openSubscribe(item, true)">重新订阅</button>
+              </div>
+            </div>
+          </template>
           <template #actions>
             <BaseButton type="button" @click.stop="openDetail(item)">详情</BaseButton>
-            <BaseButton variant="primary" type="button" @click.stop="openSubscribe(item)">订阅</BaseButton>
+            <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
+              {{ movieSubscribeLabel(item) }}
+            </BaseButton>
           </template>
         </SubscriptionMovieCard>
       </div>
@@ -130,6 +142,7 @@ import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
+import { avSubscribeLabel, normalizeAvId, subscribedAv } from '../lib/subscriptionStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -149,6 +162,13 @@ const { data: settingsData, refetch: refetchSettings } = useQuery({
   staleTime: 60_000
 })
 
+const avQuery = useQuery({
+  queryKey: ['subscriptions', 'av'],
+  queryFn: () => api('/api/subscriptions/av'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
+
 const activeUrl = ref('')
 const manualUrl = ref('')
 const movies = ref([])
@@ -162,6 +182,7 @@ const successMessage = ref('')
 const subscribeItem = ref(null)
 const detailItem = ref(null)
 const submitting = ref(false)
+const movieMenuId = ref('')
 const showMakerDialog = ref(false)
 const savingMaker = ref(false)
 const newMaker = reactive({ name: '', url: '', preferred_listing_source: 'javlibrary' })
@@ -172,6 +193,7 @@ const makers = computed(() => {
   return Array.isArray(rows) && rows.length ? rows : defaultMakers
 })
 const activeMaker = computed(() => makers.value.find((maker) => maker.url === activeUrl.value) || makers.value[0])
+const avSubscriptions = computed(() => Array.isArray(avQuery.data.value?.subscriptions) ? avQuery.data.value.subscriptions : [])
 
 onMounted(() => {
   applyRouteMaker()
@@ -327,12 +349,35 @@ function openMakerFromDetail(link) {
   }
 }
 
-function openSubscribe(item) {
+function movieKey(item) {
+  return normalizeAvId(item?.id || item?.code || '') || String(item?.url || '')
+}
+
+function isMovieSubscribed(item) {
+  return !!subscribedAv(item, avSubscriptions.value)
+}
+
+function movieSubscribeLabel(item) {
+  return avSubscribeLabel(item, avSubscriptions.value)
+}
+
+function openSubscribe(item, force = false) {
+  if (!force && isMovieSubscribed(item)) return
+  closeMenus()
   subscribeItem.value = item
 }
 
 function closeSubscribe() {
   subscribeItem.value = null
+}
+
+function toggleMovieMenu(item) {
+  const key = movieKey(item)
+  movieMenuId.value = movieMenuId.value === key ? '' : key
+}
+
+function closeMenus() {
+  movieMenuId.value = ''
 }
 
 async function confirmSubscribe(filters) {
@@ -347,6 +392,7 @@ async function confirmSubscribe(filters) {
       subscription_mode: filters.subscription_mode
     })
     updateSubscriptionCache(payload.subscription)
+    await avQuery.refetch()
     successMessage.value = `${subscribeItem.value.id} 已加入订阅`
     subscribeItem.value = null
   } catch (error) {
@@ -508,6 +554,62 @@ h1 {
   display: flex;
   justify-content: center;
   margin-top: 22px;
+}
+
+.more-menu {
+  position: relative;
+}
+
+.more-trigger {
+  display: grid;
+  grid-template-columns: repeat(3, 4px);
+  gap: 3px;
+  place-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  appearance: none;
+  cursor: pointer;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, .42));
+}
+
+.more-trigger span {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: #fff;
+}
+
+.more-panel {
+  position: absolute;
+  top: 40px;
+  right: 0;
+  z-index: 10;
+  min-width: 124px;
+  padding: 6px;
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius-sm);
+  background: var(--mm-card-bg);
+  box-shadow: var(--mm-shadow-md);
+}
+
+.more-panel button {
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  border-radius: var(--mm-radius-sm);
+  background: transparent;
+  color: var(--mm-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.more-panel button:hover {
+  background: var(--mm-primary-soft);
+  color: var(--mm-primary);
 }
 
 .empty {

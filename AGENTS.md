@@ -4,7 +4,6 @@
 - 后端：`app/` 里的 FastAPI。
 - 前端：`frontend/` 里的 Vue 3 + Vite。
 - Unraid/Docker 部署：`deploy/unraid-frontend/`。
-- Python 测试：`tests/`。
 
 ## 前端
 - 修改 UI 前先阅读附近已有的 Vue 文件。
@@ -14,13 +13,21 @@
 - 除非任务明确要求重新设计，否则保持当前浅色 MovieMuse 控制台风格。
 
 ## 测试
-- 前端改动：在 `frontend/` 下运行 `npm run build`。
-- 后端逻辑改动：相关时运行 `python -m unittest discover tests`。
-- 容器/UI 验证应使用 Docker MCP 或 UI 测试 compose 配置，不要使用生产数据。
-- 不要把 `tmp-tests/` 里的旧文件当作事实来源。
+- 日常后端测试：直接在本地运行 `python -m unittest discover tests`。
+- 重复视频/本地扫描日常调试优先用本机 Python 服务，不用 Docker：端口固定为 `18183`，访问 `http://127.0.0.1:18183/duplicates`。
+- 本机 Python 调试推荐环境：
+  - `MEDIA_DIRS=\\192.168.2.9\media`
+  - `TRASH_DIR=\\192.168.2.9\media\trash`
+  - `APP_DATA_DIR=<项目目录>\data\docker-test`
+  - 启动命令：`python -m uvicorn app.main:app --host 127.0.0.1 --port 18183`
+- `data\docker-test` 是 `media-toolbox-subscription-test` 的 `/data` 映射目录；日常只运行 18183 这一套本机 Python 服务，不要同时启动 18180 或 Docker 容器共写同一个 SQLite。
+- 如需完全隔离测试，可临时使用 `data\local-python-debug`，但那里不会带 Docker/调试配置，页面会像新环境一样空。
+- 使用真实媒体目录调试时，默认只读验证扫描、索引、页面状态；不要执行移动/删除/回收站操作，除非任务明确要求并已确认。
+- 只有任务明确要求同步到 Unraid 时，才把本地修改同步/部署到 Unraid 做实机验证。
 
 ## 安全
-- 不要提交真实媒体、API key、模型文件、`data/`、`docker-data/` 或 `tmp-tests/`。
+- 永远不要提交：真实媒体、API key、模型文件。
+- 数据/临时/生成物不要提交：`data/`、`docker-data/`、`tmp-tests/`、`.tmp-*/`、`trash/`、`sample-media/`、`frontend/dist/`、`frontend/node_modules/`、`*.sqlite3`、`*.log`、`__pycache__/`。
 - UI 中移动、删除、放入回收站等文件操作必须要求明确确认。
 - 测试时保持 Unraid 媒体挂载只读，除非任务明确是在验证移动行为。
 

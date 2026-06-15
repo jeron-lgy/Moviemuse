@@ -930,6 +930,7 @@ function postprocessPhaseLabel(task, phase) {
   if (phase === 'subtitle') return '字幕'
   if (taskType.startsWith('wash_')) return '洗版'
   if (taskType === 'subscription') return '订阅'
+  if (taskType === 'external_qb') return '外部 qB'
   return '后处理'
 }
 

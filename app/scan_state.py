@@ -8,12 +8,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .scanner import MovieFile, MovieGroup, ScanResult, SubtitleMatch, scan_libraries
+from .scanner import (
+    MovieFile,
+    MovieGroup,
+    ScanResult,
+    SubtitleMatch,
+    analyze_video,
+    build_scan_result,
+    find_cover,
+    find_nfo,
+    find_subtitles,
+    iter_video_files,
+    normalized_roots,
+    scan_libraries,
+)
 
 
 @dataclass
 class ScanSnapshot:
     status: str = "idle"
+    mode: str = "incremental"
     started_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
@@ -21,6 +35,10 @@ class ScanSnapshot:
     scanned_dirs: tuple[Path, ...] = ()
     processed_files: int = 0
     total_files: int = 0
+    reused_files: int = 0
+    changed_files: int = 0
+    missing_files: int = 0
+    changed_paths: tuple[str, ...] = ()
     current_path: str | None = None
 
     @property
@@ -141,6 +159,7 @@ def _result_from_dict(data: dict[str, Any]) -> ScanResult:
 def _snapshot_to_dict(snapshot: ScanSnapshot) -> dict[str, Any]:
     return {
         "status": snapshot.status,
+        "mode": snapshot.mode,
         "started_at": snapshot.started_at,
         "finished_at": snapshot.finished_at,
         "error": snapshot.error,
@@ -148,6 +167,10 @@ def _snapshot_to_dict(snapshot: ScanSnapshot) -> dict[str, Any]:
         "scanned_dirs": [str(path) for path in snapshot.scanned_dirs],
         "processed_files": snapshot.processed_files,
         "total_files": snapshot.total_files,
+        "reused_files": snapshot.reused_files,
+        "changed_files": snapshot.changed_files,
+        "missing_files": snapshot.missing_files,
+        "changed_paths": list(snapshot.changed_paths),
         "current_path": snapshot.current_path,
     }
 
@@ -156,6 +179,7 @@ def _snapshot_from_dict(data: dict[str, Any]) -> ScanSnapshot:
     result_data = data.get("result")
     return ScanSnapshot(
         status=str(data.get("status") or "idle"),
+        mode=str(data.get("mode") or "incremental"),
         started_at=data.get("started_at"),
         finished_at=data.get("finished_at"),
         error=data.get("error"),
@@ -163,6 +187,10 @@ def _snapshot_from_dict(data: dict[str, Any]) -> ScanSnapshot:
         scanned_dirs=tuple(Path(str(path)) for path in data.get("scanned_dirs") or []),
         processed_files=int(data.get("processed_files") or 0),
         total_files=int(data.get("total_files") or 0),
+        reused_files=int(data.get("reused_files") or 0),
+        changed_files=int(data.get("changed_files") or 0),
+        missing_files=int(data.get("missing_files") or 0),
+        changed_paths=tuple(str(path) for path in data.get("changed_paths") or []),
         current_path=data.get("current_path"),
     )
 
@@ -173,6 +201,7 @@ class ScanCache:
         self._snapshot = ScanSnapshot()
         self._thread: threading.Thread | None = None
         self._db_path: Path | None = None
+        self._run_id = 0
 
     def configure(self, data_dir: Path) -> None:
         db_path = data_dir / "scan_cache.sqlite3"
@@ -196,41 +225,69 @@ class ScanCache:
         self,
         media_dirs: list[Path],
         force: bool = False,
+        mode: str = "incremental",
         excluded_dirs: list[Path] | None = None,
         completion_callback: Callable[[ScanSnapshot], None] | None = None,
     ) -> bool:
+        normalized_mode = "full" if mode == "full" else "incremental"
         with self._lock:
             if self._snapshot.status == "running" and not force:
                 return False
+            self._run_id += 1
+            run_id = self._run_id
             excluded_dirs = list(excluded_dirs or [])
             self._snapshot = ScanSnapshot(
                 status="running",
+                mode=normalized_mode,
                 started_at=time.time(),
                 result=self._snapshot.result,
                 scanned_dirs=tuple(media_dirs),
             )
             snapshot = self._snapshot
-            self._thread = threading.Thread(target=self._run, args=(list(media_dirs), excluded_dirs, completion_callback), daemon=True)
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(run_id, list(media_dirs), excluded_dirs, normalized_mode, completion_callback),
+                daemon=True,
+            )
             self._thread.start()
         self._save_snapshot(snapshot)
         return True
 
     def _run(
         self,
+        run_id: int,
         media_dirs: list[Path],
         excluded_dirs: list[Path],
+        mode: str,
         completion_callback: Callable[[ScanSnapshot], None] | None = None,
     ) -> None:
         def progress(processed: int, total: int, current_path: Path | None) -> None:
             with self._lock:
+                if run_id != self._run_id:
+                    return
                 self._snapshot.processed_files = processed
                 self._snapshot.total_files = total
                 self._snapshot.current_path = str(current_path) if current_path else None
 
         try:
-            result = scan_libraries(media_dirs, excluded_dirs=excluded_dirs, progress=progress)
+            if mode == "full":
+                result, reused_files, changed_files, missing_files, changed_paths = self._scan_with_cache(
+                    media_dirs,
+                    excluded_dirs=excluded_dirs,
+                    progress=progress,
+                    force_refresh=True,
+                )
+            else:
+                result, reused_files, changed_files, missing_files, changed_paths = self._scan_with_cache(
+                    media_dirs,
+                    excluded_dirs=excluded_dirs,
+                    progress=progress,
+                    force_refresh=False,
+                )
         except Exception as exc:
             with self._lock:
+                if run_id != self._run_id:
+                    return
                 self._snapshot.status = "failed"
                 self._snapshot.finished_at = time.time()
                 self._snapshot.error = str(exc)
@@ -241,6 +298,8 @@ class ScanCache:
                 completion_callback(snapshot)
             return
         with self._lock:
+            if run_id != self._run_id:
+                return
             self._snapshot.status = "completed"
             self._snapshot.finished_at = time.time()
             self._snapshot.error = None
@@ -248,11 +307,233 @@ class ScanCache:
             self._snapshot.scanned_dirs = tuple(media_dirs)
             self._snapshot.processed_files = result.total_files
             self._snapshot.total_files = result.total_files
+            self._snapshot.reused_files = reused_files
+            self._snapshot.changed_files = changed_files
+            self._snapshot.missing_files = missing_files
+            self._snapshot.changed_paths = tuple(changed_paths) if mode != "full" else ()
             self._snapshot.current_path = None
             snapshot = self._snapshot
         self._save_snapshot(snapshot)
         if completion_callback:
             completion_callback(snapshot)
+
+    def _scan_with_cache(
+        self,
+        media_dirs: list[Path],
+        excluded_dirs: list[Path],
+        progress: Callable[[int, int, Path | None], None] | None,
+        force_refresh: bool,
+    ) -> tuple[ScanResult, int, int, int, tuple[str, ...]]:
+        if not self._db_path:
+            return scan_libraries(media_dirs, excluded_dirs=excluded_dirs, progress=progress), 0, 0, 0, ()
+
+        files: list[MovieFile] = []
+        missing_dirs: list[Path] = []
+        videos: list[Path] = []
+        excluded_roots = normalized_roots(excluded_dirs)
+        for media_dir in media_dirs:
+            if not media_dir.exists():
+                missing_dirs.append(media_dir)
+                continue
+            videos.extend(iter_video_files(media_dir, excluded_roots))
+
+        total = len(videos)
+        if progress:
+            progress(0, total, None)
+
+        cached = self._cached_files_for_roots(media_dirs)
+        current_paths: set[str] = set()
+        reused_files = 0
+        changed_files = 0
+        changed_paths: list[str] = []
+
+        for index, video in enumerate(videos, start=1):
+            path_key = str(video)
+            current_paths.add(path_key)
+            try:
+                stat = video.stat()
+                size_bytes = int(stat.st_size)
+                mtime_ns = int(stat.st_mtime_ns)
+                sidecar_signature = self._sidecar_signature(video)
+            except OSError:
+                if progress:
+                    progress(index, total, video)
+                continue
+
+            row = cached.get(path_key)
+            movie: MovieFile | None = None
+            if (
+                row
+                and not force_refresh
+                and row["size_bytes"] == size_bytes
+                and row["mtime_ns"] == mtime_ns
+                and row["sidecar_signature"] == sidecar_signature
+            ):
+                try:
+                    movie = _file_from_dict(json.loads(str(row["payload"] or "{}")))
+                    reused_files += 1
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    movie = None
+
+            if movie is None:
+                movie = analyze_video(video)
+                changed_files += 1
+                changed_paths.append(path_key)
+
+            files.append(movie)
+            self._upsert_cached_file(movie, self._scan_root_for(video, media_dirs), size_bytes, mtime_ns, sidecar_signature)
+            if progress:
+                progress(index, total, video)
+
+        missing_files = self._mark_missing(media_dirs, current_paths)
+        result = build_scan_result(files, media_dirs, missing_dirs)
+        return result, reused_files, changed_files, missing_files, tuple(changed_paths)
+
+    def _scan_root_for(self, path: Path, media_dirs: list[Path]) -> str:
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            resolved_path = path.absolute()
+        for media_dir in media_dirs:
+            try:
+                resolved_root = media_dir.resolve()
+                resolved_path.relative_to(resolved_root)
+                return str(media_dir)
+            except (OSError, ValueError):
+                continue
+        return str(path.parent)
+
+    def _sidecar_signature(self, video: Path) -> str:
+        sidecars = [path for path in (find_nfo(video), find_cover(video)) if path]
+        sidecars.extend(subtitle.path for subtitle in find_subtitles(video))
+        parts: list[str] = []
+        for sidecar in sorted(set(sidecars), key=lambda item: str(item).lower()):
+            try:
+                stat = sidecar.stat()
+            except OSError:
+                continue
+            parts.append(f"{sidecar.name}\0{stat.st_size}\0{stat.st_mtime_ns}")
+        return "\n".join(parts)
+
+    def _cached_files_for_roots(self, media_dirs: list[Path]) -> dict[str, dict[str, Any]]:
+        conn = self._connect()
+        if not conn:
+            return {}
+        roots = [str(path) for path in media_dirs]
+        if not roots:
+            return {}
+        placeholders = ",".join("?" for _ in roots)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT path, size_bytes, mtime_ns, sidecar_signature, payload
+                FROM duplicate_scan_files
+                WHERE scan_root IN ({placeholders}) AND missing = 0
+                """,
+                roots,
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+        return {
+            str(row[0]): {
+                "size_bytes": int(row[1] or 0),
+                "mtime_ns": int(row[2] or 0),
+                "sidecar_signature": str(row[3] or ""),
+                "payload": str(row[4] or "{}"),
+            }
+            for row in rows
+        }
+
+    def _upsert_cached_file(
+        self,
+        movie: MovieFile,
+        scan_root: str,
+        size_bytes: int,
+        mtime_ns: int,
+        sidecar_signature: str,
+    ) -> None:
+        conn = self._connect()
+        if not conn:
+            return
+        payload = json.dumps(_file_to_dict(movie), ensure_ascii=False)
+        now = time.time()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO duplicate_scan_files (
+                        path, scan_root, size_bytes, mtime_ns, sidecar_signature, suffix, name, group_key,
+                        resolution, subtitle_kind, payload, missing, last_seen_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        scan_root = excluded.scan_root,
+                        size_bytes = excluded.size_bytes,
+                        mtime_ns = excluded.mtime_ns,
+                        sidecar_signature = excluded.sidecar_signature,
+                        suffix = excluded.suffix,
+                        name = excluded.name,
+                        group_key = excluded.group_key,
+                        resolution = excluded.resolution,
+                        subtitle_kind = excluded.subtitle_kind,
+                        payload = excluded.payload,
+                        missing = 0,
+                        last_seen_at = excluded.last_seen_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(movie.path),
+                        scan_root,
+                        size_bytes,
+                        mtime_ns,
+                        sidecar_signature,
+                        movie.path.suffix.lower(),
+                        movie.path.name,
+                        movie.group_key,
+                        movie.resolution,
+                        movie.subtitle_kind,
+                        payload,
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+
+    def _mark_missing(self, media_dirs: list[Path], current_paths: set[str]) -> int:
+        conn = self._connect()
+        if not conn:
+            return 0
+        roots = [str(path) for path in media_dirs]
+        if not roots:
+            return 0
+        placeholders = ",".join("?" for _ in roots)
+        try:
+            rows = conn.execute(
+                f"SELECT path FROM duplicate_scan_files WHERE scan_root IN ({placeholders}) AND missing = 0",
+                roots,
+            ).fetchall()
+            missing_paths = [str(row[0]) for row in rows if str(row[0]) not in current_paths]
+            if missing_paths:
+                mark_placeholders = ",".join("?" for _ in missing_paths)
+                with conn:
+                    conn.execute(
+                        f"""
+                        UPDATE duplicate_scan_files
+                        SET missing = 1, updated_at = ?
+                        WHERE path IN ({mark_placeholders})
+                        """,
+                        [time.time(), *missing_paths],
+                    )
+            return len(missing_paths)
+        except sqlite3.Error:
+            return 0
+        finally:
+            conn.close()
 
     def _connect(self, db_path: Path | None = None) -> sqlite3.Connection | None:
         path = db_path or self._db_path
@@ -282,6 +563,38 @@ class ScanCache:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS duplicate_scan_files (
+                    path TEXT PRIMARY KEY,
+                    scan_root TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    sidecar_signature TEXT NOT NULL DEFAULT '',
+                    suffix TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    group_key TEXT NOT NULL DEFAULT '',
+                    resolution TEXT NOT NULL DEFAULT '',
+                    subtitle_kind TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL,
+                    missing INTEGER NOT NULL DEFAULT 0,
+                    last_seen_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_duplicate_scan_files_root_missing ON duplicate_scan_files(scan_root, missing)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_duplicate_scan_files_group ON duplicate_scan_files(group_key)"
+            )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(duplicate_scan_files)").fetchall()
+            }
+            if "sidecar_signature" not in columns:
+                conn.execute("ALTER TABLE duplicate_scan_files ADD COLUMN sidecar_signature TEXT NOT NULL DEFAULT ''")
         conn.close()
 
     def _load_snapshot(self, db_path: Path) -> ScanSnapshot | None:

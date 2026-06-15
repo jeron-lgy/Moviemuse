@@ -98,6 +98,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "username": "admin",
         "password_hash": password_hash("admin"),
     },
+    "demo": {
+        "enabled": False,
+        "cover_url": "",
+        "hide_system_settings": True,
+    },
 }
 
 
@@ -111,6 +116,7 @@ class SystemSettingsService:
         self._normalize_network()
         self._normalize_notifications()
         self._normalize_auth()
+        self._normalize_demo()
 
     def _load(self) -> dict[str, Any]:
         data = json.loads(json.dumps(DEFAULT_SETTINGS))
@@ -145,7 +151,7 @@ class SystemSettingsService:
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            for section in ("mteam", "qbittorrent", "jellyfin", "network", "notifications"):
+            for section in ("mteam", "qbittorrent", "jellyfin", "network", "notifications", "demo"):
                 value = payload.get(section)
                 if isinstance(value, dict):
                     self.data.setdefault(section, {})
@@ -165,6 +171,7 @@ class SystemSettingsService:
             self._normalize_network()
             self._normalize_notifications()
             self._normalize_auth()
+            self._normalize_demo()
             self._save()
             return self.get()
 
@@ -196,6 +203,15 @@ class SystemSettingsService:
         auth["username"] = username
         auth["password_hash"] = hashed or password_hash(legacy_password or "admin")
         auth.pop("password", None)
+
+    def _normalize_demo(self) -> None:
+        demo = self.data.setdefault("demo", {})
+        defaults = DEFAULT_SETTINGS["demo"]
+        for key, default in defaults.items():
+            demo.setdefault(key, default)
+        demo["enabled"] = bool(demo.get("enabled", False))
+        demo["hide_system_settings"] = bool(demo.get("hide_system_settings", True))
+        demo["cover_url"] = str(demo.get("cover_url") or "").strip()
 
 
 def merge_dict(target: dict[str, Any], source: dict[str, Any]) -> None:

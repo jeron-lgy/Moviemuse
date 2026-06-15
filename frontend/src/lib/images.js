@@ -1,3 +1,5 @@
+import { useDemoStore } from '../stores/demo'
+
 function itemId(item) {
   return item?.id || item?.code || item?.name || ''
 }
@@ -12,6 +14,8 @@ function itemReleased(item) {
 }
 
 export function imageProxyUrl(url, item = null, options = {}) {
+  const demoUrl = demoImageUrl(item, options)
+  if (demoUrl) return demoUrl
   if (options.kind === 'cover' || (!options.kind && item)) {
     const existing = item?.cover_proxy || item?.coverProxy
     if (existing && (!url || sameProxySource(existing, url))) return existing
@@ -53,4 +57,17 @@ function sameProxySource(proxyUrl, sourceUrl) {
 
 function directMediaUrl(url) {
   return /\.(mp4|webm|ogg|mov)(\?|#|$)/i.test(String(url || ''))
+}
+
+function demoImageUrl(item, options = {}) {
+  let demo
+  try {
+    demo = useDemoStore()
+  } catch {
+    return ''
+  }
+  if (!demo.enabled) return ''
+  const kind = String(options.kind || (item ? 'cover' : 'image')).toLowerCase()
+  if (!['cover', 'actor', 'image'].includes(kind)) return ''
+  return demo.replacementCoverUrl
 }

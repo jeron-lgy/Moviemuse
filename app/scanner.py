@@ -130,8 +130,17 @@ def scan_libraries(
         if progress:
             progress(index, total, video)
 
+    return build_scan_result(files, media_dirs, missing_dirs)
+
+
+def build_scan_result(
+    files: Iterable[MovieFile],
+    media_dirs: list[Path],
+    missing_dirs: list[Path] | None = None,
+) -> ScanResult:
+    file_list = list(files)
     grouped: dict[str, list[MovieFile]] = {}
-    for item in files:
+    for item in file_list:
         grouped.setdefault(item.group_key, []).append(item)
 
     groups = []
@@ -152,8 +161,8 @@ def scan_libraries(
         )
     groups.sort(key=lambda group: (group.title.lower(), group.year))
     duplicate_files = sum(len(group.files) for group in groups)
-    sorted_files = tuple(sorted(files, key=lambda file: str(file.path).lower()))
-    return ScanResult(tuple(groups), len(files), duplicate_files, tuple(media_dirs), sorted_files, tuple(missing_dirs))
+    sorted_files = tuple(sorted(file_list, key=lambda file: str(file.path).lower()))
+    return ScanResult(tuple(groups), len(file_list), duplicate_files, tuple(media_dirs), sorted_files, tuple(missing_dirs or []))
 
 
 def iter_video_files(root: Path, excluded_roots: tuple[Path, ...]) -> Iterable[Path]:

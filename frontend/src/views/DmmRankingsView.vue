@@ -1,5 +1,5 @@
 <template>
-  <section class="rankings-view">
+  <section class="rankings-view" @click="closeMenus">
     <PageHeader
       kicker="订阅管理"
       title="DMM/FANZA 榜单"
@@ -48,7 +48,6 @@
 
       <div v-else-if="activeKind === 'actress'" class="actress-grid">
         <BaseCard v-for="item in items" :key="`${item.rank}-${item.name}`" as="article" class="actress-card" padding="none">
-          <div class="rank-badge">{{ item.rank }}</div>
           <button class="actress-cover" type="button" @click="openActress(item)">
             <img v-if="item.cover" :src="actressCoverUrl(item)" alt="" loading="lazy">
             <span v-else>暂无头像</span>
@@ -62,8 +61,8 @@
             <p class="latest-date">{{ item.latest_release_date || item.latest_date || '未知日期' }}</p>
             <div class="card-actions">
               <BaseButton type="button" @click="openActress(item)">查看作品</BaseButton>
-              <BaseButton variant="primary" type="button" :disabled="busyActress === item.name" @click="subscribeActress(item)">
-                {{ busyActress === item.name ? '订阅中' : '订阅女优' }}
+              <BaseButton variant="primary" type="button" :disabled="busyActress === item.name || isActressSubscribed(item)" @click="subscribeActress(item)">
+                {{ actressSubscribeLabel(item) }}
               </BaseButton>
             </div>
           </div>
@@ -83,11 +82,20 @@
           @actor="openActress"
         >
           <template #menu>
-            <span class="rank-badge">{{ item.rank }}</span>
+            <div class="more-menu" @click.stop>
+              <button class="more-trigger" type="button" aria-label="更多操作" @click.stop="toggleMovieMenu(item)">
+                <span></span><span></span><span></span>
+              </button>
+              <div v-if="movieMenuId === movieKey(item)" class="more-panel" @click.stop>
+                <button type="button" @click="openSubscribe(item, true)">重新订阅</button>
+              </div>
+            </div>
           </template>
           <template #actions>
             <BaseButton type="button" @click.stop="openDetail(item)">详情</BaseButton>
-            <BaseButton variant="primary" type="button" @click.stop="openSubscribe(item)">订阅</BaseButton>
+            <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
+              {{ movieSubscribeLabel(item) }}
+            </BaseButton>
           </template>
         </SubscriptionMovieCard>
       </div>
@@ -116,13 +124,14 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { useQueryClient } from '@tanstack/vue-query'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
+import { avSubscribeLabel, isActressSubscribed as findActressSubscribed, normalizeAvId, subscribedAv as findSubscribedAv } from '../lib/subscriptionStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -145,6 +154,21 @@ const detailItem = ref(null)
 const subscribeItem = ref(null)
 const submitting = ref(false)
 const busyActress = ref('')
+const movieMenuId = ref('')
+
+const avQuery = useQuery({
+  queryKey: ['subscriptions', 'av'],
+  queryFn: () => api('/api/subscriptions/av'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
+
+const actressQuery = useQuery({
+  queryKey: ['subscriptions', 'actress'],
+  queryFn: () => api('/api/subscriptions/actress'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
 
 const activeConfig = computed(() => tabs.find((tab) => tab.key === activeTab.value) || tabs[0])
 const activeKind = computed(() => activeConfig.value.kind)
@@ -223,12 +247,52 @@ function normalizedActresses(item) {
   }).filter((actor) => actor.name)
 }
 
+function movieKey(item) {
+  return normalizeAvId(item?.id || item?.code || item?.url || '')
+}
+
+function subscribedAv(item) {
+  const rows = Array.isArray(avQuery.data.value?.subscriptions) ? avQuery.data.value.subscriptions : []
+  return findSubscribedAv(item, rows)
+}
+
+function isMovieSubscribed(item) {
+  return !!subscribedAv(item)
+}
+
+function movieSubscribeLabel(item) {
+  const rows = Array.isArray(avQuery.data.value?.subscriptions) ? avQuery.data.value.subscriptions : []
+  return avSubscribeLabel(item, rows)
+}
+
+function isActressSubscribed(item) {
+  const rows = Array.isArray(actressQuery.data.value?.subscriptions) ? actressQuery.data.value.subscriptions : []
+  return findActressSubscribed(item, rows)
+}
+
+function actressSubscribeLabel(item) {
+  const name = item?.name || item?.dmm_name || item?.id
+  if (busyActress.value === name) return '订阅中'
+  return isActressSubscribed(item) ? '已订阅' : '订阅女优'
+}
+
 function openDetail(item) {
   detailItem.value = item
 }
 
-function openSubscribe(item) {
+function openSubscribe(item, force = false) {
+  if (!force && isMovieSubscribed(item)) return
+  closeMenus()
   subscribeItem.value = item
+}
+
+function toggleMovieMenu(item) {
+  const key = movieKey(item)
+  movieMenuId.value = movieMenuId.value === key ? '' : key
+}
+
+function closeMenus() {
+  movieMenuId.value = ''
 }
 
 function openActress(item) {
@@ -257,6 +321,7 @@ async function confirmSubscribe(filters) {
       subscription_mode: filters.subscription_mode
     })
     updateSubscriptionCache('av', payload.subscription)
+    await avQuery.refetch()
     successMessage.value = `${subscribeItem.value.id} 已加入订阅`
     subscribeItem.value = null
   } catch (error) {
@@ -288,6 +353,7 @@ async function subscribeActress(item) {
       include_vr: false
     })
     updateSubscriptionCache('actress', payload.subscription)
+    await actressQuery.refetch()
     successMessage.value = `${name} 已加入女优订阅，后台扫描已入队`
   } catch (error) {
     errorMessage.value = error.message || '订阅女优失败'
@@ -376,39 +442,19 @@ function formatTime(value) {
 
 .movie-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 16px;
 }
 
 .actress-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 16px;
 }
 
 .actress-card {
   position: relative;
   overflow: hidden;
-}
-
-.rank-badge {
-  display: inline-grid;
-  place-items: center;
-  min-width: 34px;
-  height: 28px;
-  padding: 0 10px;
-  border-radius: 999px;
-  background: var(--mm-primary);
-  color: #fff;
-  font-weight: 650;
-  box-shadow: 0 8px 22px rgba(255, 56, 92, .18);
-}
-
-.actress-card > .rank-badge {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 2;
 }
 
 .actress-cover {
@@ -479,6 +525,62 @@ function formatTime(value) {
   margin-top: 4px;
 }
 
+.more-menu {
+  position: relative;
+}
+
+.more-trigger {
+  display: grid;
+  grid-template-columns: repeat(3, 4px);
+  gap: 3px;
+  place-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  appearance: none;
+  cursor: pointer;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, .42));
+}
+
+.more-trigger span {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: #fff;
+}
+
+.more-panel {
+  position: absolute;
+  top: 40px;
+  right: 0;
+  z-index: 10;
+  min-width: 124px;
+  padding: 6px;
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius-sm);
+  background: var(--mm-card-bg);
+  box-shadow: var(--mm-shadow-md);
+}
+
+.more-panel button {
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  border-radius: var(--mm-radius-sm);
+  background: transparent;
+  color: var(--mm-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.more-panel button:hover {
+  background: var(--mm-primary-soft);
+  color: var(--mm-primary);
+}
+
 .empty {
   padding: 48px;
   color: var(--mm-muted);
@@ -488,7 +590,7 @@ function formatTime(value) {
 @media (max-width: 1500px) {
   .movie-grid,
   .actress-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 }
 

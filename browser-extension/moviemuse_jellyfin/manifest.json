@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "moviemuse_jellyfin",
+  "version": "0.1.0",
+  "description": "在 Jellyfin 媒体详情页发送字幕和转码任务到 MovieMuse。",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": [
+    "http://127.0.0.1:18183/*",
+    "http://localhost:18183/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "moviemuse_jellyfin",
+    "default_popup": "popup.html"
+  }
+}

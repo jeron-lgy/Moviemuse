@@ -590,9 +590,106 @@ class PostprocessFlowTest(unittest.TestCase):
         config = self.main.postprocess_qb_config({"tags": "custom,jav"})
         tags = {item.strip().lower() for item in str(config["tags"]).split(",") if item.strip()}
 
-        self.assertEqual(config["save_path"], str(self.root / "downloads"))
+        self.assertEqual(Path(config["save_path"]), self.root / "downloads")
         self.assertEqual(config["category"], "study3")
         self.assertEqual(tags, {"custom", "jav", "moviemuse", "auto-postprocess"})
+
+    def test_poll_qb_adopts_external_tagged_torrent(self) -> None:
+        post = self.main.get_postprocess_service()
+        post.update_settings(
+            {
+                "external_qb_adopt_enabled": True,
+                "download_dir": str(self.root / "downloads"),
+                "allowed_categories": ["study3"],
+                "required_tags": ["moviemuse"],
+                "target_codec": "av1",
+            }
+        )
+
+        class FakeResponse:
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+            def json(self) -> object:
+                return self.payload
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class FakeClient:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            def __enter__(self) -> "FakeClient":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def get(self, url: str, params: dict[str, str] | None = None) -> FakeResponse:
+                if url.endswith("/api/v2/torrents/info"):
+                    return FakeResponse([
+                        {
+                            "hash": "external-hash",
+                            "name": "ABF-359.mp4",
+                            "progress": 0.42,
+                            "state": "downloading",
+                            "content_path": str(self_path / "downloads" / "ABF-359.mp4"),
+                            "save_path": str(self_path / "downloads"),
+                            "category": "study3",
+                            "tags": "moviemuse",
+                            "size": 1234,
+                        }
+                    ])
+                return FakeResponse([])
+
+            def post(self, url: str, data: dict[str, str] | None = None) -> FakeResponse:
+                return FakeResponse("Ok.")
+
+        self_path = self.root
+        self.main.get_system_settings_service().update({"qbittorrent": {"url": "http://qb"}})
+        original_client = self.main.httpx.Client
+        self.main.httpx.Client = FakeClient
+        try:
+            result = self.main.poll_qb_postprocess_once()
+        finally:
+            self.main.httpx.Client = original_client
+
+        task = post.list_tasks(limit=10)[0]
+        qb_row = post.get_qb_torrent("external-hash")
+        self.assertEqual(result["adoption"]["adopted"], 1)
+        self.assertEqual(task["av_id"], "ABF-359")
+        self.assertEqual(task["task_type"], "external_qb")
+        self.assertEqual(task["status"], "downloading")
+        self.assertEqual(qb_row["task_id"], task["id"])
+        self.assertEqual(qb_row["status"], "downloading")
+
+    def test_external_qb_task_keeps_source_file_after_completion(self) -> None:
+        post = self.main.get_postprocess_service()
+        download_dir = self.root / "downloads"
+        output_dir = self.root / "output"
+        input_path = download_dir / "ABF-359.mp4"
+        make_sample_video(input_path)
+        post.update_settings(
+            {
+                "auto_transcode_enabled": False,
+                "auto_subtitle_enabled": False,
+                "download_dir": str(download_dir),
+                "output_dir": str(output_dir),
+            }
+        )
+        task = post.create_task(av_id="ABF-359", task_type="external_qb", status="ready_to_run")
+        post.update_task(task["id"], input_path=str(input_path))
+
+        result = self.main.validate_and_activate_postprocess_task(task["id"])
+
+        completed = post.get_task(task["id"])
+        events = post.list_events(task["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(input_path.exists())
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["data"]["source_trash"]["status"], "skipped")
+        self.assertTrue(any(event["stage"] == "source_trashing_skipped" for event in events))
 
     def test_postprocess_cancel_syncs_wash_subscription(self) -> None:
         service = self.main.get_subscription_service()

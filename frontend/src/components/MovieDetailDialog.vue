@@ -15,8 +15,8 @@
             <h2>{{ movieTitle }}</h2>
 
             <div class="detail-actions">
-              <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', mergedItem)">
-                订阅番号
+              <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(mergedItem)" @click.stop="emit('subscribe-av', mergedItem)">
+                {{ movieSubscribeLabel(mergedItem) }}
               </BaseButton>
               <BaseButton
                 v-if="primaryActor"
@@ -133,7 +133,9 @@
             >
               <template #actions>
                 <BaseButton type="button" @click.stop="emit('recommend', movie)">详情</BaseButton>
-                <BaseButton variant="primary" type="button" @click.stop="emit('subscribe-av', movie)">订阅</BaseButton>
+                <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(movie)" @click.stop="emit('subscribe-av', movie)">
+                  {{ movieSubscribeLabel(movie) }}
+                </BaseButton>
               </template>
             </SubscriptionMovieCard>
           </div>
@@ -166,9 +168,10 @@
 
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
-import { useQueryClient } from '@tanstack/vue-query'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl, mediaProxyUrl } from '../lib/images'
+import { avSubscribeLabel, normalizeAvId, subscribedAv as findSubscribedAv } from '../lib/subscriptionStatus'
 import SubscriptionMovieCard from './SubscriptionMovieCard.vue'
 import { BaseButton, BaseCard, BaseSwitch, NoticeBanner } from './ui'
 
@@ -181,6 +184,20 @@ const props = defineProps({
 
 const emit = defineEmits(['close', 'subscribe-av', 'actor', 'maker', 'recommend'])
 const queryClient = useQueryClient()
+
+const avQuery = useQuery({
+  queryKey: ['subscriptions', 'av'],
+  queryFn: () => api('/api/subscriptions/av'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
+
+const actressQuery = useQuery({
+  queryKey: ['subscriptions', 'actress'],
+  queryFn: () => api('/api/subscriptions/actress'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
 
 const detail = ref({})
 const loading = ref(false)
@@ -284,6 +301,32 @@ function actorKey(actor) {
   return actor.id || actor.url || actor.name
 }
 
+function movieKey(item) {
+  return normalizeAvId(item?.id || item?.code || '')
+}
+
+function subscribedAv(item) {
+  const target = movieKey(item)
+  if (!target) return null
+  const current = queryClient.getQueryData(['subscriptions', 'av'])
+  const rows = Array.isArray(avQuery.data.value?.subscriptions)
+    ? avQuery.data.value.subscriptions
+    : (Array.isArray(current?.subscriptions) ? current.subscriptions : [])
+  return findSubscribedAv(item, rows)
+}
+
+function isMovieSubscribed(item) {
+  return !!subscribedAv(item)
+}
+
+function movieSubscribeLabel(item) {
+  const current = queryClient.getQueryData(['subscriptions', 'av'])
+  const rows = Array.isArray(avQuery.data.value?.subscriptions)
+    ? avQuery.data.value.subscriptions
+    : (Array.isArray(current?.subscriptions) ? current.subscriptions : [])
+  return avSubscribeLabel(item, rows, '订阅番号')
+}
+
 function actorIdentityKeys(actor) {
   const keys = new Set()
   const add = (value) => {
@@ -305,7 +348,9 @@ function isActorSubscribed(actor) {
     if (known.has(key)) return true
   }
   const current = queryClient.getQueryData(['subscriptions', 'actress'])
-  const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+  const rows = Array.isArray(actressQuery.data.value?.subscriptions)
+    ? actressQuery.data.value.subscriptions
+    : (Array.isArray(current?.subscriptions) ? current.subscriptions : [])
   return rows.some((row) => {
     for (const key of actorIdentityKeys(row)) {
       if (actorIdentityKeys(actor).has(key)) return true

@@ -18,6 +18,7 @@ DEFAULT_POSTPROCESS_SETTINGS: dict[str, Any] = {
     "auto_transcode_enabled": False,
     "auto_subtitle_enabled": False,
     "worker_auto_run": False,
+    "external_qb_adopt_enabled": False,
     "download_dir": str(Path(os.getenv("POSTPROCESS_DOWNLOAD_DIR", "/media/study3"))),
     "output_dir": str(Path(os.getenv("POSTPROCESS_OUTPUT_DIR", "/media/压制"))),
     "target_codec": "av1",
@@ -667,6 +668,7 @@ def normalize_postprocess_settings(raw: dict[str, Any]) -> dict[str, Any]:
     result["auto_transcode_enabled"] = bool(result.get("auto_transcode_enabled"))
     result["auto_subtitle_enabled"] = bool(result.get("auto_subtitle_enabled"))
     result["worker_auto_run"] = bool(result.get("worker_auto_run"))
+    result["external_qb_adopt_enabled"] = bool(result.get("external_qb_adopt_enabled"))
     result["ffmpeg_mode"] = str(result.get("ffmpeg_mode") or "").strip().lower()
     if result["ffmpeg_mode"] not in {"standard", "custom"}:
         result["ffmpeg_mode"] = "custom" if bool(result.get("ffmpeg_custom_enabled")) else "standard"

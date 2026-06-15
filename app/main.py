@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .log_service import AppLogService
-from .scanner import ScanResult, scan_libraries
+from .scanner import ScanResult, detect_catalog_number, scan_libraries
 from .scan_state import scan_cache
 from .storage import MoveRequest, MoveResult, Storage
 from .mteam_service import download_mteam_torrent, search_mteam
@@ -614,6 +614,7 @@ CONSOLE_AUTH_OPEN_PREFIXES = (
     "/api/subtitle",
     "/api/transcode",
     "/api/compute",
+    "/api/integrations",
     "/static",
     "/assets",
     "/docs",
@@ -783,6 +784,14 @@ class SubtitleJobCreate(BaseModel):
     model: str | None = Field(default=None, description="Whisper 模型，例如 large-v3、medium")
     translate: bool = True
     translate_backend: str = "google"
+
+
+class JellyfinIntegrationRequest(BaseModel):
+    item_id: str = Field(default="", description="Jellyfin 媒体 item id")
+    media_source_id: str = Field(default="", description="Jellyfin MediaSource id；为空使用第一个带路径的 source")
+    title: str = Field(default="", description="当前页面标题，作为任务名回退")
+    path: str = Field(default="", description="可选直接传入的媒体路径；正常由后端向 Jellyfin 查询")
+    target_codec: str | None = Field(default=None, description="转码目标编码；为空使用后处理设置")
 
 
 def get_subtitle_service() -> SubtitleService:
@@ -1987,14 +1996,20 @@ def api_scan() -> dict[str, object]:
     scan_cache.configure(data_dir)
     snapshot = scan_cache.snapshot()
     result = snapshot.result or ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple())
+    duplicate_group_keys = {group.key for group in result.groups}
     return {
         "status": snapshot.status,
+        "mode": snapshot.mode,
         "started_at": snapshot.started_at,
         "finished_at": snapshot.finished_at,
         "error": snapshot.error,
         "progress": snapshot.progress,
         "processed_files": snapshot.processed_files,
         "scan_total_files": snapshot.total_files,
+        "reused_files": snapshot.reused_files,
+        "changed_files": snapshot.changed_files,
+        "missing_files": snapshot.missing_files,
+        "changed_paths": list(snapshot.changed_paths),
         "current_path": snapshot.current_path,
         "active_scan_dirs": [str(path) for path in snapshot.scanned_dirs],
         "selectable_scan_dirs": [str(path) for path in selectable_scan_dirs(media_dirs, [trash_dir])],
@@ -2008,29 +2023,38 @@ def api_scan() -> dict[str, object]:
         "single_files": [
             scan_file_payload(file)
             for file in result.files
-            if file.group_key not in {group.key for group in result.groups}
+            if file.group_key not in duplicate_group_keys
         ],
     }
 
 
 @app.post("/api/scan/run")
-def api_scan_run(paths: list[str] = Form(default=[])) -> dict[str, object]:
+def api_scan_run(paths: list[str] = Form(default=[]), mode: str = Form(default="incremental")) -> dict[str, object]:
     media_dirs, trash_dir, data_dir = settings()
     scan_cache.configure(data_dir)
     scan_dirs = selected_scan_dirs(media_dirs, paths, [trash_dir])
     if not scan_dirs:
         raise HTTPException(status_code=400, detail="请至少选择一个媒体子目录")
-    started = scan_cache.start(scan_dirs, force=True, excluded_dirs=[trash_dir], completion_callback=notify_scan_completed)
-    return {"status": "running", "started": started, "scan_dirs": [str(path) for path in scan_dirs]}
+    scan_mode = "full" if mode == "full" else "incremental"
+    started = scan_cache.start(scan_dirs, force=False, mode=scan_mode, excluded_dirs=[trash_dir], completion_callback=notify_scan_completed)
+    if not started:
+        raise HTTPException(status_code=409, detail="已有扫描任务在运行")
+    return {"status": "running", "started": started, "mode": scan_mode, "scan_dirs": [str(path) for path in scan_dirs]}
 
 
 @app.post("/scan/run")
-def scan_run(paths: list[str] = Form(default=[])) -> RedirectResponse:
+def scan_run(paths: list[str] = Form(default=[]), mode: str = Form(default="incremental")) -> RedirectResponse:
     media_dirs, trash_dir, data_dir = settings()
     scan_cache.configure(data_dir)
     scan_dirs = selected_scan_dirs(media_dirs, paths, [trash_dir])
     if scan_dirs:
-        scan_cache.start(scan_dirs, force=True, excluded_dirs=[trash_dir], completion_callback=notify_scan_completed)
+        scan_cache.start(
+            scan_dirs,
+            force=False,
+            mode="full" if mode == "full" else "incremental",
+            excluded_dirs=[trash_dir],
+            completion_callback=notify_scan_completed,
+        )
     return RedirectResponse("/", status_code=303)
 
 
@@ -6973,10 +6997,171 @@ QB_DONE_STATES = {"completed", "uploading", "stalledUP", "pausedUP", "forcedUP",
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts"}
 
 
+def qb_tags_text(value: Any) -> str:
+    if isinstance(value, list):
+        return ",".join(str(part).strip() for part in value if str(part).strip())
+    return str(value or "").strip()
+
+
+def qb_tag_set(value: Any) -> set[str]:
+    return {item.strip().lower() for item in qb_tags_text(value).split(",") if item.strip()}
+
+
+def qb_torrent_hash(item: dict[str, Any]) -> str:
+    for key in ("hash", "infohash_v1", "infohash_v2"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def infer_external_qb_av_id(item: dict[str, Any], files: list[dict[str, Any]] | None = None) -> str:
+    candidates = [
+        item.get("name", ""),
+        item.get("content_path", ""),
+        item.get("save_path", ""),
+    ]
+    for file_item in files or []:
+        candidates.append(file_item.get("name", ""))
+    for candidate in candidates:
+        detected = detect_catalog_number(str(candidate or ""))
+        if detected:
+            return detected.upper()
+    return ""
+
+
+def external_qb_adoption_match(item: dict[str, Any], post_settings: dict[str, Any]) -> dict[str, Any]:
+    category = str(item.get("category") or "").strip()
+    tags = qb_tag_set(item.get("tags", ""))
+    allowed_categories = {str(item).strip().lower() for item in post_settings.get("allowed_categories") or [] if str(item).strip()}
+    required_tags = {str(item).strip().lower() for item in post_settings.get("required_tags") or [] if str(item).strip()}
+    if not allowed_categories and not required_tags:
+        return {"ok": False, "reason": "未配置 qB 接管分类或标签，拒绝扫描外部种子"}
+    if allowed_categories and category.lower() not in allowed_categories:
+        return {"ok": False, "reason": f"qB 分类 {category} 不在接管范围", "category": category}
+    missing_tags = sorted(required_tags - tags)
+    if missing_tags:
+        return {"ok": False, "reason": f"qB 标签缺失: {', '.join(missing_tags)}", "tags": sorted(tags)}
+    return {"ok": True, "category": category, "tags": sorted(tags)}
+
+
+def adopt_external_qb_torrents(qb_config: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(qb_config.get("url") or "").strip().rstrip("/")
+    if not base_url:
+        return {"status": "skipped", "reason": "未配置 qBittorrent Web UI 地址", "adopted": 0}
+    post = get_postprocess_service()
+    post_settings = post.get_settings()
+    if not bool(post_settings.get("external_qb_adopt_enabled")):
+        return {"status": "disabled", "adopted": 0}
+
+    def operation(client: httpx.Client, _auth_method: str) -> dict[str, Any]:
+        response = client.get(f"{base_url}/api/v2/torrents/info")
+        response.raise_for_status()
+        items = response.json()
+        if not isinstance(items, list):
+            items = []
+        adopted: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+            torrent_hash = qb_torrent_hash(raw_item)
+            name = str(raw_item.get("name") or "")
+            if not torrent_hash:
+                skipped.append({"name": name, "reason": "missing_hash"})
+                continue
+            if post.get_qb_torrent(torrent_hash):
+                skipped.append({"torrent_hash": torrent_hash, "name": name, "reason": "already_bound"})
+                continue
+            match = external_qb_adoption_match(raw_item, post_settings)
+            if not match.get("ok"):
+                skipped.append({"torrent_hash": torrent_hash, "name": name, "reason": match.get("reason", "")})
+                continue
+            files: list[dict[str, Any]] = []
+            av_id = infer_external_qb_av_id(raw_item)
+            if not av_id:
+                files = qb_torrent_files(client, base_url, torrent_hash)
+                av_id = infer_external_qb_av_id(raw_item, files)
+            if not av_id:
+                skipped.append({"torrent_hash": torrent_hash, "name": name, "reason": "missing_av_id"})
+                continue
+            category = str(raw_item.get("category") or "")
+            tags = qb_tags_text(raw_item.get("tags", ""))
+            save_path = str(raw_item.get("save_path") or "")
+            content_path = str(raw_item.get("content_path") or save_path)
+            progress = float(raw_item.get("progress") or 0)
+            state = str(raw_item.get("state") or "")
+            size = int(raw_item.get("size") or raw_item.get("total_size") or 0)
+            task = post.create_task(
+                av_id=av_id,
+                task_type="external_qb",
+                status="torrent_pushed",
+                target_codec=str(post_settings.get("target_codec") or "av1"),
+                needs_subtitle=bool(post_settings.get("auto_subtitle_enabled")),
+                data={
+                    "source": "external_qb",
+                    "qb_name": name,
+                    "external_qb_hash": torrent_hash,
+                    "source_cleanup": "keep",
+                    "files_preview": files[:20],
+                },
+            )
+            post.bind_qb_torrent(
+                task_id=task["id"],
+                av_id=av_id,
+                torrent_hash=torrent_hash,
+                category=category,
+                tags=tags,
+                save_path=save_path,
+                status="torrent_pushed",
+                data={
+                    "source": "external_qb",
+                    "qb_name": name,
+                    "content_path": content_path,
+                    "progress": progress,
+                    "state": state,
+                    "size": size,
+                },
+            )
+            post.update_qb_torrent(
+                torrent_hash,
+                category=category,
+                tags=tags,
+                save_path=save_path,
+                content_path=content_path,
+                progress=progress,
+                state=state,
+                data={"source": "external_qb", "qb_name": name},
+            )
+            post.add_event(task["id"], "info", "external_qb_adopted", "外部 qB 种子已接管到后处理队列", {
+                "torrent_hash": torrent_hash,
+                "av_id": av_id,
+                "category": category,
+                "tags": tags,
+                "save_path": save_path,
+                "content_path": content_path,
+                "source_cleanup": "keep",
+            })
+            adopted.append({"task_id": task["id"], "av_id": av_id, "torrent_hash": torrent_hash, "name": name})
+        return {"status": "ok", "checked": len(items), "adopted": len(adopted), "items": adopted, "skipped": skipped[:20]}
+
+    return with_qbittorrent_client(base_url, qb_config, operation, timeout=30)
+
+
 def poll_qb_postprocess_once() -> dict[str, Any]:
     post = get_postprocess_service()
     settings_data = get_system_settings_service().get()
     qb_config = settings_data.get("qbittorrent", {})
+    adoption: dict[str, Any] = {"status": "disabled", "adopted": 0}
+    if bool(post.get_settings().get("external_qb_adopt_enabled")):
+        try:
+            adoption = adopt_external_qb_torrents(qb_config)
+        except Exception as exc:
+            adoption = {"status": "error", "message": str(exc), "adopted": 0}
+            app_log("error", "qbittorrent", "外部 qB 种子接管扫描失败", {
+                "stage": "external_qb_adopt_failed",
+                "error": str(exc),
+            })
     pending = post.list_qb_torrents(statuses=["torrent_pushed", "downloading"], limit=200)
     results: list[dict[str, Any]] = []
     for row in pending:
@@ -6990,7 +7175,7 @@ def poll_qb_postprocess_once() -> dict[str, Any]:
             post.update_task(task["id"], status="failed", error_code="qb_poll_failed", error_message=str(exc))
             post.add_event(task["id"], "error", "qb_poll_failed", "qB 下载状态轮询失败", {"error": str(exc)})
             results.append({"torrent_hash": row.get("torrent_hash", ""), "status": "error", "message": str(exc)})
-    return {"checked": len(pending), "results": results}
+    return {"checked": len(pending), "adoption": adoption, "results": results}
 
 
 def refresh_qb_torrent_status(row: dict[str, Any], task: dict[str, Any], qb_config: dict[str, Any]) -> dict[str, Any]:
@@ -8220,18 +8405,26 @@ def validate_and_activate_postprocess_task(
             post.add_event(task_id, "error", "old_version_trashing", "旧 active version 移动到 trash 失败，新版本保持激活", old_version_trash_failure)
     source_trash_payload: dict[str, Any] | None = None
     source_trash_failure: dict[str, Any] | None = None
-    try:
-        source_trash_payload = move_postprocess_source_to_trash(task, product_path, settings_payload)
-        if source_trash_payload:
-            post.add_event(task_id, "info", "source_trashing", "后处理源文件已移动到 trash", source_trash_payload)
-    except Exception as exc:
-        source_trash_failure = {
-            "error_code": "source_trash_failed",
-            "message": str(exc),
+    if source_type == "external_qb":
+        source_trash_payload = {
+            "status": "skipped",
+            "reason": "外部 qB 接管任务默认保留源文件，避免影响做种",
             "input_path": task.get("input_path", ""),
         }
-        source_trash_payload = {"status": "failed", **source_trash_failure}
-        post.add_event(task_id, "error", "source_trashing", "后处理源文件移动到 trash 失败，版本保持激活", source_trash_failure)
+        post.add_event(task_id, "info", "source_trashing_skipped", "外部 qB 接管任务已跳过源文件清理", source_trash_payload)
+    else:
+        try:
+            source_trash_payload = move_postprocess_source_to_trash(task, product_path, settings_payload)
+            if source_trash_payload:
+                post.add_event(task_id, "info", "source_trashing", "后处理源文件已移动到 trash", source_trash_payload)
+        except Exception as exc:
+            source_trash_failure = {
+                "error_code": "source_trash_failed",
+                "message": str(exc),
+                "input_path": task.get("input_path", ""),
+            }
+            source_trash_payload = {"status": "failed", **source_trash_failure}
+            post.add_event(task_id, "error", "source_trashing", "后处理源文件移动到 trash 失败，版本保持激活", source_trash_failure)
     post.update_task(task_id, status="jellyfin_refreshing", output_path=product_path, error_code="", error_message="", data={"version_id": version["id"], "activation": activation})
     jellyfin_refresh = refresh_jellyfin_library(get_system_settings_service().get().get("jellyfin", {}))
     post.add_event(
@@ -8635,6 +8828,222 @@ def get_jellyfin_user_id(config: dict[str, Any]) -> str:
     except (httpx.HTTPError, ValueError):
         return ""
     return ""
+
+
+def jellyfin_config() -> dict[str, Any]:
+    settings_data = get_system_settings_service().get()
+    config = settings_data.get("jellyfin", {})
+    return config if isinstance(config, dict) else {}
+
+
+def jellyfin_auth_headers(config: dict[str, Any]) -> dict[str, str]:
+    api_key = str(config.get("api_key") or "").strip()
+    return {"X-Emby-Token": api_key} if api_key else {}
+
+
+def jellyfin_media_source(item: dict[str, Any], media_source_id: str = "") -> dict[str, Any]:
+    sources = item.get("MediaSources") if isinstance(item.get("MediaSources"), list) else []
+    wanted = str(media_source_id or "").strip()
+    if wanted:
+        for source in sources:
+            if isinstance(source, dict) and str(source.get("Id") or "") == wanted:
+                return source
+    for source in sources:
+        if isinstance(source, dict) and str(source.get("Path") or "").strip():
+            return source
+    return sources[0] if sources and isinstance(sources[0], dict) else {}
+
+
+def jellyfin_source_resolution(source: dict[str, Any]) -> str:
+    streams = source.get("MediaStreams") if isinstance(source.get("MediaStreams"), list) else []
+    video = next((item for item in streams if isinstance(item, dict) and str(item.get("Type") or "").lower() == "video"), {})
+    width = int(video.get("Width") or source.get("Width") or 0) if isinstance(video, dict) else int(source.get("Width") or 0)
+    height = int(video.get("Height") or source.get("Height") or 0) if isinstance(video, dict) else int(source.get("Height") or 0)
+    if width and height:
+        return f"{width}x{height}"
+    return ""
+
+
+def fetch_jellyfin_item(item_id: str, config: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(config.get("url") or "").strip().rstrip("/")
+    api_key = str(config.get("api_key") or "").strip()
+    clean_item_id = str(item_id or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="未配置 Jellyfin 地址")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="未配置 Jellyfin API Key")
+    if not clean_item_id:
+        raise HTTPException(status_code=400, detail="缺少 Jellyfin item id")
+    user_id = get_jellyfin_user_id(config)
+    paths = [f"/Users/{user_id}/Items/{clean_item_id}"] if user_id else []
+    paths.append(f"/Items/{clean_item_id}")
+    params = {"Fields": "Path,MediaSources,MediaStreams,ProviderIds,Overview"}
+    last_error = ""
+    with httpx.Client(timeout=12, follow_redirects=True) as client:
+        for path in paths:
+            try:
+                response = client.get(f"{base_url}{path}", headers=jellyfin_auth_headers(config), params=params)
+                if response.status_code == 404:
+                    last_error = "Jellyfin 未找到该媒体"
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict):
+                    return data
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                if status_code == 401:
+                    raise HTTPException(status_code=502, detail="Jellyfin API Key 未授权或已失效") from exc
+                last_error = f"Jellyfin 返回 HTTP {status_code}"
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = str(exc)
+    raise HTTPException(status_code=404, detail=last_error or "Jellyfin 媒体解析失败")
+
+
+def jellyfin_subscription_match(payload: JellyfinIntegrationRequest) -> dict[str, Any] | None:
+    item_id = str(payload.item_id or "").strip()
+    title = str(payload.title or "").strip()
+    path = str(payload.path or "").strip()
+    detected_av_id = canonical_av_id(detect_catalog_number(title or path))
+    for av in get_subscription_service().get_subscribed_av():
+        av_id = canonical_av_id(av.get("id") or "")
+        jellyfin_item_id = str(av.get("jellyfin_item_id") or "").strip()
+        jellyfin_path = str(av.get("jellyfin_path") or "").strip()
+        wash = av.get("wash") if isinstance(av.get("wash"), dict) else {}
+        wash_item_id = str(wash.get("new_jellyfin_item_id") or "").strip()
+        wash_path = str(wash.get("new_path") or "").strip()
+        matched_by = ""
+        if item_id and item_id in {jellyfin_item_id, wash_item_id}:
+            matched_by = "item_id"
+        elif path and any(normalize_media_path(path) == normalize_media_path(candidate) for candidate in (jellyfin_path, wash_path) if candidate):
+            matched_by = "path"
+        elif detected_av_id and detected_av_id == av_id and jellyfin_path:
+            matched_by = "av_id"
+        if not matched_by:
+            continue
+        resolved_path = wash_path if item_id and item_id == wash_item_id and wash_path else jellyfin_path or wash_path
+        if not resolved_path:
+            continue
+        return {
+            "status": "ok",
+            "source": "subscription_db",
+            "matched_by": matched_by,
+            "item_id": jellyfin_item_id or wash_item_id or item_id,
+            "media_source_id": str(payload.media_source_id or ""),
+            "title": str(av.get("title") or payload.title or Path(resolved_path).stem),
+            "path": resolved_path,
+            "size": 0,
+            "resolution": "",
+            "type": "Movie",
+            "av_id": av_id,
+            "library_status": str(av.get("library_status") or av.get("status") or ""),
+        }
+    return None
+
+
+def resolve_jellyfin_media(payload: JellyfinIntegrationRequest) -> dict[str, Any]:
+    config = jellyfin_config()
+    direct_path = str(payload.path or "").strip()
+    if direct_path:
+        title = str(payload.title or Path(direct_path).stem).strip()
+        return {
+            "status": "ok",
+            "source": "provided_path",
+            "item_id": str(payload.item_id or ""),
+            "media_source_id": str(payload.media_source_id or ""),
+            "title": title,
+            "path": direct_path,
+            "size": 0,
+            "resolution": "",
+        }
+
+    subscription_match = jellyfin_subscription_match(payload)
+    if subscription_match:
+        return subscription_match
+
+    item = fetch_jellyfin_item(payload.item_id, config)
+    source = jellyfin_media_source(item, payload.media_source_id)
+    path = str(source.get("Path") or item.get("Path") or "").strip()
+    title = str(payload.title or item.get("Name") or item.get("OriginalTitle") or "").strip()
+    if not path:
+        raise HTTPException(status_code=404, detail="Jellyfin 返回的媒体没有可用文件路径")
+    return {
+        "status": "ok",
+        "source": "jellyfin",
+        "item_id": str(item.get("Id") or payload.item_id or ""),
+        "media_source_id": str(source.get("Id") or payload.media_source_id or ""),
+        "title": title or Path(path).stem,
+        "path": path,
+        "size": int(source.get("Size") or 0),
+        "resolution": jellyfin_source_resolution(source),
+        "type": str(item.get("Type") or ""),
+    }
+
+
+def jellyfin_task_av_id(resolved: dict[str, Any]) -> str:
+    for candidate in (resolved.get("title"), resolved.get("path")):
+        detected = detect_catalog_number(str(candidate or ""))
+        if detected:
+            return canonical_av_id(detected)
+    item_id = re.sub(r"[^A-Za-z0-9]+", "", str(resolved.get("item_id") or ""))[:12].upper()
+    return f"JELLYFIN-{item_id or uuid.uuid4().hex[:8].upper()}"
+
+
+def submit_jellyfin_transcode_job(resolved: dict[str, Any], target_codec: str | None = None) -> dict[str, object]:
+    path = str(resolved.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="缺少媒体文件路径")
+    post_settings = get_postprocess_service().get_settings()
+    av_id = jellyfin_task_av_id(resolved)
+    transcode_settings = normalize_transcode_settings_payload({
+        **post_settings,
+        "target_codec": target_codec or post_settings.get("target_codec"),
+    })
+    task_like = {
+        "id": uuid.uuid4().hex,
+        "av_id": av_id,
+        "task_type": "jellyfin",
+        "input_path": path,
+    }
+    output_path = avoid_output_conflict(build_postprocess_output_path(task_like, post_settings), str(task_like["id"]))
+    job_payload_data = {
+        "task_id": str(task_like["id"]),
+        "av_id": av_id,
+        "input_path": rewrite_proxy_path(path) if backend_url() else path,
+        "output_path": rewrite_proxy_path(output_path) if backend_url() else output_path,
+        "console_input_path": path,
+        "console_output_path": output_path,
+        "target_codec": transcode_settings.get("target_codec"),
+        "target_encoder": transcode_settings.get("target_encoder"),
+        "crf": transcode_settings.get("crf"),
+        "preset": transcode_settings.get("preset"),
+        "preset_flag": transcode_settings.get("preset_flag"),
+        "ffmpeg_mode": transcode_settings.get("ffmpeg_mode"),
+        "ffmpeg_standard_enabled": transcode_settings.get("ffmpeg_standard_enabled"),
+        "ffmpeg_custom_enabled": transcode_settings.get("ffmpeg_custom_enabled"),
+        "ffmpeg_custom_template": transcode_settings.get("ffmpeg_custom_template"),
+        "ffmpeg_standard_command": build_ffmpeg_preview(transcode_settings),
+        "source": "jellyfin",
+        "jellyfin_item_id": resolved.get("item_id", ""),
+        "jellyfin_title": resolved.get("title", ""),
+    }
+    if backend_url():
+        result = remote_post_json("/api/transcode/jobs", job_payload_data, timeout=60)
+        job = result.get("job") if isinstance(result.get("job"), dict) else result
+        job_id = str(result.get("job_id") or (job.get("id") if isinstance(job, dict) else ""))
+    else:
+        job = create_transcode_job(job_payload_data)
+        job_id = str(job.get("id") or "")
+        result = {"status": "queued", "job_id": job_id, "job": job}
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "av_id": av_id,
+        "input_path": path,
+        "output_path": output_path,
+        "resolved": resolved,
+        "result": result,
+    }
 
 
 @app.on_event("startup")
@@ -10432,6 +10841,32 @@ def api_jellyfin_libraries() -> dict[str, object]:
     return {"libraries": get_jellyfin_libraries(settings_data.get("jellyfin", {}))}
 
 
+@app.post("/api/integrations/jellyfin/resolve", dependencies=[Depends(require_subtitle_token)])
+def api_integration_jellyfin_resolve(payload: JellyfinIntegrationRequest) -> dict[str, object]:
+    return {"status": "ok", "media": resolve_jellyfin_media(payload)}
+
+
+@app.post("/api/integrations/jellyfin/subtitle", dependencies=[Depends(require_subtitle_token)])
+def api_integration_jellyfin_subtitle(payload: JellyfinIntegrationRequest) -> dict[str, object]:
+    media = resolve_jellyfin_media(payload)
+    path = str(media.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="缺少媒体文件路径")
+    job = submit_subtitle_job_for_path(path)
+    return {
+        "status": "queued",
+        "media": media,
+        "job_id": str(job.get("id") or job.get("job_id") or ""),
+        "job": job,
+    }
+
+
+@app.post("/api/integrations/jellyfin/transcode", dependencies=[Depends(require_subtitle_token)])
+def api_integration_jellyfin_transcode(payload: JellyfinIntegrationRequest) -> dict[str, object]:
+    media = resolve_jellyfin_media(payload)
+    return submit_jellyfin_transcode_job(media, payload.target_codec)
+
+
 @app.get("/api/mteam/search")
 def api_search_mteam(q: str = "") -> dict[str, object]:
     if not q.strip():
@@ -10729,11 +11164,20 @@ def wechat_text_only_event(event_key: str) -> bool:
 def wechat_notification_text(event_key: str, title: str, message: str, payload: dict[str, Any]) -> tuple[str, str, str]:
     av_id = notification_short_text(payload.get("av_id") or payload.get("id"), "")
     item_title = notification_short_text(payload.get("title") or title, av_id or "MovieMuse")
-    if event_key in {"av_subscribed", "actress_new_av"}:
-        heading = f"番号{av_id}已完成订阅" if av_id else "番号已完成订阅"
+    if event_key == "av_subscribed":
+        heading = f"番号{av_id}已加入订阅" if av_id else "番号已加入订阅"
         body = item_title if item_title and item_title != av_id else notification_short_text(payload.get("detail") or message, "")
         content = f"{heading}\n\n{body}".strip()
         return heading, body, content
+    if event_key == "actress_new_av":
+        actress = notification_short_text(payload.get("actress") or payload.get("actress_name"), "")
+        heading = f"{actress}发现新番号{av_id}" if actress and av_id else f"发现新番号{av_id}" if av_id else "发现新番号"
+        release_date = notification_short_text(payload.get("release_date") or payload.get("date"), "")
+        body_lines = [item_title if item_title and item_title != av_id else notification_short_text(payload.get("detail") or message, "")]
+        if release_date:
+            body_lines.append(f"发售日期：{release_date}")
+        body = "\n".join(line for line in body_lines if line)
+        return heading, body, f"{heading}\n\n{body}".strip()
     if event_key == "torrent_sent":
         heading = f"番号{av_id}开始下载" if av_id else "番号开始下载"
         site = notification_short_text(payload.get("site") or payload.get("source") or "馒头")
@@ -11554,7 +11998,7 @@ def wechat_work_test_suite_samples() -> list[dict[str, Any]]:
         {
             "event_key": "actress_new_av",
             "payload": {
-                "status": "subscribed",
+                "status": "new",
                 "title": sample_title,
                 "detail": "订阅女优 长浜みつり 发现新番号 IPZZ-828",
                 "av_id": "IPZZ-828",

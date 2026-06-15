@@ -80,6 +80,10 @@
     </aside>
 
     <main class="mm-main" :class="{ full: route.meta.fullBleed }">
+      <div v-if="demo.enabled && !route.meta.fullBleed" class="mm-demo-banner">
+        <span>演示模式已开启，封面和系统设置正在以非破坏方式隐藏。</span>
+        <RouterLink to="/system?tab=demo">管理</RouterLink>
+      </div>
       <div v-if="showThemeToggle" class="mm-app-toolbar">
         <BaseThemeToggle />
       </div>
@@ -89,7 +93,7 @@
 </template>
 
 <script setup>
-import { computed, watch } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import {
   ChevronLeft,
@@ -106,10 +110,12 @@ import {
   Sparkles
 } from '@lucide/vue'
 import { useUiStore } from './stores/ui'
+import { useDemoStore } from './stores/demo'
 import { postJson } from './lib/api'
 import { BaseThemeToggle } from './components/ui'
 
 const ui = useUiStore()
+const demo = useDemoStore()
 const route = useRoute()
 const subscriptionsOpen = computed(() => ui.openGroups.subscriptions)
 const showThemeToggle = computed(() => !route.meta.fullBleed && route.name !== 'ui-preview')
@@ -121,6 +127,12 @@ watch(
   },
   { immediate: true }
 )
+
+onMounted(() => {
+  demo.load().catch(() => {
+    demo.loaded = true
+  })
+})
 
 async function logout() {
   try {
@@ -361,6 +373,28 @@ async function logout() {
   display: flex;
   justify-content: flex-end;
   margin: -8px 0 18px;
+}
+
+.mm-demo-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 44px;
+  margin: -8px 0 18px;
+  padding: 0 14px;
+  border: 1px solid color-mix(in srgb, var(--mm-warning) 34%, var(--mm-border));
+  border-radius: var(--mm-radius-md);
+  background: var(--mm-warning-soft);
+  color: var(--mm-text);
+  font-size: 13px;
+}
+
+.mm-demo-banner a {
+  flex: none;
+  color: var(--mm-primary);
+  font-weight: var(--mm-font-weight-semibold);
+  text-decoration: none;
 }
 
 .mm-main.full {

@@ -15,7 +15,51 @@
       </button>
     </BaseCard>
 
-    <BaseCard v-if="activeTab === 'mteam'" class="setting-panel">
+    <BaseCard v-if="demo.enabled && demo.hideSystemSettings && activeTab !== 'demo'" class="setting-panel demo-guard">
+      <div class="panel-head">
+        <div>
+          <h2>演示模式已开启</h2>
+          <p>系统设置暂时不可见。这里没有修改、清空或覆盖真实配置，关闭演示模式后会恢复显示。</p>
+        </div>
+        <BaseButton type="button" @click="setActiveTab('demo')">管理演示模式</BaseButton>
+      </div>
+      <div class="demo-guard-body">
+        <strong>真实设置已隐藏</strong>
+        <span>MTeam、qBittorrent、Jellyfin、代理、账号和通知配置仍保留在后端，只是当前页面不展示。</span>
+      </div>
+    </BaseCard>
+
+    <BaseCard v-else-if="activeTab === 'demo'" class="setting-panel">
+      <div class="panel-head">
+        <div>
+          <h2>演示模式</h2>
+          <p>用一张演示图临时替换控制台里的封面，并隐藏系统设置；不会改写订阅、缓存或真实配置。</p>
+        </div>
+      </div>
+      <div class="form-grid">
+        <FormField as="div" label="启用演示模式" wide>
+          <BaseSwitch v-model="demo.enabled" aria-label="启用演示模式" />
+        </FormField>
+        <FormField label="演示封面图" wide hint="留空时使用 MovieMuse 图标。支持 http(s)、/static 本地路径或 data URL。">
+          <input v-model.trim="demo.coverUrl" placeholder="/static/icons/moviemuse-app-icon-1024.png">
+        </FormField>
+        <FormField as="div" label="隐藏系统设置" wide>
+          <BaseSwitch v-model="demo.hideSystemSettings" aria-label="隐藏系统设置" />
+        </FormField>
+      </div>
+      <div class="demo-preview">
+        <span>预览</span>
+        <img :src="demo.replacementCoverUrl" alt="">
+      </div>
+      <div class="panel-footer">
+        <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
+          {{ saving ? '保存中' : '保存演示模式' }}
+        </BaseButton>
+      </div>
+    </BaseCard>
+
+    <BaseCard v-else-if="activeTab === 'mteam'" class="setting-panel">
       <div class="panel-head">
         <div>
           <h2>MTeam</h2>
@@ -446,10 +490,12 @@
 import { reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, postJson } from '../lib/api'
+import { useDemoStore } from '../stores/demo'
 import NotificationsView from './NotificationsView.vue'
 import { BaseButton, BaseCard, BaseSwitch, FormField, NoticeBanner, PageHeader, SecretInput } from '../components/ui'
 
 const tabs = [
+  { key: 'demo', label: '演示模式' },
   { key: 'mteam', label: 'MTeam' },
   { key: 'qb', label: 'qBittorrent' },
   { key: 'jellyfin', label: 'Jellyfin' },
@@ -473,6 +519,7 @@ const defaultMakers = [
 
 const route = useRoute()
 const router = useRouter()
+const demo = useDemoStore()
 const activeTab = ref(normalizeTab(route.query.tab) || normalizeTab(localStorage.getItem('systemActiveTab')) || 'jellyfin')
 const loading = ref(false)
 const saving = ref(false)
@@ -576,6 +623,7 @@ async function loadAll() {
       api('/api/system-settings'),
       api('/api/subscriptions/settings')
     ])
+    demo.applySettings(systemPayload.settings?.demo || {})
     Object.assign(system.mteam, systemPayload.settings?.mteam || {})
     Object.assign(system.qbittorrent, systemPayload.settings?.qbittorrent || {})
     Object.assign(system.jellyfin, systemPayload.settings?.jellyfin || {})
@@ -656,6 +704,11 @@ async function saveAll() {
   try {
     if (activeTab.value === 'notifications' && notificationsView.value?.saveNotifications) {
       await notificationsView.value.saveNotifications()
+      return
+    }
+    if (activeTab.value === 'demo') {
+      await demo.save()
+      message.value = demo.enabled ? '演示模式已开启' : '演示模式已关闭'
       return
     }
     syncJellyfinLibrary()
@@ -972,6 +1025,56 @@ async function deleteActorIdentity() {
   display: grid;
   gap: 18px;
   --mm-input-radius: 14px;
+}
+
+.demo-guard {
+  min-height: 280px;
+}
+
+.demo-guard-body {
+  display: grid;
+  gap: 8px;
+  padding: 22px;
+  border: 1px dashed color-mix(in srgb, var(--mm-warning) 44%, var(--mm-border));
+  border-radius: var(--mm-radius-md);
+  background: var(--mm-warning-soft);
+}
+
+.demo-guard-body strong {
+  color: var(--mm-text);
+  font-size: 18px;
+  font-weight: var(--mm-font-weight-semibold);
+}
+
+.demo-guard-body span {
+  color: var(--mm-muted);
+  line-height: 1.7;
+}
+
+.demo-preview {
+  display: grid;
+  grid-template-columns: auto 160px;
+  align-items: center;
+  gap: 18px;
+  width: min(360px, 100%);
+  padding: 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius-md);
+  background: var(--mm-surface);
+}
+
+.demo-preview span {
+  color: var(--mm-muted);
+  font-size: 14px;
+}
+
+.demo-preview img {
+  width: 160px;
+  max-width: 100%;
+  aspect-ratio: 3 / 2;
+  border-radius: var(--mm-radius-sm);
+  background: var(--mm-image-bg);
+  object-fit: contain;
 }
 
 .setting-tabs {

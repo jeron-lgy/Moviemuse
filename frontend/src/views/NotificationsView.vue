@@ -15,8 +15,11 @@
       <div class="section-head">
         <div>
           <h2>通知渠道</h2>
-          <p>点击加号选择 Server 酱或 Gotify，弹出配置卡片后填写参数。</p>
+          <p>点击加号选择 Server 酱、Gotify 或 WeCom，弹出配置卡片后填写参数。</p>
         </div>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="saveNotifications">
+          {{ saving ? '保存中' : '保存渠道' }}
+        </BaseButton>
       </div>
 
       <div class="channel-list">
@@ -143,7 +146,9 @@
         </BaseButton>
         <BaseButton v-if="editingChannel.type === 'wechat_work'" type="button" @click="createWechatMenu(editingChannel)">Create menu</BaseButton>
         <BaseButton type="button" @click="editingChannel = null">取消</BaseButton>
-        <BaseButton variant="primary" type="button" @click="commitChannel">确认</BaseButton>
+        <BaseButton variant="primary" type="button" :disabled="saving" @click="commitChannelAndSave">
+          {{ saving ? '保存中' : '保存渠道' }}
+        </BaseButton>
       </template>
     </TaskDialog>
 
@@ -272,6 +277,11 @@ function commitChannel() {
   if (editingIndex.value >= 0) channels.value[editingIndex.value] = channel
   else channels.value.push(channel)
   editingChannel.value = null
+}
+
+async function commitChannelAndSave() {
+  commitChannel()
+  await saveNotifications()
 }
 
 async function testChannel(channel) {

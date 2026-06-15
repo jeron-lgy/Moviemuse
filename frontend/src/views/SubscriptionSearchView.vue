@@ -1,5 +1,5 @@
 <template>
-  <section class="search-view">
+  <section class="search-view" @click="closeMenus">
     <PageHeader kicker="订阅管理" :title="pageTitle" :description="pageDescription" />
 
     <BaseCard as="form" class="search-bar"  @submit.prevent="runSearch">
@@ -30,9 +30,23 @@
           @detail="openDetail"
           @actor="searchActress"
         >
+          <template v-if="searchType === 'av' && isMovieSubscribed(item)" #menu>
+            <div class="more-menu" @click.stop>
+              <button class="more-trigger" type="button" aria-label="更多操作" @click.stop="toggleMovieMenu(item)">
+                <span></span><span></span><span></span>
+              </button>
+              <div v-if="movieMenuId === movieKey(item)" class="more-panel" @click.stop>
+                <button type="button" @click="openSubscribe(item, true)">重新订阅</button>
+              </div>
+            </div>
+          </template>
           <template #actions>
-              <BaseButton variant="primary" v-if="searchType === 'av'"  type="button" @click.stop="openSubscribe(item)">订阅</BaseButton>
-              <BaseButton variant="primary" size="lg" v-else  type="button" @click.stop="openActressSubscribe(item)">订阅女优</BaseButton>
+              <BaseButton variant="primary" v-if="searchType === 'av'" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
+                {{ movieSubscribeLabel(item) }}
+              </BaseButton>
+              <BaseButton variant="primary" size="lg" v-else type="button" :disabled="isActressSubscribed(item)" @click.stop="openActressSubscribe(item)">
+                {{ actressSubscribeLabel(item) }}
+              </BaseButton>
               <BaseButton  type="button" @click.stop="openDetail(item)">详情</BaseButton>
           </template>
         </SubscriptionMovieCard>
@@ -106,7 +120,7 @@
 
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { useQueryClient } from '@tanstack/vue-query'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
@@ -114,6 +128,7 @@ import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { BaseButton, BaseCard, BaseSwitch, FormField } from '../components/ui'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
+import { avSubscribeLabel, isActressSubscribed as findActressSubscribed, normalizeAvId, subscribedAv } from '../lib/subscriptionStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -128,10 +143,27 @@ const subscribeItem = ref(null)
 const actressSubscribeItem = ref(null)
 const detailItem = ref(null)
 const submitting = ref(false)
+const movieMenuId = ref('')
 const actressSubscribeForm = ref({ since_date: new Date().toISOString().slice(0, 10), include_vr: false })
+
+const avQuery = useQuery({
+  queryKey: ['subscriptions', 'av'],
+  queryFn: () => api('/api/subscriptions/av'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
+
+const actressQuery = useQuery({
+  queryKey: ['subscriptions', 'actress'],
+  queryFn: () => api('/api/subscriptions/actress'),
+  staleTime: 300_000,
+  refetchInterval: false
+})
 
 const javdbResults = computed(() => Array.isArray(results.value) ? results.value : [])
 const mteamResults = computed(() => Array.isArray(mteam.value?.results) ? mteam.value.results : [])
+const avSubscriptions = computed(() => Array.isArray(avQuery.data.value?.subscriptions) ? avQuery.data.value.subscriptions : [])
+const actressSubscriptions = computed(() => Array.isArray(actressQuery.data.value?.subscriptions) ? actressQuery.data.value.subscriptions : [])
 const actressMode = computed(() => !!route.query.actress_id)
 const pageTitle = computed(() => actressMode.value ? `${String(route.query.actress_name || keyword.value || '女优')} 的番号` : '搜索')
 const pageDescription = computed(() => actressMode.value ? '查看该女优的 JavDB 番号列表，可继续订阅单个番号。' : '搜索番号和女优，JavDB 与 MTeam 结果会在同一页分区显示。')
@@ -242,11 +274,34 @@ function searchActress(actor) {
   runSearch()
 }
 
-function openSubscribe(item) {
+function movieKey(item) {
+  return normalizeAvId(item?.id || item?.code || '') || String(item?.url || '')
+}
+
+function isMovieSubscribed(item) {
+  return !!subscribedAv(item, avSubscriptions.value)
+}
+
+function movieSubscribeLabel(item) {
+  return avSubscribeLabel(item, avSubscriptions.value)
+}
+
+function isActressSubscribed(item) {
+  return findActressSubscribed(item, actressSubscriptions.value)
+}
+
+function actressSubscribeLabel(item) {
+  return isActressSubscribed(item) ? '已订阅' : '订阅女优'
+}
+
+function openSubscribe(item, force = false) {
+  if (!force && isMovieSubscribed(item)) return
+  closeMenus()
   subscribeItem.value = item
 }
 
 function openActressSubscribe(item) {
+  if (isActressSubscribed(item)) return
   actressSubscribeItem.value = item
   actressSubscribeForm.value = {
     since_date: new Date().toISOString().slice(0, 10),
@@ -272,6 +327,7 @@ async function confirmActressSubscribe() {
       include_vr: actressSubscribeForm.value.include_vr
     })
     updateSubscriptionCache('actress', payload.subscription)
+    await actressQuery.refetch()
     errorMessage.value = `${item.name || item.title} 已订阅`
     actressSubscribeItem.value = null
   } catch (error) {
@@ -291,6 +347,7 @@ async function confirmSubscribe(filters) {
       subscription_mode: filters.subscription_mode
     })
     updateSubscriptionCache('av', payload.subscription)
+    await avQuery.refetch()
     errorMessage.value = `${subscribeItem.value.id} 已加入订阅`
     subscribeItem.value = null
   } catch (error) {
@@ -298,6 +355,15 @@ async function confirmSubscribe(filters) {
   } finally {
     submitting.value = false
   }
+}
+
+function toggleMovieMenu(item) {
+  const key = movieKey(item)
+  movieMenuId.value = movieMenuId.value === key ? '' : key
+}
+
+function closeMenus() {
+  movieMenuId.value = ''
 }
 
 function updateSubscriptionCache(type, item) {
@@ -383,6 +449,62 @@ function openMaker(link) {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
   gap: 16px;
+}
+
+.more-menu {
+  position: relative;
+}
+
+.more-trigger {
+  display: grid;
+  grid-template-columns: repeat(3, 4px);
+  gap: 3px;
+  place-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  appearance: none;
+  cursor: pointer;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, .42));
+}
+
+.more-trigger span {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: #fff;
+}
+
+.more-panel {
+  position: absolute;
+  top: 40px;
+  right: 0;
+  z-index: 10;
+  min-width: 124px;
+  padding: 6px;
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius-sm);
+  background: var(--mm-card-bg);
+  box-shadow: var(--mm-shadow-md);
+}
+
+.more-panel button {
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  border-radius: var(--mm-radius-sm);
+  background: transparent;
+  color: var(--mm-text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.more-panel button:hover {
+  background: var(--mm-primary-soft);
+  color: var(--mm-primary);
 }
 
 .mteam-list {

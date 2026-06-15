@@ -33,6 +33,10 @@
             <span>算力端上线后自动执行队列<small>等待算力端的任务会自动推进。</small></span>
             <BaseSwitch v-model="postprocess.worker_auto_run" aria-label="算力端上线后自动执行队列" />
           </div>
+          <div class="toggle-line">
+            <span>接管外部 qB 种子<small>扫描已带接管标签的手动种子，源文件默认保留。</small></span>
+            <BaseSwitch v-model="postprocess.external_qb_adopt_enabled" aria-label="接管外部 qB 种子" />
+          </div>
         </div>
       </BaseCard>
 
@@ -85,6 +89,7 @@ const postprocess = reactive({
   auto_transcode_enabled: false,
   auto_subtitle_enabled: false,
   worker_auto_run: false,
+  external_qb_adopt_enabled: false,
   allowed_categories: [],
   required_tags: []
 })
@@ -103,6 +108,7 @@ async function loadAll() {
       auto_transcode_enabled: !!postPayload.settings?.auto_transcode_enabled,
       auto_subtitle_enabled: !!postPayload.settings?.auto_subtitle_enabled,
       worker_auto_run: !!postPayload.settings?.worker_auto_run,
+      external_qb_adopt_enabled: !!postPayload.settings?.external_qb_adopt_enabled,
       allowed_categories: Array.isArray(postPayload.settings?.allowed_categories) ? postPayload.settings.allowed_categories : [],
       required_tags: Array.isArray(postPayload.settings?.required_tags) ? postPayload.settings.required_tags : []
     })
@@ -138,6 +144,7 @@ async function saveAutomation() {
       auto_transcode_enabled: postprocess.auto_transcode_enabled,
       auto_subtitle_enabled: postprocess.auto_subtitle_enabled,
       worker_auto_run: postprocess.worker_auto_run,
+      external_qb_adopt_enabled: postprocess.external_qb_adopt_enabled,
       allowed_categories: postprocess.allowed_categories,
       required_tags: postprocess.required_tags
     })
