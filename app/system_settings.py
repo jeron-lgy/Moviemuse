@@ -79,7 +79,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notifications": {
         "channels": [],
         "events": {
-            "actress_new_av": True,
             "av_subscribed": True,
             "mteam_found": True,
             "torrent_sent": True,

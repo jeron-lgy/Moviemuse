@@ -6,7 +6,7 @@
 
     <button :class="posterClasses" type="button" @click="emitDetail">
       <img v-if="coverUrl && !imageFailed" :src="coverUrl" alt="" loading="lazy" @error="imageFailed = true">
-      <span v-else>暂无封面</span>
+      <span v-else>{{ coverPlaceholder }}</span>
     </button>
 
     <div class="movie-body">
@@ -49,6 +49,10 @@ const props = defineProps({
   coverUrl: {
     type: String,
     default: ''
+  },
+  coverPlaceholder: {
+    type: String,
+    default: '暂无封面'
   },
   actors: {
     type: Array,

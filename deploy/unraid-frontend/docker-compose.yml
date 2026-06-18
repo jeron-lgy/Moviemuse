@@ -8,6 +8,8 @@ services:
     image: moviemuse-unraid:latest
     container_name: moviemuse
     user: "99:100"
+    mem_limit: 2g
+    memswap_limit: 2g
 
     ports:
       # 左边是 Unraid 对外 WebUI 端口，冲突时只改左边。

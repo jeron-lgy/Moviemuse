@@ -61,7 +61,12 @@
             <p class="latest-date">{{ item.latest_release_date || item.latest_date || '未知日期' }}</p>
             <div class="card-actions">
               <BaseButton type="button" @click="openActress(item)">查看作品</BaseButton>
-              <BaseButton variant="primary" type="button" :disabled="busyActress === item.name || isActressSubscribed(item)" @click="subscribeActress(item)">
+              <SubscriptionHoverButton
+                v-if="isActressSubscribed(item)"
+                :busy="busyActress === actressCancelKey(item)"
+                @click.stop="cancelActressSubscription(item)"
+              />
+              <BaseButton v-else variant="primary" type="button" :disabled="busyActress === item.name" @click="subscribeActress(item)">
                 {{ actressSubscribeLabel(item) }}
               </BaseButton>
             </div>
@@ -74,7 +79,8 @@
           v-for="item in items"
           :key="item.url || item.id"
           :item="item"
-          :cover-url="proxyImage(item.cover, item)"
+          :cover-url="rankingCoverUrl(item)"
+          :cover-placeholder="item.cover_unavailable ? '封面未公开' : '暂无封面'"
           :actors="normalizedActresses(item)"
           variant="compact"
           poster-fit="contain"
@@ -93,7 +99,12 @@
           </template>
           <template #actions>
             <BaseButton type="button" @click.stop="openDetail(item)">详情</BaseButton>
-            <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
+            <SubscriptionHoverButton
+              v-if="isMovieSubscriptionCancelable(item)"
+              :busy="busyMovie === movieKey(item)"
+              @click.stop="cancelMovieSubscription(item)"
+            />
+            <BaseButton v-else variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
               {{ movieSubscribeLabel(item) }}
             </BaseButton>
           </template>
@@ -128,10 +139,11 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
+import SubscriptionHoverButton from '../components/SubscriptionHoverButton.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
-import { avSubscribeLabel, isActressSubscribed as findActressSubscribed, normalizeAvId, subscribedAv as findSubscribedAv } from '../lib/subscriptionStatus'
+import { avSubscribeLabel, isActressSubscribed as findActressSubscribed, normalizeAvId, subscribedActress as findSubscribedActress, subscribedAv as findSubscribedAv } from '../lib/subscriptionStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -154,6 +166,7 @@ const detailItem = ref(null)
 const subscribeItem = ref(null)
 const submitting = ref(false)
 const busyActress = ref('')
+const busyMovie = ref('')
 const movieMenuId = ref('')
 
 const avQuery = useQuery({
@@ -230,6 +243,11 @@ function proxyImage(url, item = null) {
   return imageProxyUrl(url, item)
 }
 
+function rankingCoverUrl(item) {
+  if (item?.cover_unavailable) return ''
+  return proxyImage(item?.cover, item)
+}
+
 function actressAssetId(item) {
   return `actor-${item?.dmm_name || item?.name || item?.id || 'unknown'}`
 }
@@ -265,9 +283,22 @@ function movieSubscribeLabel(item) {
   return avSubscribeLabel(item, rows)
 }
 
+function isMovieSubscriptionCancelable(item) {
+  return movieSubscribeLabel(item) === '已订阅'
+}
+
 function isActressSubscribed(item) {
   const rows = Array.isArray(actressQuery.data.value?.subscriptions) ? actressQuery.data.value.subscriptions : []
   return findActressSubscribed(item, rows)
+}
+
+function subscribedActress(item) {
+  const rows = Array.isArray(actressQuery.data.value?.subscriptions) ? actressQuery.data.value.subscriptions : []
+  return findSubscribedActress(item, rows)
+}
+
+function actressCancelKey(item) {
+  return subscribedActress(item)?.id || item?.id || item?.name || item?.dmm_name || ''
 }
 
 function actressSubscribeLabel(item) {
@@ -293,6 +324,45 @@ function toggleMovieMenu(item) {
 
 function closeMenus() {
   movieMenuId.value = ''
+}
+
+async function cancelMovieSubscription(item) {
+  const current = subscribedAv(item)
+  const id = current?.id || item?.id
+  const key = movieKey(item)
+  if (!id || busyMovie.value) return
+  busyMovie.value = key
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    await api(`/api/subscriptions/av/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeSubscriptionCacheItem('av', id)
+    await avQuery.refetch()
+    successMessage.value = `${id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消订阅失败'
+  } finally {
+    busyMovie.value = ''
+  }
+}
+
+async function cancelActressSubscription(item) {
+  const current = subscribedActress(item)
+  const id = current?.id || item?.id || item?.name
+  if (!id || busyActress.value) return
+  busyActress.value = id
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    await api(`/api/subscriptions/actress/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeSubscriptionCacheItem('actress', id)
+    await actressQuery.refetch()
+    successMessage.value = `${current?.name || item?.name || id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消女优订阅失败'
+  } finally {
+    busyActress.value = ''
+  }
 }
 
 function openActress(item) {
@@ -370,6 +440,19 @@ function updateSubscriptionCache(type, item) {
     return {
       ...(current || {}),
       subscriptions: [item, ...rows.filter((row) => row?.id !== item.id)]
+    }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
+}
+
+function removeSubscriptionCacheItem(type, id) {
+  if (!id) return
+  const key = ['subscriptions', type]
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    return {
+      ...(current || {}),
+      subscriptions: rows.filter((row) => row?.id !== id)
     }
   })
   queryClient.invalidateQueries({ queryKey: key })

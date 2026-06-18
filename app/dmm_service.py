@@ -334,7 +334,8 @@ class DMMService:
         match = re.search(r"([a-z]{2,})(\d{2,})$", raw)
         if not match:
             return raw.upper()
-        number = match.group(2).lstrip("0") or match.group(2)
+        raw_number = match.group(2)
+        number = raw_number if len(raw_number) <= 3 else (raw_number.lstrip("0") or raw_number)
         return f"{match.group(1).upper()}-{number}"
 
     @classmethod

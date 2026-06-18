@@ -364,7 +364,6 @@ function normalizeChannel(channel) {
 
 function defaultEventEnabled(key) {
   return [
-    'actress_new_av',
     'av_subscribed',
     'mteam_found',
     'torrent_sent',

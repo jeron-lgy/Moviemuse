@@ -15,13 +15,23 @@
             <h2>{{ movieTitle }}</h2>
 
             <div class="detail-actions">
-              <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(mergedItem)" @click.stop="emit('subscribe-av', mergedItem)">
+              <SubscriptionHoverButton
+                v-if="isMovieSubscriptionCancelable(mergedItem)"
+                :busy="busyMovie === movieKey(mergedItem)"
+                @click.stop="cancelMovieSubscription(mergedItem)"
+              />
+              <BaseButton v-else variant="primary" type="button" :disabled="isMovieSubscribed(mergedItem)" @click.stop="emit('subscribe-av', mergedItem)">
                 {{ movieSubscribeLabel(mergedItem) }}
               </BaseButton>
+              <SubscriptionHoverButton
+                v-if="primaryActor && isActorSubscribed(primaryActor)"
+                :busy="busyActor === actorKey(primaryActor)"
+                @click.stop.prevent="cancelActorSubscription(primaryActor)"
+              />
               <BaseButton
-                v-if="primaryActor"
+                v-else-if="primaryActor"
                 type="button"
-                :disabled="isActorBusyOrSubscribed(primaryActor)"
+                :disabled="busyActor === actorKey(primaryActor)"
                 @click.stop.prevent="openActorSubscribe(primaryActor)"
               >
                 {{ actorSubscribeLabel(primaryActor) }}
@@ -74,10 +84,18 @@
                 <div class="actor-row" v-if="actors.length">
                   <span v-for="actor in actors" :key="actorKey(actor)" class="actor-pill">
                     <button class="actor-name-button" type="button" @click="emit('actor', actor)">{{ actor.name }}</button>
+                    <SubscriptionHoverButton
+                      v-if="isActorSubscribed(actor)"
+                      class="actor-subscribe-button"
+                      size="sm"
+                      :busy="busyActor === actorKey(actor)"
+                      @click.stop.prevent="cancelActorSubscription(actor)"
+                    />
                     <button
+                      v-else
                       class="actor-subscribe-button"
                       type="button"
-                      :disabled="isActorBusyOrSubscribed(actor)"
+                      :disabled="busyActor === actorKey(actor)"
                       @click.stop.prevent="openActorSubscribe(actor)"
                     >
                       {{ actorSubscribeLabel(actor) }}
@@ -133,7 +151,12 @@
             >
               <template #actions>
                 <BaseButton type="button" @click.stop="emit('recommend', movie)">详情</BaseButton>
-                <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(movie)" @click.stop="emit('subscribe-av', movie)">
+                <SubscriptionHoverButton
+                  v-if="isMovieSubscriptionCancelable(movie)"
+                  :busy="busyMovie === movieKey(movie)"
+                  @click.stop="cancelMovieSubscription(movie)"
+                />
+                <BaseButton v-else variant="primary" type="button" :disabled="isMovieSubscribed(movie)" @click.stop="emit('subscribe-av', movie)">
                   {{ movieSubscribeLabel(movie) }}
                 </BaseButton>
               </template>
@@ -171,7 +194,8 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl, mediaProxyUrl } from '../lib/images'
-import { avSubscribeLabel, normalizeAvId, subscribedAv as findSubscribedAv } from '../lib/subscriptionStatus'
+import { avSubscribeLabel, normalizeAvId, subscribedActress as findSubscribedActress, subscribedAv as findSubscribedAv } from '../lib/subscriptionStatus'
+import SubscriptionHoverButton from './SubscriptionHoverButton.vue'
 import SubscriptionMovieCard from './SubscriptionMovieCard.vue'
 import { BaseButton, BaseCard, BaseSwitch, NoticeBanner } from './ui'
 
@@ -203,6 +227,7 @@ const detail = ref({})
 const loading = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
+const busyMovie = ref('')
 const busyActor = ref('')
 const actorSubscribeTarget = ref(null)
 const subscribedActorKeys = ref(new Set())
@@ -302,7 +327,7 @@ function actorKey(actor) {
 }
 
 function movieKey(item) {
-  return normalizeAvId(item?.id || item?.code || '')
+  return normalizeAvId(item?.id || item?.code || '') || String(item?.url || '')
 }
 
 function subscribedAv(item) {
@@ -327,6 +352,30 @@ function movieSubscribeLabel(item) {
   return avSubscribeLabel(item, rows, '订阅番号')
 }
 
+function isMovieSubscriptionCancelable(item) {
+  return movieSubscribeLabel(item) === '已订阅'
+}
+
+async function cancelMovieSubscription(item) {
+  const current = subscribedAv(item)
+  const id = current?.id || item?.id
+  const key = movieKey(item)
+  if (!id || busyMovie.value) return
+  busyMovie.value = key
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    await api(`/api/subscriptions/av/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeAvSubscriptionCache(id)
+    await avQuery.refetch()
+    successMessage.value = `${id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消订阅失败'
+  } finally {
+    busyMovie.value = ''
+  }
+}
+
 function actorIdentityKeys(actor) {
   const keys = new Set()
   const add = (value) => {
@@ -342,21 +391,23 @@ function actorIdentityKeys(actor) {
   return keys
 }
 
+function actressSubscriptions() {
+  const current = queryClient.getQueryData(['subscriptions', 'actress'])
+  return Array.isArray(actressQuery.data.value?.subscriptions)
+    ? actressQuery.data.value.subscriptions
+    : (Array.isArray(current?.subscriptions) ? current.subscriptions : [])
+}
+
+function subscribedActor(actor) {
+  return findSubscribedActress(actor, actressSubscriptions())
+}
+
 function isActorSubscribed(actor) {
   const known = subscribedActorKeys.value
   for (const key of actorIdentityKeys(actor)) {
     if (known.has(key)) return true
   }
-  const current = queryClient.getQueryData(['subscriptions', 'actress'])
-  const rows = Array.isArray(actressQuery.data.value?.subscriptions)
-    ? actressQuery.data.value.subscriptions
-    : (Array.isArray(current?.subscriptions) ? current.subscriptions : [])
-  return rows.some((row) => {
-    for (const key of actorIdentityKeys(row)) {
-      if (actorIdentityKeys(actor).has(key)) return true
-    }
-    return false
-  })
+  return !!subscribedActor(actor)
 }
 
 function isActorBusyOrSubscribed(actor) {
@@ -422,6 +473,28 @@ async function subscribeActress(actor) {
   }
 }
 
+async function cancelActorSubscription(actor) {
+  const current = subscribedActor(actor)
+  const id = current?.id || actor?.id || actor?.name
+  const key = actorKey(actor)
+  if (!id || busyActor.value) return
+  busyActor.value = key
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    await api(`/api/subscriptions/actress/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeActressSubscriptionCache(id)
+    unmarkActorSubscribed(current || actor)
+    unmarkActorSubscribed(actor)
+    await actressQuery.refetch()
+    successMessage.value = `${current?.name || actor?.name || id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消女优订阅失败'
+  } finally {
+    busyActor.value = ''
+  }
+}
+
 async function subscribeAllActors() {
   busyActor.value = '__all__'
   errorMessage.value = ''
@@ -448,6 +521,25 @@ function markActorSubscribed(actor) {
   subscribedActorKeys.value = next
 }
 
+function unmarkActorSubscribed(actor) {
+  const next = new Set(subscribedActorKeys.value)
+  for (const key of actorIdentityKeys(actor)) next.delete(key)
+  subscribedActorKeys.value = next
+}
+
+function removeAvSubscriptionCache(id) {
+  if (!id) return
+  const key = ['subscriptions', 'av']
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    return {
+      ...(current || {}),
+      subscriptions: rows.filter((row) => row?.id !== id)
+    }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
+}
+
 function updateActressSubscriptionCache(item) {
   if (!item?.id) return
   const key = ['subscriptions', 'actress']
@@ -456,6 +548,19 @@ function updateActressSubscriptionCache(item) {
     return {
       ...(current || {}),
       subscriptions: [item, ...rows.filter((row) => row?.id !== item.id)]
+    }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
+}
+
+function removeActressSubscriptionCache(id) {
+  if (!id) return
+  const key = ['subscriptions', 'actress']
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    return {
+      ...(current || {}),
+      subscriptions: rows.filter((row) => row?.id !== id)
     }
   })
   queryClient.invalidateQueries({ queryKey: key })
@@ -631,6 +736,10 @@ h2 {
   background: var(--mm-primary) !important;
   color: #fff !important;
   box-shadow: 0 8px 22px rgba(255, 56, 92, .18);
+}
+
+.actor-subscribe-button.cancelling {
+  background: var(--mm-danger) !important;
 }
 
 .actor-subscribe-button:disabled {

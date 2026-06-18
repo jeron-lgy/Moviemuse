@@ -839,12 +839,13 @@ function adaptSubtitleJob(job) {
 
 function adaptPostprocessJob(task) {
   const phase = postprocessPhase(task.status)
-  const statusKey = postprocessStatusKey(task.status)
+  const qbIssue = postprocessQbIssue(task)
+  const statusKey = qbIssue ? 'failed' : postprocessStatusKey(task.status)
   const avId = task.av_id || task.id || '后处理任务'
   const workerJob = findTranscodeJob(task)
-  const progressInfo = postprocessProgressInfo(task, phase, statusKey, workerJob)
-  const waitingDetail = postprocessWaitingDetail(task, statusKey)
-  const displayPath = postprocessDisplayPath(task, waitingDetail)
+  const progressInfo = postprocessProgressInfo(task, phase, statusKey, workerJob, qbIssue)
+  const waitingDetail = postprocessWaitingDetail(task, statusKey, qbIssue)
+  const displayPath = postprocessDisplayPath(task, waitingDetail, qbIssue)
   return {
     raw: task,
     id: `postprocess:${task.id}`,
@@ -855,8 +856,8 @@ function adaptPostprocessJob(task) {
     title: phase === 'subtitle' ? `${avId} · 生成字幕` : phase === 'transcode' ? `${avId} · 转码` : avId,
     path: displayPath,
     statusKey,
-    statusLabel: postprocessStatusLabel(task.status, phase, statusKey),
-    progressTone: postprocessProgressTone(task.status, statusKey),
+    statusLabel: postprocessStatusLabel(task.status, phase, statusKey, qbIssue),
+    progressTone: postprocessProgressTone(task.status, statusKey, qbIssue),
     createdLabel: formatTime(task.created_at),
     createdAt: task.created_at,
     updatedAt: task.updated_at || task.created_at,
@@ -878,7 +879,28 @@ function findTranscodeJob(task) {
   return transcodeJobLookup.value.get(String(workerJobId || '')) || transcodeJobLookup.value.get(String(task?.id || '')) || null
 }
 
-function postprocessProgressInfo(task, phase, statusKey, workerJob) {
+function postprocessQbIssue(task) {
+  const state = String(task?.data?.qb_state || '').trim()
+  if (state === 'missingFiles') {
+    return {
+      type: 'qb_missing_files',
+      label: '文件丢失',
+      path: task?.data?.content_path || task?.input_path || task?.output_path || 'qB 文件丢失',
+      detail: 'qB 标记文件丢失，请在 qB 中重新校验或重新下载。'
+    }
+  }
+  return null
+}
+
+function postprocessProgressInfo(task, phase, statusKey, workerJob, qbIssue = null) {
+  if (qbIssue) {
+    return {
+      showProgress: false,
+      progressPercent: 0,
+      progressLabel: '',
+      progressDetail: qbIssue.detail
+    }
+  }
   const status = String(task?.status || '')
   if (status === 'downloading') {
     const progress = clampPercent(Number(task?.data?.qb_progress || 0))
@@ -968,7 +990,8 @@ function postprocessStatusKey(status) {
   return 'queued'
 }
 
-function postprocessStatusLabel(status, phase, statusKey) {
+function postprocessStatusLabel(status, phase, statusKey, qbIssue = null) {
+  if (qbIssue) return qbIssue.label
   if (statusKey === 'running' && phase === 'transcode') return '转码中'
   if (statusKey === 'translating' && phase === 'subtitle') return '生成字幕中'
   if (statusKey === 'queued') {
@@ -984,7 +1007,8 @@ function postprocessStatusLabel(status, phase, statusKey) {
   return status || statusLabel(statusKey)
 }
 
-function postprocessWaitingDetail(task, statusKey) {
+function postprocessWaitingDetail(task, statusKey, qbIssue = null) {
+  if (qbIssue) return qbIssue.detail
   if (statusKey !== 'queued') return ''
   const status = String(task?.status || '')
   if (status === 'waiting_worker') return '算力端离线或未就绪'
@@ -1001,7 +1025,8 @@ function postprocessWaitingDetail(task, statusKey) {
   return task?.error_message || ''
 }
 
-function postprocessDisplayPath(task, waitingDetail) {
+function postprocessDisplayPath(task, waitingDetail, qbIssue = null) {
+  if (qbIssue) return qbIssue.path
   const status = String(task?.status || '')
   if (task?.input_path) return task.input_path
   if (task?.output_path) return task.output_path
@@ -1017,7 +1042,8 @@ function progressTone(statusKey) {
   return 'queued'
 }
 
-function postprocessProgressTone(status, statusKey) {
+function postprocessProgressTone(status, statusKey, qbIssue = null) {
+  if (qbIssue) return 'failed'
   if (String(status || '') === 'created') return 'idle'
   return progressTone(statusKey)
 }

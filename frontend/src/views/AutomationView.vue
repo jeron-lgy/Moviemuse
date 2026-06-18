@@ -37,6 +37,10 @@
             <span>接管外部 qB 种子<small>扫描已带接管标签的手动种子，源文件默认保留。</small></span>
             <BaseSwitch v-model="postprocess.external_qb_adopt_enabled" aria-label="接管外部 qB 种子" />
           </div>
+          <div class="toggle-line">
+            <span>外部接管完成后移动源文件<small>转码和字幕完成后把原 qB 文件移入 trash，会影响继续做种。</small></span>
+            <BaseSwitch v-model="postprocess.external_qb_trash_source_enabled" aria-label="外部接管完成后移动源文件" />
+          </div>
         </div>
       </BaseCard>
 
@@ -90,6 +94,7 @@ const postprocess = reactive({
   auto_subtitle_enabled: false,
   worker_auto_run: false,
   external_qb_adopt_enabled: false,
+  external_qb_trash_source_enabled: false,
   allowed_categories: [],
   required_tags: []
 })
@@ -109,6 +114,7 @@ async function loadAll() {
       auto_subtitle_enabled: !!postPayload.settings?.auto_subtitle_enabled,
       worker_auto_run: !!postPayload.settings?.worker_auto_run,
       external_qb_adopt_enabled: !!postPayload.settings?.external_qb_adopt_enabled,
+      external_qb_trash_source_enabled: !!postPayload.settings?.external_qb_trash_source_enabled,
       allowed_categories: Array.isArray(postPayload.settings?.allowed_categories) ? postPayload.settings.allowed_categories : [],
       required_tags: Array.isArray(postPayload.settings?.required_tags) ? postPayload.settings.required_tags : []
     })
@@ -145,6 +151,7 @@ async function saveAutomation() {
       auto_subtitle_enabled: postprocess.auto_subtitle_enabled,
       worker_auto_run: postprocess.worker_auto_run,
       external_qb_adopt_enabled: postprocess.external_qb_adopt_enabled,
+      external_qb_trash_source_enabled: postprocess.external_qb_trash_source_enabled,
       allowed_categories: postprocess.allowed_categories,
       required_tags: postprocess.required_tags
     })

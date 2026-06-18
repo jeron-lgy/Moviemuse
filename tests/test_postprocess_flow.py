@@ -691,6 +691,35 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(completed["data"]["source_trash"]["status"], "skipped")
         self.assertTrue(any(event["stage"] == "source_trashing_skipped" for event in events))
 
+    def test_external_qb_task_trashes_source_when_enabled(self) -> None:
+        post = self.main.get_postprocess_service()
+        download_dir = self.root / "downloads"
+        output_dir = self.root / "output"
+        input_path = download_dir / "ABF-360.mp4"
+        make_sample_video(input_path)
+        post.update_settings(
+            {
+                "auto_transcode_enabled": False,
+                "auto_subtitle_enabled": False,
+                "external_qb_trash_source_enabled": True,
+                "download_dir": str(download_dir),
+                "output_dir": str(output_dir),
+            }
+        )
+        task = post.create_task(av_id="ABF-360", task_type="external_qb", status="ready_to_run")
+        post.update_task(task["id"], input_path=str(input_path))
+
+        result = self.main.validate_and_activate_postprocess_task(task["id"])
+
+        completed = post.get_task(task["id"])
+        events = post.list_events(task["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(input_path.exists())
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["data"]["source_trash"]["status"], "moved")
+        self.assertTrue(Path(completed["data"]["source_trash"]["target"]).exists())
+        self.assertTrue(any(event["stage"] == "source_trashing" for event in events))
+
     def test_postprocess_cancel_syncs_wash_subscription(self) -> None:
         service = self.main.get_subscription_service()
         post = self.main.get_postprocess_service()

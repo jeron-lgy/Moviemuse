@@ -41,10 +41,21 @@
             </div>
           </template>
           <template #actions>
-              <BaseButton variant="primary" v-if="searchType === 'av'" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
+              <SubscriptionHoverButton
+                v-if="searchType === 'av' && isMovieSubscriptionCancelable(item)"
+                :busy="busyMovie === movieKey(item)"
+                @click.stop="cancelMovieSubscription(item)"
+              />
+              <BaseButton v-else-if="searchType === 'av'" variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
                 {{ movieSubscribeLabel(item) }}
               </BaseButton>
-              <BaseButton variant="primary" size="lg" v-else type="button" :disabled="isActressSubscribed(item)" @click.stop="openActressSubscribe(item)">
+              <SubscriptionHoverButton
+                v-else-if="isActressSubscribed(item)"
+                size="lg"
+                :busy="busyActress === actressCancelKey(item)"
+                @click.stop="cancelActressSubscription(item)"
+              />
+              <BaseButton variant="primary" size="lg" v-else type="button" @click.stop="openActressSubscribe(item)">
                 {{ actressSubscribeLabel(item) }}
               </BaseButton>
               <BaseButton  type="button" @click.stop="openDetail(item)">详情</BaseButton>
@@ -124,11 +135,12 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
+import SubscriptionHoverButton from '../components/SubscriptionHoverButton.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { BaseButton, BaseCard, BaseSwitch, FormField } from '../components/ui'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
-import { avSubscribeLabel, isActressSubscribed as findActressSubscribed, normalizeAvId, subscribedAv } from '../lib/subscriptionStatus'
+import { avSubscribeLabel, isActressSubscribed as findActressSubscribed, normalizeAvId, subscribedActress as findSubscribedActress, subscribedAv } from '../lib/subscriptionStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -144,6 +156,8 @@ const actressSubscribeItem = ref(null)
 const detailItem = ref(null)
 const submitting = ref(false)
 const movieMenuId = ref('')
+const busyMovie = ref('')
+const busyActress = ref('')
 const actressSubscribeForm = ref({ since_date: new Date().toISOString().slice(0, 10), include_vr: false })
 
 const avQuery = useQuery({
@@ -286,8 +300,20 @@ function movieSubscribeLabel(item) {
   return avSubscribeLabel(item, avSubscriptions.value)
 }
 
+function isMovieSubscriptionCancelable(item) {
+  return movieSubscribeLabel(item) === '已订阅'
+}
+
 function isActressSubscribed(item) {
   return findActressSubscribed(item, actressSubscriptions.value)
+}
+
+function subscribedActress(item) {
+  return findSubscribedActress(item, actressSubscriptions.value)
+}
+
+function actressCancelKey(item) {
+  return subscribedActress(item)?.id || item?.id || item?.name || item?.title || ''
 }
 
 function actressSubscribeLabel(item) {
@@ -366,6 +392,41 @@ function closeMenus() {
   movieMenuId.value = ''
 }
 
+async function cancelMovieSubscription(item) {
+  const current = subscribedAv(item, avSubscriptions.value)
+  const id = current?.id || item?.id
+  const key = movieKey(item)
+  if (!id || busyMovie.value) return
+  busyMovie.value = key
+  try {
+    await api(`/api/subscriptions/av/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeSubscriptionCacheItem('av', id)
+    await avQuery.refetch()
+    errorMessage.value = `${id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消订阅失败'
+  } finally {
+    busyMovie.value = ''
+  }
+}
+
+async function cancelActressSubscription(item) {
+  const current = subscribedActress(item)
+  const id = current?.id || item?.id || item?.name || item?.title
+  if (!id || busyActress.value) return
+  busyActress.value = id
+  try {
+    await api(`/api/subscriptions/actress/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeSubscriptionCacheItem('actress', id)
+    await actressQuery.refetch()
+    errorMessage.value = `${current?.name || item?.name || item?.title || id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消女优订阅失败'
+  } finally {
+    busyActress.value = ''
+  }
+}
+
 function updateSubscriptionCache(type, item) {
   if (!item?.id) return
   const key = ['subscriptions', type]
@@ -373,6 +434,16 @@ function updateSubscriptionCache(type, item) {
     const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
     const next = [item, ...rows.filter((row) => row?.id !== item.id)]
     return { ...(current || {}), subscriptions: next }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
+}
+
+function removeSubscriptionCacheItem(type, id) {
+  if (!id) return
+  const key = ['subscriptions', type]
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    return { ...(current || {}), subscriptions: rows.filter((row) => row?.id !== id) }
   })
   queryClient.invalidateQueries({ queryKey: key })
 }

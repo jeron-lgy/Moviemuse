@@ -69,7 +69,12 @@
           </template>
           <template #actions>
             <BaseButton type="button" @click.stop="openDetail(item)">详情</BaseButton>
-            <BaseButton variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
+            <SubscriptionHoverButton
+              v-if="isMovieSubscriptionCancelable(item)"
+              :busy="busyMovie === movieKey(item)"
+              @click.stop="cancelMovieSubscription(item)"
+            />
+            <BaseButton v-else variant="primary" type="button" :disabled="isMovieSubscribed(item)" @click.stop="openSubscribe(item)">
               {{ movieSubscribeLabel(item) }}
             </BaseButton>
           </template>
@@ -139,6 +144,7 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 import MovieDetailDialog from '../components/MovieDetailDialog.vue'
 import SubscribeAvDialog from '../components/SubscribeAvDialog.vue'
+import SubscriptionHoverButton from '../components/SubscriptionHoverButton.vue'
 import SubscriptionMovieCard from '../components/SubscriptionMovieCard.vue'
 import { api, postJson } from '../lib/api'
 import { imageProxyUrl } from '../lib/images'
@@ -183,6 +189,7 @@ const subscribeItem = ref(null)
 const detailItem = ref(null)
 const submitting = ref(false)
 const movieMenuId = ref('')
+const busyMovie = ref('')
 const showMakerDialog = ref(false)
 const savingMaker = ref(false)
 const newMaker = reactive({ name: '', url: '', preferred_listing_source: 'javlibrary' })
@@ -361,6 +368,10 @@ function movieSubscribeLabel(item) {
   return avSubscribeLabel(item, avSubscriptions.value)
 }
 
+function isMovieSubscriptionCancelable(item) {
+  return movieSubscribeLabel(item) === '已订阅'
+}
+
 function openSubscribe(item, force = false) {
   if (!force && isMovieSubscribed(item)) return
   closeMenus()
@@ -402,6 +413,26 @@ async function confirmSubscribe(filters) {
   }
 }
 
+async function cancelMovieSubscription(item) {
+  const current = subscribedAv(item, avSubscriptions.value)
+  const id = current?.id || item?.id
+  const key = movieKey(item)
+  if (!id || busyMovie.value) return
+  busyMovie.value = key
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    await api(`/api/subscriptions/av/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    removeSubscriptionCacheItem(id)
+    await avQuery.refetch()
+    successMessage.value = `${id} 已取消订阅`
+  } catch (error) {
+    errorMessage.value = error.message || '取消订阅失败'
+  } finally {
+    busyMovie.value = ''
+  }
+}
+
 function updateSubscriptionCache(item) {
   if (!item?.id) return
   const key = ['subscriptions', 'av']
@@ -410,6 +441,19 @@ function updateSubscriptionCache(item) {
     return {
       ...(current || {}),
       subscriptions: [item, ...rows.filter((row) => row?.id !== item.id)]
+    }
+  })
+  queryClient.invalidateQueries({ queryKey: key })
+}
+
+function removeSubscriptionCacheItem(id) {
+  if (!id) return
+  const key = ['subscriptions', 'av']
+  queryClient.setQueryData(key, (current) => {
+    const rows = Array.isArray(current?.subscriptions) ? current.subscriptions : []
+    return {
+      ...(current || {}),
+      subscriptions: rows.filter((row) => row?.id !== id)
     }
   })
   queryClient.invalidateQueries({ queryKey: key })

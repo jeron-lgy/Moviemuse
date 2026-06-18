@@ -103,6 +103,39 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
     def test_canonical_av_id_merges_dmm_suffix_variants(self) -> None:
         self.assertEqual(self.main.canonical_av_id("START579V"), "START-579")
         self.assertEqual(self.main.canonical_av_id("SNOS250BOD"), "SNOS-250")
+        self.assertEqual(self.main.canonical_av_id("SNOS093"), "SNOS-093")
+        self.assertEqual(self.main.canonical_av_id("FWAY085"), "FWAY-085")
+
+    def test_jellyfin_probe_log_does_not_emit_library_notification(self) -> None:
+        with patch.object(self.main, "send_notification_event") as sender:
+            self.main.notify_from_app_log("info", "jellyfin", "Jellyfin 查重命中，标记已入库", {
+                "av_id": "SNOS-093",
+                "path": "/media/study_h265/SNOS-093/SNOS-093.chinese.mp4",
+            })
+
+            sender.assert_not_called()
+
+    def test_canonical_subscription_av_id_uses_dmm_cid_when_cached_id_lost_zero(self) -> None:
+        item = {
+            "id": "SNOS-93",
+            "source": "dmm",
+            "cover": "https://pics.dmm.co.jp/mono/movie/adult/snos093/snos093pl.jpg",
+        }
+        self.assertEqual(self.main.canonical_subscription_av_id(item), "SNOS-093")
+
+        fway = {
+            "id": "FWAY-85",
+            "source": "dmm",
+            "url": "https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=fway085/",
+        }
+        self.assertEqual(self.main.canonical_subscription_av_id(fway), "FWAY-085")
+
+        padded_internal = {
+            "id": "IPZZ-895",
+            "source": "dmm",
+            "cover": "https://pics.dmm.co.jp/mono/movie/adult/ipzz00895/ipzz00895pl.jpg",
+        }
+        self.assertEqual(self.main.canonical_subscription_av_id(padded_internal), "IPZZ-895")
 
     def test_public_metadata_upgrades_dmm_small_cover_url(self) -> None:
         item = self.main.public_metadata_item({
@@ -394,6 +427,9 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
             "n_709maraa244tk": "MARAA-244",
             "ipzz00895": "IPZZ-895",
             "k9snos275": "SNOS-275",
+            "snos093": "SNOS-093",
+            "fway085": "FWAY-085",
+            "ipok026": "IPOK-026",
         }
         for cid, expected in cases.items():
             with self.subTest(cid=cid):

@@ -83,3 +83,9 @@ export function isActressSubscribed(item, subscriptions = [], extraKeys = []) {
   if (!target.size) return false
   return subscriptions.some((row) => actressIdentityKeys(row).some((key) => target.has(key)))
 }
+
+export function subscribedActress(item, subscriptions = [], extraKeys = []) {
+  const target = new Set([...actressIdentityKeys(item), ...extraKeys].filter(Boolean))
+  if (!target.size) return null
+  return subscriptions.find((row) => actressIdentityKeys(row).some((key) => target.has(key))) || null
+}
