@@ -293,12 +293,10 @@ const qbOptionState = ref('')
 const retryingSelected = ref(false)
 const runningSelected = ref(false)
 const deletingSelected = ref(false)
-const autoRunningQueue = ref(false)
 const retryingJob = reactive({})
 const selectedIds = reactive(new Set())
 let refreshTimer = 0
 let refreshGeneration = 0
-let lastAutoQueueRunAt = 0
 
 const connection = reactive({ subtitle_backend_url: '', subtitle_backend_token: '' })
 const settings = reactive({
@@ -414,7 +412,6 @@ const runningCount = computed(() => runningJobs.value.length)
 const waitingCount = computed(() => waitingJobs.value.length)
 const failedCount = computed(() => failedJobs.value.length)
 const detachedCount = computed(() => detachedJobs.value.length)
-const activePostprocessCount = computed(() => adaptedPostprocessJobs.value.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)).length)
 const statusTabs = computed(() => [
   { key: 'all', label: '全部', count: activeJobs.value.length, items: activeJobs.value },
   { key: 'running', label: '运行中', count: runningCount.value, items: runningJobs.value },
@@ -429,7 +426,6 @@ const visiblePagedJobs = computed(() => visibleJobs.value.slice((page.value - 1)
 const selectedJobs = computed(() => adaptedJobs.value.filter((job) => selectedIds.has(job.id)))
 const runnableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canRun))
 const deletableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canDelete))
-const runnableQueueJobs = computed(() => adaptedPostprocessJobs.value.filter((job) => job.canRun))
 const allVisibleSelected = computed(() => visiblePagedJobs.value.length > 0 && visiblePagedJobs.value.every((job) => selectedIds.has(job.id)))
 const memoryLabel = computed(() => {
   const memory = backendStatus.value.hardware?.memory
@@ -486,7 +482,6 @@ async function loadConsole() {
     postprocessTasks.value = postprocessPayload.tasks || []
     applyPostprocessPayload(postprocessPayload)
     backendStatus.value = postprocessPayload.worker_status || consolePayload.backend_status || {}
-    await maybeAutoRunQueue()
   } catch (error) {
     errorMessage.value = error.message || '读取任务中心失败'
   } finally {
@@ -518,7 +513,6 @@ async function refreshAll() {
   postprocessTasks.value = postprocessPayload.tasks || []
   applyPostprocessPayload(postprocessPayload)
   backendStatus.value = postprocessPayload.worker_status || backendStatus.value
-  await maybeAutoRunQueue()
 }
 
 async function testBackend() {
@@ -684,32 +678,6 @@ async function runPostprocessQueue() {
     await refreshAll()
   } catch (error) {
     errorMessage.value = error.message || '执行队列失败'
-  }
-}
-
-async function maybeAutoRunQueue() {
-  const now = Date.now()
-  if (!postprocessSettings.worker_auto_run || !backendOnline.value || autoRunningQueue.value) return
-  const runnableCount = runnableQueueJobs.value.length
-  const activeCount = activePostprocessCount.value
-  if (!runnableCount && !activeCount) return
-  if (now - lastAutoQueueRunAt < 15_000) return
-  lastAutoQueueRunAt = now
-  autoRunningQueue.value = true
-  try {
-    const payload = await postJson('/api/subscriptions/tasks/postprocess_qb/run', {})
-    const result = payload.result || {}
-    const queueResult = result.queue_auto_run || {}
-    const updated = Number(queueResult.updated || 0)
-    const subtitleChecked = Number(result.subtitle?.checked || 0)
-    if (updated || runnableCount) {
-      notice.value = `算力端在线，已自动推进后处理链路（派发 ${updated} 个，检查字幕 ${subtitleChecked} 个）。`
-    }
-    await refreshAll()
-  } catch (error) {
-    errorMessage.value = error.message || '自动推进后处理失败'
-  } finally {
-    autoRunningQueue.value = false
   }
 }
 
@@ -1009,7 +977,7 @@ function postprocessPhase(status) {
 function postprocessStatusKey(status) {
   const value = String(status || '')
   if (['waiting_worker', 'ready_to_run', 'created'].includes(value)) return 'queued'
-  if (['sent_to_worker', 'transcoding', 'worker_done', 'transcode_validating'].includes(value)) return 'running'
+  if (['dispatching', 'sent_to_worker', 'transcoding', 'worker_done', 'transcode_validating'].includes(value)) return 'running'
   if (['subtitle_processing', 'subtitle_validating', 'transcode_done'].includes(value)) return 'translating'
   if (value === 'completed') return 'completed'
   if (['failed', 'ignored', 'conflict', 'expired'].includes(value)) return 'failed'
@@ -1018,6 +986,7 @@ function postprocessStatusKey(status) {
 
 function postprocessStatusLabel(status, phase, statusKey, qbIssue = null) {
   if (qbIssue) return qbIssue.label
+  if (String(status || '') === 'dispatching') return '派发中'
   if (statusKey === 'running' && phase === 'transcode') return '转码中'
   if (statusKey === 'translating' && phase === 'subtitle') return '生成字幕中'
   if (statusKey === 'queued') {

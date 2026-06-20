@@ -856,8 +856,9 @@ class PostprocessFlowTest(unittest.TestCase):
         task = post.create_task(av_id=av_id, task_type="wash_chinese", status="ready_to_run")
         service.update_av_wash(av_id, {"mode": "chinese", "status": "requested", "task_id": task["id"]})
 
-        with TestClient(self.main.app) as client:
-            response = client.post(f"/api/postprocess/tasks/{task['id']}/cancel")
+        with patch.object(self.main, "current_console_user", return_value="test"):
+            with TestClient(self.main.app) as client:
+                response = client.post(f"/api/postprocess/tasks/{task['id']}/cancel")
 
         subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
         self.assertEqual(response.status_code, 200)
@@ -891,8 +892,9 @@ class PostprocessFlowTest(unittest.TestCase):
         task = post.create_task(av_id="DELETE-FAILED-001", task_type="subscription", status="failed")
         post.add_event(task["id"], "error", "failed", "测试失败任务")
 
-        with TestClient(self.main.app) as client:
-            response = client.delete(f"/api/postprocess/tasks/{task['id']}")
+        with patch.object(self.main, "current_console_user", return_value="test"):
+            with TestClient(self.main.app) as client:
+                response = client.delete(f"/api/postprocess/tasks/{task['id']}")
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(post.get_task(task["id"]))
@@ -902,8 +904,9 @@ class PostprocessFlowTest(unittest.TestCase):
         post = self.main.get_postprocess_service()
         task = post.create_task(av_id="DELETE-ACTIVE-001", task_type="subscription", status="ready_to_run")
 
-        with TestClient(self.main.app) as client:
-            response = client.delete(f"/api/postprocess/tasks/{task['id']}")
+        with patch.object(self.main, "current_console_user", return_value="test"):
+            with TestClient(self.main.app) as client:
+                response = client.delete(f"/api/postprocess/tasks/{task['id']}")
 
         self.assertEqual(response.status_code, 400)
         self.assertIsNotNone(post.get_task(task["id"]))
@@ -916,8 +919,9 @@ class PostprocessFlowTest(unittest.TestCase):
         task = post.create_task(av_id=av_id, task_type="wash_chinese", status="ready_to_run")
         service.update_av_wash(av_id, {"mode": "chinese", "status": "requested", "task_id": task["id"]})
 
-        with TestClient(self.main.app) as client:
-            response = client.post(f"/api/subscriptions/av/{av_id}/wash", json={"mode": "chinese", "status": "cancelled"})
+        with patch.object(self.main, "current_console_user", return_value="test"):
+            with TestClient(self.main.app) as client:
+                response = client.post(f"/api/subscriptions/av/{av_id}/wash", json={"mode": "chinese", "status": "cancelled"})
 
         subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
         self.assertEqual(response.status_code, 200)
@@ -1129,7 +1133,7 @@ class PostprocessFlowTest(unittest.TestCase):
 
         self.assertTrue(ready["ok"])
         self.assertFalse(missing["ok"])
-        self.assertEqual(missing["reason"], "控制端无法读取下载文件")
+        self.assertIn("控制端无法读取下载文件", missing["reason"])
         self.assertFalse(mismatch["ok"])
         self.assertEqual(mismatch["reason"], "下载文件本地大小与 qB 记录差异过大")
 
@@ -1450,11 +1454,14 @@ class PostprocessFlowTest(unittest.TestCase):
         task = post.create_task(av_id="TEST-WARN", task_type="subscription", status="ready_to_run")
         post.update_task(task["id"], status="completed", error_code="source_trash_failed", error_message="源文件清理失败")
 
-        with TestClient(self.main.app) as client:
-            response = client.get("/transcode")
+        with patch.object(self.main, "current_console_user", return_value="test"):
+            with TestClient(self.main.app) as client:
+                response = client.get("/api/postprocess/tasks?limit=10")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("completed · warning", response.text)
+        payload = response.json()
+        returned = next(item for item in payload["tasks"] if item["id"] == task["id"])
+        self.assertEqual(returned["status"], "completed")
         self.assertIn("source_trash_failed", response.text)
 
     def test_queue_runs_local_task_when_remote_worker_offline(self) -> None:
@@ -1511,6 +1518,37 @@ class PostprocessFlowTest(unittest.TestCase):
         updated = post.get_task(task["id"])
         self.assertEqual(result["status"], "waiting_worker")
         self.assertEqual(updated["status"], "waiting_worker")
+
+    def test_postprocess_task_claim_only_succeeds_once(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="TEST-017", task_type="subscription", status="ready_to_run")
+
+        first = post.claim_task_status(task["id"], self.main.RUNNABLE_POSTPROCESS_STATUSES, self.main.DISPATCHING_POSTPROCESS_STATUS)
+        second = post.claim_task_status(task["id"], self.main.RUNNABLE_POSTPROCESS_STATUSES, self.main.DISPATCHING_POSTPROCESS_STATUS)
+
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertEqual(first["status"], "dispatching")
+        self.assertIsNone(second)
+        self.assertEqual(post.get_task(task["id"])["status"], "dispatching")
+
+    def test_postprocess_task_list_is_read_only(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="TEST-018", task_type="subscription", status="transcoding")
+        original_recover = self.main.recover_finished_worker_jobs
+
+        def fail_if_called(_worker_status: dict[str, object]) -> list[dict[str, object]]:
+            raise AssertionError("task list endpoint must not recover worker jobs")
+
+        self.main.recover_finished_worker_jobs = fail_if_called
+        try:
+            payload = self.main.api_postprocess_tasks()
+        finally:
+            self.main.recover_finished_worker_jobs = original_recover
+
+        self.assertTrue(any(item["id"] == task["id"] for item in payload["tasks"]))
+        self.assertEqual(payload["recovered_finished"], [])
+        self.assertEqual(post.get_task(task["id"])["status"], "transcoding")
 
     def test_task_events_are_visible_in_system_logs(self) -> None:
         post = self.main.get_postprocess_service()

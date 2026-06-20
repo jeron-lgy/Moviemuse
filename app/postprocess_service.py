@@ -338,17 +338,18 @@ class PostprocessService:
             row = conn.execute("SELECT * FROM postprocess_tasks WHERE id = ?", (task_id,)).fetchone()
         return row_to_task(row) if row else None
 
-    def list_tasks(self, *, limit: int = 100, statuses: list[str] | None = None) -> list[dict[str, Any]]:
+    def list_tasks(self, *, limit: int = 100, statuses: list[str] | None = None, order: str = "desc") -> list[dict[str, Any]]:
         params: list[Any] = []
         where = ""
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
             where = f"WHERE status IN ({placeholders})"
             params.extend(statuses)
+        direction = "ASC" if str(order or "").lower() == "asc" else "DESC"
         params.append(max(1, min(500, int(limit or 100))))
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM postprocess_tasks {where} ORDER BY created_at DESC LIMIT ?",
+                f"SELECT * FROM postprocess_tasks {where} ORDER BY created_at {direction} LIMIT ?",
                 params,
             ).fetchall()
         return [row_to_task(row) for row in rows]
@@ -391,6 +392,25 @@ class PostprocessService:
         params.append(task_id)
         with self._connect() as conn:
             conn.execute(f"UPDATE postprocess_tasks SET {', '.join(assignments)} WHERE id = ?", params)
+        return self.get_task(task_id)
+
+    def claim_task_status(self, task_id: str, expected_statuses: list[str] | set[str] | tuple[str, ...], next_status: str) -> dict[str, Any] | None:
+        statuses = [str(item) for item in expected_statuses if str(item or "").strip()]
+        if not statuses:
+            return None
+        placeholders = ",".join("?" for _ in statuses)
+        now = time.time()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE postprocess_tasks
+                SET status = ?, error_code = '', error_message = '', updated_at = ?, finished_at = 0
+                WHERE id = ? AND status IN ({placeholders})
+                """,
+                [next_status, now, task_id, *statuses],
+            )
+            if cursor.rowcount != 1:
+                return None
         return self.get_task(task_id)
 
     def delete_task(self, task_id: str) -> dict[str, Any] | None:

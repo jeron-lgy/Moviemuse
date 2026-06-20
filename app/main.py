@@ -626,10 +626,13 @@ CONSOLE_SESSION_COOKIE = "moviemuse_session"
 CONSOLE_SESSION_TTL = 7 * 24 * 60 * 60
 CONSOLE_AUTH_OPEN_PREFIXES = (
     "/api/auth",
-    "/api/subtitle",
+    "/api/subtitle/jobs",
+    "/api/subtitle/upload",
+    "/api/subtitle/node",
+    "/api/subtitle/translate",
     "/api/transcode",
     "/api/compute",
-    "/api/integrations",
+    "/api/integrations/jellyfin",
     "/static",
     "/assets",
     "/docs",
@@ -9160,7 +9163,7 @@ def poll_postprocess_once() -> dict[str, Any]:
     recovered_missing = recover_missing_worker_jobs(worker_status) if bool(worker_status.get("online") or worker_status.get("status") == "ok") else []
     worker_queue = refresh_worker_queue_readiness(worker_status)
     if bool(post_settings.get("worker_auto_run")):
-        candidates = post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=1)
+        candidates = post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=1, order="asc")
         if candidates:
             queue_result = run_postprocess_queue()
             app_log("info", "postprocess", "后处理队列自动执行已处理", {
@@ -9723,7 +9726,6 @@ def api_postprocess_tasks(status: str | None = None, limit: int = 200) -> dict[s
     statuses = [item.strip() for item in str(status or "").split(",") if item.strip()]
     post = get_postprocess_service()
     worker_status = subtitle_backend_status()
-    recovered_finished = recover_finished_worker_jobs(worker_status)
     tasks = post.list_tasks(statuses=statuses or None, limit=limit)
     qb_rows = post.list_qb_torrents(limit=500)
     return {
@@ -9731,7 +9733,7 @@ def api_postprocess_tasks(status: str | None = None, limit: int = 200) -> dict[s
         "qb_torrents": qb_rows,
         "settings": post.get_settings(),
         "worker_status": worker_status,
-        "recovered_finished": recovered_finished,
+        "recovered_finished": [],
     }
 
 
@@ -9750,12 +9752,18 @@ def api_run_postprocess_task(task_id: str) -> dict[str, object]:
     task = post.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="后处理任务不存在")
+    status = str(task.get("status") or "")
+    if status not in RUNNABLE_POSTPROCESS_STATUSES:
+        return {"status": "skipped", "reason": "not_runnable", "task": task}
     settings_payload = post.get_settings()
     if postprocess_task_needs_worker(task, settings_payload) and worker_is_offline():
         updated = post.update_task(task_id, status="waiting_worker", error_code="", error_message="")
         post.add_event(task_id, "info", "worker_offline", "算力端离线，单任务执行已保留在等待队列")
         return {"status": "waiting_worker", "task": updated}
-    return dispatch_postprocess_task(task)
+    claimed = claim_postprocess_task_for_dispatch(task)
+    if not claimed:
+        return {"status": "skipped", "reason": "status_changed", "task": post.get_task(task_id)}
+    return dispatch_postprocess_task(claimed)
 
 
 def reset_postprocess_task_for_retry(task: dict[str, Any]) -> str:
@@ -9967,6 +9975,7 @@ async def api_run_selected_postprocess_tasks(request: Request) -> dict[str, obje
 
 
 WORKER_ACTIVE_TASK_STATUSES = {
+    "dispatching",
     "sent_to_worker",
     "transcoding",
     "worker_done",
@@ -10173,6 +10182,17 @@ def postprocess_task_needs_worker(task: dict[str, Any], settings_payload: dict[s
 
 
 RUNNABLE_POSTPROCESS_STATUSES = {"waiting_worker", "ready_to_run"}
+DISPATCHING_POSTPROCESS_STATUS = "dispatching"
+
+
+def claim_postprocess_task_for_dispatch(task: dict[str, Any]) -> dict[str, Any] | None:
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return None
+    claimed = get_postprocess_service().claim_task_status(task_id, RUNNABLE_POSTPROCESS_STATUSES, DISPATCHING_POSTPROCESS_STATUS)
+    if claimed:
+        get_postprocess_service().add_event(task_id, "info", "task_dispatch_claimed", "后处理任务已进入派发保护状态")
+    return claimed
 
 
 def hold_postprocess_tasks_missing_input(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -10222,8 +10242,12 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
     worker_candidates = [task for task in tasks if postprocess_task_needs_worker(task, settings_payload)]
     updated: list[dict[str, Any]] = []
     for task in local_candidates:
+        claimed = claim_postprocess_task_for_dispatch(task)
+        if not claimed:
+            skipped.append({"task_id": str(task.get("id") or ""), "reason": "status_changed"})
+            continue
         try:
-            updated.append(dispatch_postprocess_task(task))
+            updated.append(dispatch_postprocess_task(claimed))
         except Exception as exc:
             message = str(exc)
             post.update_task(str(task["id"]), status="ready_to_run", error_code="local_postprocess_failed", error_message=message)
@@ -10277,8 +10301,12 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
 
     deferred = max(0, len(worker_candidates) - available_slots)
     for task in worker_candidates[:available_slots]:
+        claimed = claim_postprocess_task_for_dispatch(task)
+        if not claimed:
+            skipped.append({"task_id": str(task.get("id") or ""), "reason": "status_changed"})
+            continue
         try:
-            updated.append(dispatch_postprocess_task(task))
+            updated.append(dispatch_postprocess_task(claimed))
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
             message = f"算力端接口返回 {status_code}: {exc.response.text[:200] if exc.response is not None else exc}"
@@ -10345,17 +10373,19 @@ def run_postprocess_queue() -> dict[str, object]:
     online = bool(worker_status.get("online") or worker_status.get("status") == "ok")
     recovered_finished = recover_finished_worker_jobs(worker_status) if online else []
     recovered_missing = recover_missing_worker_jobs(worker_status) if online else []
-    candidates = sorted(
-        post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=200),
-        key=lambda item: float(item.get("created_at") or 0),
-    )
+    candidates = post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=500, order="asc")
     candidates, held_missing_input = hold_postprocess_tasks_missing_input(candidates)
     local_candidates = [task for task in candidates if not postprocess_task_needs_worker(task, settings_payload)]
     worker_candidates = [task for task in candidates if postprocess_task_needs_worker(task, settings_payload)]
     updated: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     for task in local_candidates:
+        claimed = claim_postprocess_task_for_dispatch(task)
+        if not claimed:
+            skipped.append({"task_id": str(task.get("id") or ""), "reason": "status_changed"})
+            continue
         try:
-            updated.append(dispatch_postprocess_task(task))
+            updated.append(dispatch_postprocess_task(claimed))
         except Exception as exc:
             message = str(exc)
             post.update_task(task["id"], status="ready_to_run", error_code="local_postprocess_failed", error_message=message)
@@ -10370,6 +10400,7 @@ def run_postprocess_queue() -> dict[str, object]:
             "updated": len(updated),
             "waiting": len(worker_candidates),
             "held": held_missing_input,
+            "skipped": skipped,
             "recovered_finished": recovered_finished,
             "recovered_missing": recovered_missing,
             "worker_status": worker_status,
@@ -10392,6 +10423,7 @@ def run_postprocess_queue() -> dict[str, object]:
             "updated": len(updated),
             "queued": len(worker_candidates),
             "held": held_missing_input,
+            "skipped": skipped,
             "recovered_finished": recovered_finished,
             "recovered_missing": recovered_missing,
             "max_concurrency": max_concurrency,
@@ -10402,8 +10434,12 @@ def run_postprocess_queue() -> dict[str, object]:
 
     deferred = max(0, len(worker_candidates) - available_slots)
     for task in worker_candidates[:available_slots]:
+        claimed = claim_postprocess_task_for_dispatch(task)
+        if not claimed:
+            skipped.append({"task_id": str(task.get("id") or ""), "reason": "status_changed"})
+            continue
         try:
-            result = dispatch_postprocess_task(task)
+            result = dispatch_postprocess_task(claimed)
             updated.append(result)
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
@@ -10429,6 +10465,7 @@ def run_postprocess_queue() -> dict[str, object]:
         "updated": len(updated),
         "deferred": deferred,
         "held": held_missing_input,
+        "skipped": skipped,
         "recovered_finished": recovered_finished,
         "recovered_missing": recovered_missing,
         "max_concurrency": max_concurrency,
