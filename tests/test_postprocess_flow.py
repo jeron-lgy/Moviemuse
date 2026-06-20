@@ -1566,6 +1566,7 @@ class PostprocessFlowTest(unittest.TestCase):
         post = self.main.get_postprocess_service()
         post.update_settings({"worker_auto_run": True, "auto_transcode_enabled": True})
         task = post.create_task(av_id="TEST-006", task_type="subscription", status="ready_to_run")
+        post.update_task(task["id"], input_path=str(self.root / "TEST-006.mp4"))
         calls: list[str] = []
         original_dispatch = self.main.dispatch_postprocess_task
 
@@ -1588,6 +1589,7 @@ class PostprocessFlowTest(unittest.TestCase):
         post = self.main.get_postprocess_service()
         post.update_settings({"worker_auto_run": False, "auto_transcode_enabled": True})
         task = post.create_task(av_id="TEST-007", task_type="subscription", status="waiting_worker")
+        post.update_task(task["id"], input_path=str(self.root / "TEST-007.mp4"))
         calls: list[str] = []
         original_dispatch = self.main.dispatch_postprocess_task
 
@@ -1606,11 +1608,24 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertIsNone(result["queue_auto_run"])
         self.assertEqual(post.get_task(task["id"])["status"], "ready_to_run")
 
+    def test_waiting_worker_without_input_is_not_promoted(self) -> None:
+        post = self.main.get_postprocess_service()
+        post.update_settings({"worker_auto_run": False, "auto_transcode_enabled": True})
+        task = post.create_task(av_id="TEST-008", task_type="subscription", status="waiting_worker")
+
+        result = self.main.refresh_worker_queue_readiness({"status": "ok", "online": True})
+
+        updated = post.get_task(task["id"])
+        self.assertEqual(result["promoted"], [])
+        self.assertEqual(updated["status"], "waiting_input")
+        self.assertIn("路径回写", updated["error_message"])
+
     def test_postprocess_queue_respects_max_concurrency(self) -> None:
         post = self.main.get_postprocess_service()
         post.update_settings({"max_concurrency": 1, "auto_transcode_enabled": True})
         active = post.create_task(av_id="TEST-009", task_type="subscription", status="sent_to_worker")
         ready = post.create_task(av_id="TEST-010", task_type="subscription", status="ready_to_run")
+        post.update_task(ready["id"], input_path=str(self.root / "TEST-010.mp4"))
         calls: list[str] = []
         original_dispatch = self.main.dispatch_postprocess_task
 
@@ -1635,8 +1650,10 @@ class PostprocessFlowTest(unittest.TestCase):
         post = self.main.get_postprocess_service()
         post.update_settings({"max_concurrency": 1, "auto_transcode_enabled": True})
         first = post.create_task(av_id="TEST-011", task_type="subscription", status="ready_to_run")
+        post.update_task(first["id"], input_path=str(self.root / "TEST-011.mp4"))
         time.sleep(0.01)
         second = post.create_task(av_id="TEST-012", task_type="subscription", status="ready_to_run")
+        post.update_task(second["id"], input_path=str(self.root / "TEST-012.mp4"))
         calls: list[str] = []
         original_dispatch = self.main.dispatch_postprocess_task
 
@@ -1657,6 +1674,33 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(result["deferred"], 1)
         self.assertEqual(post.get_task(first["id"])["status"], "sent_to_worker")
         self.assertEqual(post.get_task(second["id"])["status"], "ready_to_run")
+
+    def test_postprocess_queue_skips_missing_input_before_dispatch(self) -> None:
+        post = self.main.get_postprocess_service()
+        post.update_settings({"max_concurrency": 1, "auto_transcode_enabled": True})
+        stale = post.create_task(av_id="TEST-MISSING", task_type="subscription", status="ready_to_run")
+        time.sleep(0.01)
+        ready = post.create_task(av_id="TEST-READY", task_type="subscription", status="ready_to_run")
+        post.update_task(ready["id"], input_path=str(self.root / "TEST-READY.mp4"))
+        calls: list[str] = []
+        original_dispatch = self.main.dispatch_postprocess_task
+
+        def fake_dispatch(task_payload: dict[str, object]) -> dict[str, object]:
+            calls.append(str(task_payload["id"]))
+            post.update_task(str(task_payload["id"]), status="sent_to_worker")
+            return {"task_id": task_payload["id"], "status": "sent_to_worker"}
+
+        self.main.dispatch_postprocess_task = fake_dispatch
+        try:
+            result = self.main.run_postprocess_queue()
+        finally:
+            self.main.dispatch_postprocess_task = original_dispatch
+
+        self.assertEqual(calls, [ready["id"]])
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(post.get_task(stale["id"])["status"], "waiting_input")
+        self.assertEqual(post.get_task(ready["id"])["status"], "sent_to_worker")
 
 
 if __name__ == "__main__":

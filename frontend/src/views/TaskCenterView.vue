@@ -976,7 +976,7 @@ function postprocessPhase(status) {
 
 function postprocessStatusKey(status) {
   const value = String(status || '')
-  if (['waiting_worker', 'ready_to_run', 'created'].includes(value)) return 'queued'
+  if (['waiting_worker', 'waiting_input', 'ready_to_run', 'created'].includes(value)) return 'queued'
   if (['dispatching', 'sent_to_worker', 'transcoding', 'worker_done', 'transcode_validating'].includes(value)) return 'running'
   if (['subtitle_processing', 'subtitle_validating', 'transcode_done'].includes(value)) return 'translating'
   if (value === 'completed') return 'completed'
@@ -992,6 +992,7 @@ function postprocessStatusLabel(status, phase, statusKey, qbIssue = null) {
   if (statusKey === 'queued') {
     const value = String(status || '')
     if (value === 'waiting_worker') return '等待算力端'
+    if (value === 'waiting_input') return '等待输入文件'
     if (value === 'ready_to_run') return '等待队列'
     if (['torrent_pushed', 'downloading'].includes(value)) return '等待下载'
     if (value === 'created') return '未接管'
@@ -1008,6 +1009,7 @@ function postprocessWaitingDetail(task, statusKey, qbIssue = null) {
   if (statusKey !== 'queued') return ''
   const status = String(task?.status || '')
   if (status === 'waiting_worker') return '算力端离线或未就绪'
+  if (status === 'waiting_input') return '等待下载完成或路径回写'
   if (status === 'ready_to_run') {
     if (task?.input_path) return '等待队列执行'
     return '等待链路写入输入文件'

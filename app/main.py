@@ -9145,6 +9145,9 @@ def refresh_worker_queue_readiness(worker_status: dict[str, Any] | None = None) 
     if online:
         for task in waiting:
             task_id = str(task.get("id") or "")
+            held_item = hold_postprocess_task_missing_input(task)
+            if held_item:
+                continue
             post.update_task(task_id, status="ready_to_run", error_code="", error_message="")
             post.add_event(task_id, "info", "worker_ready", "算力端在线，任务已进入可执行队列", {"worker_status": status_payload})
             promoted.append(task_id)
@@ -10182,6 +10185,7 @@ def postprocess_task_needs_worker(task: dict[str, Any], settings_payload: dict[s
 
 
 RUNNABLE_POSTPROCESS_STATUSES = {"waiting_worker", "ready_to_run"}
+MISSING_INPUT_POSTPROCESS_STATUS = "waiting_input"
 DISPATCHING_POSTPROCESS_STATUS = "dispatching"
 
 
@@ -10195,24 +10199,40 @@ def claim_postprocess_task_for_dispatch(task: dict[str, Any]) -> dict[str, Any] 
     return claimed
 
 
+def hold_postprocess_task_missing_input(task: dict[str, Any]) -> dict[str, Any] | None:
+    if str(task.get("input_path") or "").strip():
+        return None
+    post = get_postprocess_service()
+    task_id = str(task.get("id") or "")
+    torrent_hash = str(task.get("torrent_hash") or "").strip()
+    if torrent_hash:
+        next_status = reset_postprocess_task_for_retry(task)
+        return {
+            "task_id": task_id,
+            "status": next_status,
+            "reason": "missing_input_waiting_qb",
+            "torrent_hash": torrent_hash,
+        }
+    message = "等待下载完成或路径回写，当前任务缺少输入文件"
+    updated = post.update_task(task_id, status=MISSING_INPUT_POSTPROCESS_STATUS, error_code="", error_message=message)
+    if updated:
+        post.add_event(task_id, "warning", "missing_input_waiting", message)
+    return {
+        "task_id": task_id,
+        "status": MISSING_INPUT_POSTPROCESS_STATUS,
+        "reason": "missing_input_no_torrent",
+    }
+
+
 def hold_postprocess_tasks_missing_input(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     runnable: list[dict[str, Any]] = []
     held: list[dict[str, Any]] = []
     for task in tasks:
-        if str(task.get("input_path") or "").strip():
+        held_item = hold_postprocess_task_missing_input(task)
+        if not held_item:
             runnable.append(task)
             continue
-        torrent_hash = str(task.get("torrent_hash") or "").strip()
-        if not torrent_hash:
-            runnable.append(task)
-            continue
-        next_status = reset_postprocess_task_for_retry(task)
-        held.append({
-            "task_id": str(task.get("id") or ""),
-            "status": next_status,
-            "reason": "missing_input_waiting_qb",
-            "torrent_hash": torrent_hash,
-        })
+        held.append(held_item)
     return runnable, held
 
 
