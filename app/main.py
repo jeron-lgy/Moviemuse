@@ -14,6 +14,7 @@ import secrets
 import uuid
 import hashlib
 import base64
+import codecs
 import struct
 from datetime import date, datetime
 from pathlib import Path
@@ -1108,6 +1109,8 @@ def gpu_summary() -> list[dict[str, object]]:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=4,
             check=True,
         )
@@ -1222,12 +1225,23 @@ def parse_ffmpeg_progress_line(line: str, duration: float) -> dict[str, Any]:
 
 
 def read_process_stream(stream: Any, chunks: "queue.Queue[str | None]") -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    stream_is_binary = False
     try:
         while True:
             chunk = stream.read(1)
             if not chunk:
                 break
+            if isinstance(chunk, bytes):
+                stream_is_binary = True
+                chunk = decoder.decode(chunk)
+                if not chunk:
+                    continue
             chunks.put(chunk)
+        if stream_is_binary:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                chunks.put(tail)
     finally:
         try:
             stream.close()
@@ -1450,9 +1464,6 @@ def run_transcode_job_background(job_id: str) -> None:
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
         )
         chunks: queue.Queue[str | None] = queue.Queue()
         if process.stderr:
@@ -8366,6 +8377,8 @@ def run_ffprobe(path: Path) -> dict[str, Any]:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
         check=True,
     )

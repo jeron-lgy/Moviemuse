@@ -67,8 +67,10 @@ async function login() {
 .login-card {
   display: grid;
   gap: 26px;
-  width: min(420px, 100%);
+  width: min(420px, calc(100vw - 48px));
+  max-width: 100%;
   padding: 30px;
+  overflow: hidden;
 }
 
 .login-brand {
@@ -108,10 +110,21 @@ async function login() {
 .login-form {
   display: grid;
   gap: 16px;
+  min-width: 0;
+}
+
+.login-form :deep(.mm-field),
+.login-form :deep(.mm-secret-input) {
+  min-width: 0;
+}
+
+.login-form :deep(.mm-notice) {
+  overflow-wrap: anywhere;
 }
 
 input {
   width: 100%;
+  max-width: 100%;
   min-height: 44px;
   padding: 0 14px;
   border: 1px solid var(--mm-border);

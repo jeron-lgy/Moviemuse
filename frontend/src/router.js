@@ -43,6 +43,20 @@ export const router = createRouter({
   routes
 })
 
+const STALE_BUILD_RELOAD_KEY = 'moviemuse:stale-build-reload'
+const STALE_BUILD_ERROR_RE = /Failed to fetch dynamically imported module|Importing a module script failed|Unable to preload CSS|dynamically imported module/i
+
+function isStaleBuildError(error) {
+  return STALE_BUILD_ERROR_RE.test(String(error?.message || error || ''))
+}
+
+router.onError((error) => {
+  if (!isStaleBuildError(error)) return
+  if (sessionStorage.getItem(STALE_BUILD_RELOAD_KEY) === '1') return
+  sessionStorage.setItem(STALE_BUILD_RELOAD_KEY, '1')
+  window.location.reload()
+})
+
 router.beforeEach(async (to) => {
   if (to.meta.public) return true
   try {
@@ -58,5 +72,6 @@ router.beforeEach(async (to) => {
 })
 
 router.afterEach((to) => {
+  sessionStorage.removeItem(STALE_BUILD_RELOAD_KEY)
   document.title = `${to.meta.title || 'MovieMuse'} - MovieMuse`
 })
