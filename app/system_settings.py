@@ -212,7 +212,6 @@ class SystemSettingsService:
         demo["hide_system_settings"] = bool(demo.get("hide_system_settings", True))
         demo["cover_url"] = str(demo.get("cover_url") or "").strip()
 
-
 def merge_dict(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key, value in source.items():
         if isinstance(value, dict) and isinstance(target.get(key), dict):

@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -109,7 +110,13 @@ class PostprocessFlowTest(unittest.TestCase):
         )
 
         self.assertEqual(subscription, str(output_root / "IPZZ-872" / "IPZZ-872.mp4"))
-        self.assertEqual(wash, str(output_root / "ABF-359" / "ABF-359.chinese.mkv"))
+        self.assertEqual(wash, str(output_root / "ABF-359" / "ABF-359.mkv"))
+
+        leading_zero = self.main.build_postprocess_output_path(
+            {"av_id": "SNOS-71", "task_type": "external_qb", "input_path": str(self.root / "SNOS-071-4K.mkv")},
+            settings,
+        )
+        self.assertEqual(leading_zero, str(output_root / "SNOS-071" / "SNOS-071-4K.mkv"))
 
     def test_transcode_validation_copies_metadata_sidecars(self) -> None:
         source_dir = self.root / "study3"
@@ -158,11 +165,132 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         for filename in ("IPZZ-872.nfo", "IPZZ-872-fanart.jpg", "IPZZ-872-poster.jpg", "IPZZ-872-thumb.jpg"):
             self.assertTrue((output_path.parent / filename).exists(), filename)
+            self.assertFalse((source_dir / filename).exists(), filename)
         updated = post.get_task(task["id"])
         assert updated is not None
         self.assertEqual(updated["data"]["metadata_sidecars"]["status"], "ok")
+        self.assertEqual(len(updated["data"]["metadata_sidecars"]["moved"]), 4)
         events = post.list_events(task["id"])
-        self.assertTrue(any(event["stage"] == "metadata_sidecars_copied" for event in events))
+        self.assertTrue(any(event["stage"] == "metadata_sidecars_moved" for event in events))
+
+    def test_nfo_actor_repair_syncs_actor_within_single_movie_directory(self) -> None:
+        output_root = self.root / "out"
+        movie_dir = output_root / "MIDA-609"
+        movie_dir.mkdir(parents=True)
+        (movie_dir / "MIDA-609.nfo").write_text(
+            '<?xml version="1.0" encoding="utf-8"?><movie><title>MIDA-609</title><actor><name>神宫寺奈绪</name><type>Actor</type></actor><fileinfo /></movie>',
+            encoding="utf-8",
+        )
+        (movie_dir / "movie.nfo").write_text(
+            '<?xml version="1.0" encoding="utf-8"?><movie><title>MIDA-609</title><tag>神宫寺奈绪</tag><fileinfo /></movie>',
+            encoding="utf-8",
+        )
+        self.main.get_postprocess_service().update_settings({"output_dir": str(output_root)})
+
+        preview = self.main.nfo_actor_repair_candidates(apply=False)
+        self.assertEqual(preview["repairable_dirs"], 1)
+        self.assertEqual(preview["target_files"], 1)
+        self.assertEqual(preview["items"][0]["target_files"], ["movie.nfo"])
+
+        applied = self.main.nfo_actor_repair_candidates(apply=True)
+        self.assertEqual(applied["repaired_files"], 1)
+        repaired_text = (movie_dir / "movie.nfo").read_text(encoding="utf-8")
+        self.assertIn("<actor>", repaired_text)
+        self.assertIn("<name>神宫寺奈绪</name>", repaired_text)
+        self.assertTrue(list(movie_dir.glob("movie.nfo.bak-*")))
+
+    @unittest.skipIf(os.name == "nt", "POSIX readonly replacement semantics are tested on Linux")
+    def test_nfo_actor_repair_replaces_readonly_target_file(self) -> None:
+        output_root = self.root / "out"
+        movie_dir = output_root / "ABF-358"
+        movie_dir.mkdir(parents=True)
+        (movie_dir / "ABF-358.av1.nfo").write_text(
+            '<movie><title>ABF-358</title><actor><name>凉森玲梦</name><type>Actor</type></actor></movie>',
+            encoding="utf-8",
+        )
+        target = movie_dir / "movie.nfo"
+        target.write_text(
+            '<movie><title>ABF-358</title><tag>凉森玲梦</tag></movie>',
+            encoding="utf-8",
+        )
+        target.chmod(0o444)
+        self.main.get_postprocess_service().update_settings({"output_dir": str(output_root)})
+
+        try:
+            applied = self.main.nfo_actor_repair_candidates(apply=True)
+        finally:
+            target.chmod(0o644)
+
+        self.assertEqual(applied["repaired_files"], 1)
+        self.assertIn("<name>凉森玲梦</name>", target.read_text(encoding="utf-8"))
+        self.assertTrue(list(movie_dir.glob("movie.nfo.bak-*")))
+
+    def test_nfo_actor_repair_skips_output_root_to_avoid_cross_movie_copy(self) -> None:
+        output_root = self.root / "out"
+        output_root.mkdir(parents=True)
+        (output_root / "ABF-361.nfo").write_text(
+            '<movie><title>ABF-361</title><actor><name>中森ななみ</name><type>Actor</type></actor></movie>',
+            encoding="utf-8",
+        )
+        (output_root / "SNOS-209.nfo").write_text(
+            '<movie><title>SNOS-209</title><tag>瀬戸環奈</tag></movie>',
+            encoding="utf-8",
+        )
+        self.main.get_postprocess_service().update_settings({"output_dir": str(output_root)})
+
+        preview = self.main.nfo_actor_repair_candidates(apply=False)
+
+        self.assertEqual(preview["repairable_dirs"], 0)
+        self.assertEqual(preview["target_files"], 0)
+        self.assertTrue(any(item["reason"] == "skip_output_root" for item in preview["skipped"]))
+
+    def test_jellyfin_actor_refresh_finds_item_with_missing_people(self) -> None:
+        output_root = self.root / "out"
+        output_root.mkdir(parents=True)
+        (output_root / "SONE-250.nfo").write_text(
+            '<movie><title>SONE-250</title><actor><name>葵司</name><type>Actor</type></actor></movie>',
+            encoding="utf-8",
+        )
+        (output_root / "SONE-250.mp4").write_bytes(b"video")
+        self.main.get_postprocess_service().update_settings({"output_dir": str(output_root)})
+
+        with patch.object(self.main, "jellyfin_config", return_value={"url": "http://jf", "api_key": "key"}), \
+            patch.object(self.main, "find_jellyfin_item_for_video", return_value={
+                "Id": "item-1",
+                "Name": "SONE-250",
+                "Path": str(output_root / "SONE-250.mp4"),
+                "People": [],
+            }):
+            preview = self.main.jellyfin_actor_refresh_candidates(apply=False)
+
+        self.assertEqual(preview["actor_nfos"], 1)
+        self.assertEqual(preview["matched_items"], 1)
+        self.assertEqual(preview["target_items"], 1)
+        self.assertEqual(preview["items"][0]["actors"], ["葵司"])
+
+    def test_jellyfin_actor_refresh_triggers_only_missing_people_items(self) -> None:
+        output_root = self.root / "out"
+        output_root.mkdir(parents=True)
+        (output_root / "SONE-250.nfo").write_text(
+            '<movie><title>SONE-250</title><actor><name>葵司</name><type>Actor</type></actor></movie>',
+            encoding="utf-8",
+        )
+        (output_root / "SONE-250.mp4").write_bytes(b"video")
+        self.main.get_postprocess_service().update_settings({"output_dir": str(output_root)})
+
+        with patch.object(self.main, "jellyfin_config", return_value={"url": "http://jf", "api_key": "key"}), \
+            patch.object(self.main, "find_jellyfin_item_for_video", return_value={
+                "Id": "item-1",
+                "Name": "SONE-250",
+                "Path": str(output_root / "SONE-250.mp4"),
+                "People": [],
+            }), \
+            patch.object(self.main, "refresh_jellyfin_item_metadata", return_value={"status": "refreshed"}) as refresh:
+            applied = self.main.jellyfin_actor_refresh_candidates(apply=True)
+
+        self.assertEqual(applied["target_items"], 1)
+        self.assertEqual(applied["refreshed_items"], 1)
+        refresh.assert_called_once()
 
     def test_postprocess_schema_migrates_existing_partial_table(self) -> None:
         from app.postprocess_service import PostprocessService
@@ -1023,6 +1151,27 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertIsNotNone(nested)
         assert nested is not None
         self.assertEqual(nested["path"], "/study3/SNOS-233/Disc/SNOS-233.mkv")
+
+        leading_zero = self.main.pick_main_video_file(
+            [{"name": "ACHJ-083.mp4", "size": 1234}],
+            "ACHJ-83",
+            "/study3/ACHJ-083.mp4",
+        )
+        self.assertIsNotNone(leading_zero)
+        assert leading_zero is not None
+        self.assertEqual(leading_zero["path"], "/study3/ACHJ-083.mp4")
+
+        external_av_id = self.main.infer_external_qb_av_id({"name": "SNOS-071-4K.mkv"})
+        self.assertEqual(external_av_id, "SNOS-071")
+
+        repeated_root = self.main.pick_main_video_file(
+            [{"name": "MIDA-528-U/MIDA-528-U.mp4", "size": 1234}],
+            "MIDA-528",
+            "/study3/MIDA-528-U",
+        )
+        self.assertIsNotNone(repeated_root)
+        assert repeated_root is not None
+        self.assertEqual(repeated_root["path"], "/study3/MIDA-528-U/MIDA-528-U.mp4")
 
     def test_subtitle_validation_marks_active_version_with_chinese_subtitle(self) -> None:
         input_path = self.root / "input-subtitle.mp4"

@@ -320,11 +320,25 @@ def normalize_title(title: str) -> str:
     return re.sub(r"\W+", "", title, flags=re.UNICODE).lower()
 
 
+def normalize_catalog_digits(value: str) -> str:
+    number = str(value or "").strip()
+    if not number:
+        return ""
+    if len(number) <= 3:
+        return number.zfill(3)
+    if number.startswith("0"):
+        stripped = number.lstrip("0") or number
+        if len(stripped) <= 3:
+            return stripped.zfill(3)
+        return stripped
+    return number
+
+
 def detect_catalog_number(value: str) -> str:
-    match = re.search(r"\b([a-zA-Z]{2,10})[-_ ]?0*(\d{2,6})(?:[-_ ]?[cC])?\b", value)
+    match = re.search(r"(?<![a-zA-Z0-9])([a-zA-Z]{2,10})[-_ ]?(\d{2,6})(?:[-_ ]?[cC])?(?![a-zA-Z0-9])", value)
     if not match:
         return ""
-    return f"{match.group(1)}-{match.group(2)}"
+    return f"{match.group(1)}-{normalize_catalog_digits(match.group(2))}"
 
 
 def normalize_catalog_number(value: str) -> str:

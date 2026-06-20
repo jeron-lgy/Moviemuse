@@ -2,6 +2,20 @@
   <section class="duplicates-view">
     <NoticeBanner v-if="message">{{ message }}</NoticeBanner>
     <NoticeBanner v-if="errorMessage" tone="error">{{ errorMessage }}</NoticeBanner>
+    <NoticeBanner v-if="scanRecoveryMessage" :tone="scanRecoveryTone">
+      <div class="scan-recovery-notice">
+        <span>{{ scanRecoveryMessage }}</span>
+        <BaseButton
+          v-if="scan.can_reset"
+          type="button"
+          size="sm"
+          :disabled="resettingScan"
+          @click="resetScanState"
+        >
+          {{ resettingScan ? '重置中' : '重置状态' }}
+        </BaseButton>
+      </div>
+    </NoticeBanner>
 
     <BaseCard class="hero-card">
       <PageHeader
@@ -228,6 +242,7 @@ const selectedPaths = ref([])
 const selectedPathsTouched = ref(false)
 const loading = ref(false)
 const running = ref(false)
+const resettingScan = ref(false)
 const submittingAction = ref(false)
 const message = ref('')
 const errorMessage = ref('')
@@ -282,7 +297,18 @@ const visibleRows = computed(() => [
 ])
 const percent = computed(() => Math.round(Number(scan.value.progress || 0) * 100))
 const scanModeLabel = computed(() => scan.value.mode === 'full' ? '全量' : '增量')
+const scanStatusLabel = computed(() => formatStatus(scan.value.status))
 const scanRunning = computed(() => running.value || scan.value.status === 'running')
+const scanRecoveryMessage = computed(() => {
+  if (scan.value.scan_stale) {
+    return '扫描长时间没有进度，可能卡在文件系统读取。可以先重置状态，再重新扫描。'
+  }
+  if (scan.value.status === 'interrupted') {
+    return scan.value.error || '上次扫描异常中断，已保留旧结果，可以重新扫描。'
+  }
+  return ''
+})
+const scanRecoveryTone = computed(() => scan.value.scan_stale ? 'error' : 'info')
 const autoMoveRows = computed(() => matchedMoveRows())
 const autoSubtitleRows = computed(() => matchedSubtitleRows())
 const moveSelection = computed(() => uniquePaths([
@@ -298,7 +324,7 @@ const subtitleSelection = computed(() => {
 })
 const selectedActionCount = computed(() => moveSelection.value.length + subtitleSelection.value.length)
 const statusItems = computed(() => [
-  { label: '扫描进度', value: `${percent.value}%`, detail: `${scanModeLabel.value} · ${scan.value.processed_files || 0} / ${scan.value.scan_total_files || 0}`, progress: true },
+  { label: '扫描进度', value: `${percent.value}%`, detail: `${scanStatusLabel.value} · ${scanModeLabel.value} · ${scan.value.processed_files || 0} / ${scan.value.scan_total_files || 0}`, progress: true },
   { label: '重复组', value: scan.value.duplicate_groups || 0, detail: `${scan.value.total_files || 0} 文件 · 复用 ${scan.value.reused_files || 0}` },
   { label: '重复文件', value: scan.value.duplicate_files || 0, detail: `${scan.value.single_files?.length || 0} 个单文件` },
   { label: '待处理', value: selectedActionCount.value, detail: `${moveSelection.value.length} 移动 / ${subtitleSelection.value.length} 字幕 · 变更 ${scan.value.changed_files || 0}` }
@@ -345,6 +371,21 @@ async function runScan(mode = 'incremental') {
     errorMessage.value = error.message || '启动扫描失败'
   } finally {
     running.value = false
+  }
+}
+
+async function resetScanState() {
+  resettingScan.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await api('/api/scan/reset', { method: 'POST' })
+    message.value = payload.reset ? '扫描状态已重置，可以重新扫描。' : '当前没有运行中的扫描任务。'
+    await loadScan()
+  } catch (error) {
+    errorMessage.value = error.message || '重置扫描状态失败'
+  } finally {
+    resettingScan.value = false
   }
 }
 
@@ -575,7 +616,8 @@ function formatStatus(status) {
     idle: '待扫描',
     running: '扫描中',
     completed: '已完成',
-    failed: '失败'
+    failed: '失败',
+    interrupted: '已中断'
   }
   return labels[status] || status || '待扫描'
 }
@@ -597,6 +639,17 @@ function formatStatus(status) {
   display: grid;
   gap: 18px;
   border-radius: 16px;
+}
+
+.scan-recovery-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.scan-recovery-notice span {
+  min-width: 0;
 }
 
 .hero-card :deep(.mm-page-head) {

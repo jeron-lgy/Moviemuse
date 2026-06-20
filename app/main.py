@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .log_service import AppLogService
-from .scanner import ScanResult, detect_catalog_number, scan_libraries
+from .scanner import ScanResult, detect_catalog_number, normalize_catalog_digits, scan_libraries
 from .scan_state import scan_cache
 from .storage import MoveRequest, MoveResult, Storage
 from .mteam_service import download_mteam_torrent, search_mteam
@@ -2010,6 +2010,8 @@ def api_scan() -> dict[str, object]:
     media_dirs, trash_dir, data_dir = settings()
     scan_cache.configure(data_dir)
     snapshot = scan_cache.snapshot()
+    scan_alive = scan_cache.scan_alive()
+    scan_stale = scan_cache.scan_stale()
     result = snapshot.result or ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple())
     duplicate_group_keys = {group.key for group in result.groups}
     return {
@@ -2026,6 +2028,10 @@ def api_scan() -> dict[str, object]:
         "missing_files": snapshot.missing_files,
         "changed_paths": list(snapshot.changed_paths),
         "current_path": snapshot.current_path,
+        "last_progress_at": snapshot.last_progress_at,
+        "scan_alive": scan_alive,
+        "scan_stale": scan_stale,
+        "can_reset": snapshot.status == "running",
         "active_scan_dirs": [str(path) for path in snapshot.scanned_dirs],
         "selectable_scan_dirs": [str(path) for path in selectable_scan_dirs(media_dirs, [trash_dir])],
         "total_files": result.total_files,
@@ -2055,6 +2061,19 @@ def api_scan_run(paths: list[str] = Form(default=[]), mode: str = Form(default="
     if not started:
         raise HTTPException(status_code=409, detail="已有扫描任务在运行")
     return {"status": "running", "started": started, "mode": scan_mode, "scan_dirs": [str(path) for path in scan_dirs]}
+
+
+@app.post("/api/scan/reset")
+def api_scan_reset() -> dict[str, object]:
+    _, _, data_dir = settings()
+    scan_cache.configure(data_dir)
+    reset = scan_cache.reset_running()
+    snapshot = scan_cache.snapshot()
+    return {
+        "status": snapshot.status,
+        "reset": reset,
+        "error": snapshot.error,
+    }
 
 
 @app.post("/scan/run")
@@ -3466,10 +3485,10 @@ def canonical_av_id(value: object) -> str:
         if compact.startswith(prefix) and re.fullmatch(rf"{prefix}[A-Z]{{2,}}\d{{2,}}", compact):
             compact = compact[len(prefix) :]
             break
-    match = re.fullmatch(r"([A-Z]{2,})(\d{2,})", compact)
+    match = re.fullmatch(r"([A-Z]{2,})(\d{1,})", compact)
     if not match:
         return raw
-    return f"{match.group(1)}-{match.group(2)}"
+    return f"{match.group(1)}-{normalize_catalog_digits(match.group(2))}"
 
 
 def av_id_parts(value: object) -> tuple[str, str]:
@@ -7115,7 +7134,7 @@ def infer_external_qb_av_id(item: dict[str, Any], files: list[dict[str, Any]] | 
     for candidate in candidates:
         detected = detect_catalog_number(str(candidate or ""))
         if detected:
-            return detected.upper()
+            return canonical_av_id(detected)
     return ""
 
 
@@ -7441,12 +7460,27 @@ def resolve_qb_file_path(content_path: str, file_name: str) -> str:
         if not file_name or name_path.name.lower() == content.name.lower():
             return content_path.replace("\\", "/")
         return str(content.parent / file_name).replace("\\", "/")
+    parts = name_path.parts
+    if parts and parts[0].lower() == content.name.lower():
+        return str(content.parent / file_name).replace("\\", "/")
     return (str(content / file_name) if content_path else file_name).replace("\\", "/")
+
+
+def catalog_ids_match(expected: str, candidate: str) -> bool:
+    expected_prefix, expected_number = av_id_parts(expected)
+    candidate_prefix, candidate_number = av_id_parts(candidate)
+    if not expected_prefix or not candidate_prefix:
+        return False
+    return (
+        expected_prefix == candidate_prefix
+        and (expected_number.lstrip("0") or "0") == (candidate_number.lstrip("0") or "0")
+    )
 
 
 def pick_main_video_file(files: list[dict[str, Any]], av_id: str, content_path: str) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
-    av_lower = av_id.lower()
+    normalized_av_id = canonical_av_id(av_id)
+    av_lower = normalized_av_id.lower()
     for item in files:
         name = str(item.get("name") or "")
         suffix = Path(name).suffix.lower()
@@ -7455,15 +7489,23 @@ def pick_main_video_file(files: list[dict[str, Any]], av_id: str, content_path: 
             continue
         if any(token in lower for token in ("sample", "trailer")):
             continue
-        if av_lower and av_lower not in lower:
-            continue
+        if normalized_av_id:
+            detected = canonical_av_id(detect_catalog_number(name))
+            if detected:
+                if not catalog_ids_match(normalized_av_id, detected):
+                    continue
+            elif av_lower not in lower:
+                continue
         size = int(item.get("size") or 0)
         full_path = resolve_qb_file_path(content_path, name)
         candidates.append({"path": full_path, "name": name, "size": size, "reason": "matched_av_largest_video"})
     if candidates:
         return sorted(candidates, key=lambda row: row["size"], reverse=True)[0]
     content = Path(content_path)
-    if content.suffix.lower() in VIDEO_EXTENSIONS and av_lower in content.name.lower():
+    detected_content = canonical_av_id(detect_catalog_number(content.name))
+    if content.suffix.lower() in VIDEO_EXTENSIONS and (
+        catalog_ids_match(normalized_av_id, detected_content) or (av_lower and av_lower in content.name.lower())
+    ):
         return {"path": content_path, "name": content.name, "size": 0, "reason": "content_path_video"}
     return None
 
@@ -7562,30 +7604,18 @@ def worker_is_offline() -> bool:
 
 def build_postprocess_output_path(task: dict[str, Any], settings_payload: dict[str, Any]) -> str:
     input_path = Path(str(task.get("input_path") or ""))
-    av_id = str(task.get("av_id") or input_path.stem or "unknown").upper()
-    suffix = input_path.suffix if input_path.suffix.lower() in VIDEO_EXTENSIONS else ".mkv"
-    task_type = str(task.get("task_type") or "")
-    variant = ""
-    if task_type == "wash_chinese":
-        variant = ".chinese"
-    elif task_type == "wash_4k":
-        variant = ".4k"
+    av_id = canonical_av_id(task.get("av_id")) or canonical_av_id(detect_catalog_number(input_path.stem)) or str(input_path.stem or "unknown").upper()
+    filename = input_path.name if input_path.suffix.lower() in VIDEO_EXTENSIONS else f"{input_path.stem or av_id}.mkv"
     output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
-    return str(output_dir / f"{av_id}{variant}{suffix}")
+    return str(output_dir / filename)
 
 
 def build_postprocess_original_output_path(task: dict[str, Any], settings_payload: dict[str, Any], source_path: str) -> str:
     source = Path(str(source_path or task.get("input_path") or ""))
-    av_id = str(task.get("av_id") or source.stem or "unknown").upper()
-    suffix = source.suffix if source.suffix.lower() in VIDEO_EXTENSIONS else ".mkv"
-    task_type = str(task.get("task_type") or "")
-    variant = ""
-    if task_type == "wash_chinese":
-        variant = ".chinese"
-    elif task_type == "wash_4k":
-        variant = ".4k"
+    av_id = canonical_av_id(task.get("av_id")) or canonical_av_id(detect_catalog_number(source.stem)) or str(source.stem or "unknown").upper()
+    filename = source.name if source.suffix.lower() in VIDEO_EXTENSIONS else f"{source.stem or av_id}.mkv"
     output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
-    return str(output_dir / f"{av_id}{variant}.original{suffix}")
+    return str(output_dir / filename)
 
 
 def avoid_output_conflict(path: str, task_id: str) -> str:
@@ -7664,15 +7694,379 @@ def ensure_managed_subtitle_product(subtitle_path: str, product_path: str) -> st
 
 POSTPROCESS_METADATA_IMAGE_SUFFIXES = ("fanart", "poster", "thumb")
 POSTPROCESS_METADATA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+VIDEO_FILE_GLOB_EXTENSIONS = ("*.mp4", "*.mkv", "*.avi", "*.mov", "*.wmv", "*.flv", "*.ts", "*.m2ts")
 
 
-def copy_postprocess_metadata_sidecars(task: dict[str, Any], product_path: str) -> dict[str, Any]:
+def nfo_actor_names(path: Path) -> list[str]:
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for actor in root.findall("actor"):
+        name = str(actor.findtext("name") or "").strip()
+        if not name:
+            continue
+        key = re.sub(r"\s+", "", name).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def directory_catalog_ids(directory: Path, nfo_files: list[Path]) -> set[str]:
+    ids: set[str] = set()
+    detected_dir = canonical_av_id(detect_catalog_number(directory.name))
+    if detected_dir:
+        ids.add(detected_dir)
+    for nfo in nfo_files:
+        if nfo.name.lower() == "movie.nfo":
+            continue
+        detected = canonical_av_id(detect_catalog_number(nfo.stem))
+        if detected:
+            ids.add(detected)
+    for pattern in VIDEO_FILE_GLOB_EXTENSIONS:
+        for video in directory.glob(pattern):
+            detected = canonical_av_id(detect_catalog_number(video.stem))
+            if detected:
+                ids.add(detected)
+    return ids
+
+
+def nfo_repair_actor_node(name: str) -> ET.Element:
+    actor = ET.Element("actor")
+    name_node = ET.SubElement(actor, "name")
+    name_node.text = name
+    type_node = ET.SubElement(actor, "type")
+    type_node.text = "Actor"
+    return actor
+
+
+def insert_nfo_actor_nodes(path: Path, actors: list[str]) -> dict[str, Any]:
+    original_mode = 0o644
+    try:
+        original_mode = path.stat().st_mode & 0o777
+    except OSError:
+        pass
+    tree = ET.parse(path)
+    root = tree.getroot()
+    existing_keys = {re.sub(r"\s+", "", name).lower() for name in nfo_actor_names(path)}
+    inserted: list[str] = []
+    insert_at = len(root)
+    for index, child in enumerate(list(root)):
+        if child.tag == "fileinfo":
+            insert_at = index
+            break
+    for name in actors:
+        key = re.sub(r"\s+", "", name).lower()
+        if not key or key in existing_keys:
+            continue
+        root.insert(insert_at, nfo_repair_actor_node(name))
+        insert_at += 1
+        existing_keys.add(key)
+        inserted.append(name)
+    if not inserted:
+        return {"status": "skipped", "reason": "actor_exists", "inserted": []}
+    try:
+        ET.indent(tree, space="  ")
+    except Exception:
+        pass
+    backup = path.with_name(f"{path.name}.bak-{local_now().strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, backup)
+    temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        tree.write(temp_path, encoding="utf-8", xml_declaration=True)
+        try:
+            temp_path.chmod(original_mode)
+        except OSError:
+            pass
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+    return {"status": "updated", "backup": str(backup), "inserted": inserted}
+
+
+def nfo_actor_repair_candidates(*, apply: bool = False) -> dict[str, Any]:
+    post_settings = get_postprocess_service().get_settings()
+    output_root = Path(str(post_settings.get("output_dir") or "/media/压制"))
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "root": str(output_root),
+        "dry_run": not apply,
+        "checked_dirs": 0,
+        "repairable_dirs": 0,
+        "target_files": 0,
+        "repaired_files": 0,
+        "items": [],
+        "skipped": [],
+    }
+    if not output_root.exists() or not output_root.is_dir():
+        payload["status"] = "skipped"
+        payload["reason"] = "output_dir_missing"
+        return payload
+
+    directories = sorted({path.parent for path in output_root.rglob("*.nfo") if path.is_file()})
+    for directory in directories:
+        if directory == output_root:
+            payload["skipped"].append({"directory": str(directory), "reason": "skip_output_root"})
+            continue
+        nfo_files = sorted(path for path in directory.glob("*.nfo") if path.is_file())
+        if len(nfo_files) < 2:
+            continue
+        payload["checked_dirs"] += 1
+        catalog_ids = directory_catalog_ids(directory, nfo_files)
+        if len(catalog_ids) > 1:
+            payload["skipped"].append({"directory": str(directory), "reason": "multiple_catalog_ids", "catalog_ids": sorted(catalog_ids)})
+            continue
+        file_rows: list[dict[str, Any]] = []
+        actor_names: list[str] = []
+        actor_keys: set[str] = set()
+        for nfo in nfo_files:
+            actors = nfo_actor_names(nfo)
+            for name in actors:
+                key = re.sub(r"\s+", "", name).lower()
+                if key and key not in actor_keys:
+                    actor_keys.add(key)
+                    actor_names.append(name)
+            file_rows.append({"path": str(nfo), "name": nfo.name, "actors": actors})
+        targets = [row for row in file_rows if not row["actors"]]
+        sources = [row for row in file_rows if row["actors"]]
+        if not actor_names or not targets:
+            continue
+
+        item: dict[str, Any] = {
+            "directory": str(directory),
+            "catalog_id": sorted(catalog_ids)[0] if catalog_ids else "",
+            "actors": actor_names,
+            "source_files": [row["name"] for row in sources],
+            "target_files": [row["name"] for row in targets],
+            "results": [],
+        }
+        payload["repairable_dirs"] += 1
+        payload["target_files"] += len(targets)
+        if apply:
+            for target in targets:
+                path = Path(str(target["path"]))
+                if not path_under(path, output_root):
+                    result = {"file": target["name"], "status": "skipped", "reason": "outside_output_dir"}
+                else:
+                    try:
+                        result = {"file": target["name"], **insert_nfo_actor_nodes(path, actor_names)}
+                    except Exception as exc:
+                        result = {"file": target["name"], "status": "failed", "reason": str(exc)}
+                if result.get("status") == "updated":
+                    payload["repaired_files"] += 1
+                item["results"].append(result)
+        payload["items"].append(item)
+    return payload
+
+
+def nfo_is_backup_or_auxiliary(path: Path, output_root: Path) -> bool:
+    try:
+        relative = path.relative_to(output_root)
+    except ValueError:
+        relative = path
+    lower_parts = {part.lower() for part in relative.parts}
+    if lower_parts & {"nfo_back", "backup", "backups"}:
+        return True
+    name_lower = path.name.lower()
+    return ".bak-" in name_lower or name_lower.startswith(".")
+
+
+def matching_video_for_nfo(nfo_path: Path) -> Path | None:
+    if nfo_path.stem.lower() == "movie":
+        return None
+    for suffix in VIDEO_EXTENSIONS:
+        candidate = nfo_path.with_suffix(suffix)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def jellyfin_people_names(item: dict[str, Any]) -> list[str]:
+    people = item.get("People") if isinstance(item.get("People"), list) else []
+    names: list[str] = []
+    seen: set[str] = set()
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        person_type = str(person.get("Type") or person.get("Role") or "").strip().lower()
+        if person_type and person_type != "actor":
+            continue
+        name = str(person.get("Name") or "").strip()
+        key = re.sub(r"\s+", "", name).lower()
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
+
+
+def find_jellyfin_item_for_video(av_id: str, video_path: Path, config: dict[str, Any]) -> dict[str, Any] | None:
+    base_url = str(config.get("url") or "").strip().rstrip("/")
+    api_key = str(config.get("api_key") or "").strip()
+    if not base_url or not api_key or not av_id:
+        return None
+    user_id = get_jellyfin_user_id(config)
+    endpoint = f"/Users/{user_id}/Items" if user_id else "/Items"
+    library_id = str(config.get("library_id") or "").strip()
+    expected_path = normalize_media_path(str(video_path))
+    params = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Video,Episode",
+        "SearchTerm": av_id,
+        "Limit": "20",
+        "Fields": "Path,People,ProviderIds,MediaSources",
+    }
+    if library_id:
+        params["ParentId"] = library_id
+    try:
+        with httpx.Client(timeout=15, follow_redirects=True) as client:
+            response = client.get(f"{base_url}{endpoint}", headers=jellyfin_auth_headers(config), params=params)
+            response.raise_for_status()
+            items = response.json().get("Items", [])
+    except (httpx.HTTPError, ValueError):
+        return None
+    fallback: dict[str, Any] | None = None
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        path_value = str(item.get("Path") or "")
+        haystack = f"{item.get('Name') or ''} {path_value}".lower()
+        if av_id.lower() not in haystack:
+            continue
+        if not fallback:
+            fallback = item
+        if expected_path and normalize_media_path(path_value) == expected_path:
+            return item
+    return fallback
+
+
+def jellyfin_item_with_people(item: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    if "People" in item:
+        return item
+    item_id = str(item.get("Id") or "").strip()
+    if not item_id:
+        return item
+    try:
+        detail = fetch_jellyfin_item(item_id, config)
+    except HTTPException:
+        return item
+    if not isinstance(detail, dict):
+        return item
+    merged = {**item, **detail}
+    if "People" not in merged and "People" in detail:
+        merged["People"] = detail["People"]
+    return merged
+
+
+def refresh_jellyfin_item_metadata(item_id: str, config: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(config.get("url") or "").strip().rstrip("/")
+    api_key = str(config.get("api_key") or "").strip()
+    clean_item_id = str(item_id or "").strip()
+    if not base_url or not api_key:
+        return {"status": "skipped", "reason": "jellyfin_not_configured"}
+    if not clean_item_id:
+        return {"status": "skipped", "reason": "missing_item_id"}
+    params = {
+        "Recursive": "false",
+        "MetadataRefreshMode": "FullRefresh",
+        "ImageRefreshMode": "Default",
+        "ReplaceAllMetadata": "true",
+        "ReplaceAllImages": "false",
+    }
+    try:
+        with httpx.Client(timeout=20, follow_redirects=True) as client:
+            response = client.post(
+                f"{base_url}/Items/{clean_item_id}/Refresh",
+                headers=jellyfin_auth_headers(config),
+                params=params,
+            )
+            response.raise_for_status()
+        return {"status": "refreshed"}
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc)}
+
+
+def jellyfin_actor_refresh_candidates(*, apply: bool = False) -> dict[str, Any]:
+    post_settings = get_postprocess_service().get_settings()
+    output_root = Path(str(post_settings.get("output_dir") or "/media/压制"))
+    config = jellyfin_config()
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "root": str(output_root),
+        "dry_run": not apply,
+        "checked_nfos": 0,
+        "actor_nfos": 0,
+        "matched_items": 0,
+        "target_items": 0,
+        "refreshed_items": 0,
+        "items": [],
+        "skipped": [],
+    }
+    if not output_root.exists() or not output_root.is_dir():
+        payload["status"] = "skipped"
+        payload["reason"] = "output_dir_missing"
+        return payload
+    if not str(config.get("url") or "").strip() or not str(config.get("api_key") or "").strip():
+        payload["status"] = "skipped"
+        payload["reason"] = "jellyfin_not_configured"
+        return payload
+
+    for nfo in sorted(output_root.rglob("*.nfo")):
+        if not nfo.is_file() or nfo_is_backup_or_auxiliary(nfo, output_root):
+            continue
+        payload["checked_nfos"] += 1
+        actors = nfo_actor_names(nfo)
+        if not actors:
+            continue
+        payload["actor_nfos"] += 1
+        video = matching_video_for_nfo(nfo)
+        if not video:
+            payload["skipped"].append({"nfo": str(nfo), "reason": "matching_video_missing"})
+            continue
+        av_id = canonical_av_id(detect_catalog_number(nfo.stem))
+        if not av_id:
+            payload["skipped"].append({"nfo": str(nfo), "reason": "catalog_id_missing"})
+            continue
+        item = find_jellyfin_item_for_video(av_id, video, config)
+        if not item:
+            payload["skipped"].append({"nfo": str(nfo), "video": str(video), "av_id": av_id, "reason": "jellyfin_item_missing"})
+            continue
+        payload["matched_items"] += 1
+        item = jellyfin_item_with_people(item, config)
+        item_people = jellyfin_people_names(item)
+        if item_people:
+            continue
+        row: dict[str, Any] = {
+            "av_id": av_id,
+            "nfo": str(nfo),
+            "video": str(video),
+            "actors": actors,
+            "item_id": str(item.get("Id") or ""),
+            "item_name": str(item.get("Name") or ""),
+            "item_path": str(item.get("Path") or ""),
+            "results": [],
+        }
+        payload["target_items"] += 1
+        if apply:
+            result = refresh_jellyfin_item_metadata(row["item_id"], config)
+            if result.get("status") == "refreshed":
+                payload["refreshed_items"] += 1
+            row["results"].append(result)
+        payload["items"].append(row)
+    return payload
+
+
+def move_postprocess_metadata_sidecars(task: dict[str, Any], product_path: str) -> dict[str, Any]:
     source = Path(str(task.get("input_path") or ""))
     product = Path(product_path)
     payload: dict[str, Any] = {
         "source": str(source),
         "target_dir": str(product.parent),
-        "copied": [],
+        "moved": [],
         "skipped": [],
         "missing": [],
     }
@@ -7705,7 +8099,7 @@ def copy_postprocess_metadata_sidecars(task: dict[str, Any], product_path: str) 
             payload["missing"].append(kind)
             continue
 
-        target = product.parent / f"{product.stem}{name_suffix}{found.suffix}"
+        target = product.parent / found.name
         try:
             if found.resolve() == target.resolve():
                 payload["skipped"].append({"kind": kind, "path": str(found), "reason": "already_in_place"})
@@ -7713,23 +8107,26 @@ def copy_postprocess_metadata_sidecars(task: dict[str, Any], product_path: str) 
         except OSError:
             pass
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(found, target)
-        payload["copied"].append({"kind": kind, "source": str(found), "target": str(target)})
+        if target.exists():
+            payload["skipped"].append({"kind": kind, "source": str(found), "target": str(target), "reason": "target_exists"})
+            continue
+        shutil.move(str(found), str(target))
+        payload["moved"].append({"kind": kind, "source": str(found), "target": str(target)})
 
-    payload["status"] = "ok" if payload["copied"] or payload["skipped"] else "missing"
+    payload["status"] = "ok" if payload["moved"] or payload["skipped"] else "missing"
     return payload
 
 
 def record_postprocess_metadata_sidecars(task_id: str, task: dict[str, Any], product_path: str) -> dict[str, Any]:
     post = get_postprocess_service()
     try:
-        payload = copy_postprocess_metadata_sidecars(task, product_path)
+        payload = move_postprocess_metadata_sidecars(task, product_path)
         post.update_task(task_id, data={"metadata_sidecars": payload})
         post.add_event(
             task_id,
             "info",
-            "metadata_sidecars_copied",
-            "刮削元数据已同步到转码目录",
+            "metadata_sidecars_moved",
+            "刮削元数据已移动到转码目录",
             payload,
         )
         return payload
@@ -8758,7 +9155,10 @@ def poll_postprocess_once() -> dict[str, Any]:
     queue_result: dict[str, Any] | None = None
     post = get_postprocess_service()
     post_settings = post.get_settings()
-    worker_queue = refresh_worker_queue_readiness()
+    worker_status = subtitle_backend_status()
+    recovered_finished = recover_finished_worker_jobs(worker_status)
+    recovered_missing = recover_missing_worker_jobs(worker_status) if bool(worker_status.get("online") or worker_status.get("status") == "ok") else []
+    worker_queue = refresh_worker_queue_readiness(worker_status)
     if bool(post_settings.get("worker_auto_run")):
         candidates = post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=1)
         if candidates:
@@ -8768,7 +9168,15 @@ def poll_postprocess_once() -> dict[str, Any]:
                 "status": queue_result.get("status"),
                 "updated": queue_result.get("updated"),
             })
-    return {"qb": qb_result, "subtitle": subtitle_result, "wash_sync": wash_sync_result, "worker_queue": worker_queue, "queue_auto_run": queue_result}
+    return {
+        "qb": qb_result,
+        "subtitle": subtitle_result,
+        "wash_sync": wash_sync_result,
+        "worker_finished_recovery": recovered_finished,
+        "worker_missing_recovery": recovered_missing,
+        "worker_queue": worker_queue,
+        "queue_auto_run": queue_result,
+    }
 
 
 def torrent_info_hash(torrent_bytes: bytes) -> str:
@@ -9007,7 +9415,7 @@ def fetch_jellyfin_item(item_id: str, config: dict[str, Any]) -> dict[str, Any]:
     user_id = get_jellyfin_user_id(config)
     paths = [f"/Users/{user_id}/Items/{clean_item_id}"] if user_id else []
     paths.append(f"/Items/{clean_item_id}")
-    params = {"Fields": "Path,MediaSources,MediaStreams,ProviderIds,Overview"}
+    params = {"Fields": "Path,People,MediaSources,MediaStreams,ProviderIds,Overview"}
     last_error = ""
     with httpx.Client(timeout=12, follow_redirects=True) as client:
         for path in paths:
@@ -9314,13 +9722,16 @@ def automation_page(request: Request, legacy: int = 0) -> Response:
 def api_postprocess_tasks(status: str | None = None, limit: int = 200) -> dict[str, object]:
     statuses = [item.strip() for item in str(status or "").split(",") if item.strip()]
     post = get_postprocess_service()
+    worker_status = subtitle_backend_status()
+    recovered_finished = recover_finished_worker_jobs(worker_status)
     tasks = post.list_tasks(statuses=statuses or None, limit=limit)
     qb_rows = post.list_qb_torrents(limit=500)
     return {
         "tasks": tasks,
         "qb_torrents": qb_rows,
         "settings": post.get_settings(),
-        "worker_status": subtitle_backend_status(),
+        "worker_status": worker_status,
+        "recovered_finished": recovered_finished,
     }
 
 
@@ -9580,6 +9991,142 @@ def worker_transcode_job_ids(worker_status: dict[str, Any]) -> set[str]:
     return ids
 
 
+def worker_transcode_jobs(worker_status: dict[str, Any]) -> list[dict[str, Any]]:
+    if backend_url():
+        payload, _ = remote_get_safe("/api/transcode/jobs?limit=500")
+        if isinstance(payload, dict) and isinstance(payload.get("jobs"), list):
+            return [item for item in payload["jobs"] if isinstance(item, dict)]
+    transcode_jobs_info = worker_status.get("transcode_jobs") if isinstance(worker_status, dict) else {}
+    items = transcode_jobs_info.get("items", []) if isinstance(transcode_jobs_info, dict) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def worker_job_matches_task(job: dict[str, Any], task: dict[str, Any]) -> bool:
+    data = task.get("data") if isinstance(task.get("data"), dict) else {}
+    worker_result = data.get("worker_result") if isinstance(data.get("worker_result"), dict) else {}
+    worker_job_id = str(data.get("worker_job_id") or worker_result.get("job_id") or "")
+    task_id = str(task.get("id") or "")
+    job_ids = {str(job.get("id") or ""), str(job.get("job_id") or ""), str(job.get("task_id") or "")}
+    return bool((worker_job_id and worker_job_id in job_ids) or (task_id and task_id in job_ids))
+
+
+def worker_numeric_value(value: Any, default: float = 0.0) -> float:
+    try:
+        text = str(value).strip().rstrip("%")
+        return float(text) if text else default
+    except (TypeError, ValueError):
+        return default
+
+
+def worker_transcode_job_done(job: dict[str, Any]) -> bool:
+    status = str(job.get("status") or "").strip().lower()
+    if status in {"worker_done", "completed", "done", "success", "succeeded"}:
+        return True
+    progress = worker_numeric_value(job.get("progress"))
+    progress_percent = worker_numeric_value(job.get("progress_percent"))
+    message = str(job.get("message") or job.get("last_progress_line") or "")
+    return (progress >= 1 or progress_percent >= 100) and ("完成" in message or "ended" in message.lower())
+
+
+def worker_done_output_path(job: dict[str, Any], task: dict[str, Any]) -> str:
+    data = task.get("data") if isinstance(task.get("data"), dict) else {}
+    worker_payload = data.get("worker_payload") if isinstance(data.get("worker_payload"), dict) else {}
+    candidates = [
+        job.get("console_output_path"),
+        worker_payload.get("console_output_path"),
+        job.get("output_path"),
+        job.get("video_path"),
+        task.get("output_path"),
+    ]
+    for candidate in candidates:
+        path = rewrite_backend_path_to_console(str(candidate or "")) or ""
+        if path:
+            return path
+    return ""
+
+
+def worker_done_payload(job: dict[str, Any], task: dict[str, Any], output_path: str) -> dict[str, Any]:
+    data = task.get("data") if isinstance(task.get("data"), dict) else {}
+    worker_payload = data.get("worker_payload") if isinstance(data.get("worker_payload"), dict) else {}
+    return {
+        "status": "worker_done",
+        "job_id": str(job.get("id") or job.get("job_id") or worker_payload.get("job_id") or ""),
+        "task_id": str(task.get("id") or job.get("task_id") or ""),
+        "output_path": str(job.get("output_path") or worker_payload.get("output_path") or output_path),
+        "input_path": str(job.get("input_path") or worker_payload.get("input_path") or task.get("input_path") or ""),
+        "console_output_path": output_path,
+        "console_input_path": str(worker_payload.get("console_input_path") or task.get("input_path") or ""),
+        "target_codec": str(job.get("target_codec") or task.get("target_codec") or ""),
+        "progress": worker_numeric_value(job.get("progress"), 1),
+        "progress_percent": worker_numeric_value(job.get("progress_percent"), 100),
+        "message": str(job.get("message") or "转码完成"),
+        "recovered_by": "postprocess_worker_done_watchdog",
+    }
+
+
+def recover_finished_worker_jobs(worker_status: dict[str, Any]) -> list[dict[str, Any]]:
+    if not bool(worker_status.get("online") or worker_status.get("status") == "ok"):
+        return []
+    done_grace_seconds = max(0, int(os.getenv("POSTPROCESS_WORKER_DONE_GRACE_SECONDS", "15")))
+    missing_fail_seconds = max(done_grace_seconds, int(os.getenv("POSTPROCESS_WORKER_DONE_MISSING_SECONDS", "300")))
+    now = time.time()
+    jobs = [job for job in worker_transcode_jobs(worker_status) if worker_transcode_job_done(job)]
+    if not jobs:
+        return []
+    post = get_postprocess_service()
+    recovered: list[dict[str, Any]] = []
+    for task in post.list_tasks(statuses=["sent_to_worker", "transcoding"], limit=500):
+        job = next((item for item in jobs if worker_job_matches_task(item, task)), None)
+        if not job:
+            continue
+        finished_at = worker_numeric_value(job.get("finished_at") or job.get("updated_at"))
+        age = now - finished_at if finished_at else now - worker_numeric_value(task.get("updated_at") or task.get("created_at"))
+        if age < done_grace_seconds:
+            continue
+        output_path = worker_done_output_path(job, task)
+        data = task.get("data") if isinstance(task.get("data"), dict) else {}
+        job_id = str(job.get("id") or job.get("job_id") or data.get("worker_job_id") or "")
+        if not output_path or not Path(output_path).exists():
+            if age >= missing_fail_seconds:
+                message = f"算力端显示转码完成，但控制端找不到输出文件: {output_path or '未返回路径'}"
+                post.update_task(
+                    str(task["id"]),
+                    status="failed",
+                    error_code="worker_done_output_missing",
+                    error_message=message,
+                    data={"worker_done": worker_done_payload(job, task, output_path), "worker_done_missing_job_id": job_id},
+                )
+                post.add_event(str(task["id"]), "error", "worker_done_output_missing", "已完成的算力端任务缺少输出文件，任务已释放队列", {
+                    "worker_job": job,
+                    "output_path": output_path,
+                    "age_seconds": round(age, 1),
+                })
+                recovered.append({"task_id": str(task["id"]), "status": "failed", "reason": "output_missing", "worker_job_id": job_id})
+            elif data.get("worker_done_missing_job_id") != job_id:
+                post.update_task(str(task["id"]), data={"worker_done_missing_job_id": job_id})
+                post.add_event(str(task["id"]), "warning", "worker_done_output_waiting", "算力端显示转码完成，等待输出文件可见", {
+                    "worker_job_id": job_id,
+                    "output_path": output_path,
+                    "age_seconds": round(age, 1),
+                })
+            continue
+        payload = worker_done_payload(job, task, output_path)
+        post.update_task(str(task["id"]), status="worker_done", data={"worker_done": payload})
+        post.add_event(str(task["id"]), "warning", "worker_done_recovered", "检测到算力端已完成但回调未收尾，自动进入校验", payload)
+        try:
+            result = validate_and_activate_postprocess_task(str(task["id"]), output_path=output_path, worker_result=payload)
+            recovered.append({"task_id": str(task["id"]), "status": str(result.get("status") or "completed"), "worker_job_id": job_id})
+        except Exception as exc:
+            post.update_task(str(task["id"]), status="failed", error_code="worker_done_recovery_failed", error_message=str(exc), data={"worker_done": payload})
+            post.add_event(str(task["id"]), "error", "worker_done_recovery_failed", "已完成转码任务自动收尾失败，任务已释放队列", {
+                "error": str(exc),
+                "worker_job": job,
+                "output_path": output_path,
+            })
+            recovered.append({"task_id": str(task["id"]), "status": "failed", "error": str(exc), "worker_job_id": job_id})
+    return recovered
+
+
 def recover_missing_worker_jobs(worker_status: dict[str, Any]) -> list[dict[str, Any]]:
     if not backend_url() or not bool(worker_status.get("online") or worker_status.get("status") == "ok"):
         return []
@@ -9655,6 +10202,7 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
     unique_ids = list(dict.fromkeys(str(item or "").strip() for item in task_ids if str(item or "").strip()))
     worker_status = subtitle_backend_status()
     online = bool(worker_status.get("online") or worker_status.get("status") == "ok")
+    recovered_finished = recover_finished_worker_jobs(worker_status) if online else []
     recovered_missing = recover_missing_worker_jobs(worker_status) if online else []
     tasks: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -9694,6 +10242,7 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
             "waiting": len(worker_candidates),
             "held": held_missing_input,
             "skipped": skipped,
+            "recovered_finished": recovered_finished,
             "recovered_missing": recovered_missing,
             "worker_status": worker_status,
             "tasks": updated,
@@ -9718,6 +10267,7 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
             "queued": len(worker_candidates),
             "held": held_missing_input,
             "skipped": skipped,
+            "recovered_finished": recovered_finished,
             "recovered_missing": recovered_missing,
             "max_concurrency": max_concurrency,
             "active_count": active_count,
@@ -9756,6 +10306,7 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
         "deferred": deferred,
         "held": held_missing_input,
         "skipped": skipped,
+        "recovered_finished": recovered_finished,
         "recovered_missing": recovered_missing,
         "max_concurrency": max_concurrency,
         "active_count": active_count,
@@ -9792,6 +10343,7 @@ def run_postprocess_queue() -> dict[str, object]:
     settings_payload = post.get_settings()
     worker_status = subtitle_backend_status()
     online = bool(worker_status.get("online") or worker_status.get("status") == "ok")
+    recovered_finished = recover_finished_worker_jobs(worker_status) if online else []
     recovered_missing = recover_missing_worker_jobs(worker_status) if online else []
     candidates = sorted(
         post.list_tasks(statuses=["waiting_worker", "ready_to_run"], limit=200),
@@ -9818,6 +10370,7 @@ def run_postprocess_queue() -> dict[str, object]:
             "updated": len(updated),
             "waiting": len(worker_candidates),
             "held": held_missing_input,
+            "recovered_finished": recovered_finished,
             "recovered_missing": recovered_missing,
             "worker_status": worker_status,
             "tasks": updated,
@@ -9839,6 +10392,7 @@ def run_postprocess_queue() -> dict[str, object]:
             "updated": len(updated),
             "queued": len(worker_candidates),
             "held": held_missing_input,
+            "recovered_finished": recovered_finished,
             "recovered_missing": recovered_missing,
             "max_concurrency": max_concurrency,
             "active_count": active_count,
@@ -9875,6 +10429,7 @@ def run_postprocess_queue() -> dict[str, object]:
         "updated": len(updated),
         "deferred": deferred,
         "held": held_missing_input,
+        "recovered_finished": recovered_finished,
         "recovered_missing": recovered_missing,
         "max_concurrency": max_concurrency,
         "active_count": active_count,
@@ -10968,6 +11523,26 @@ def api_system_flaresolverr_test() -> dict[str, object]:
 def api_jellyfin_libraries() -> dict[str, object]:
     settings_data = get_system_settings_service().get()
     return {"libraries": get_jellyfin_libraries(settings_data.get("jellyfin", {}))}
+
+
+@app.get("/api/jellyfin/nfo-actor-repair")
+def api_jellyfin_nfo_actor_repair_preview() -> dict[str, object]:
+    return {"result": nfo_actor_repair_candidates(apply=False)}
+
+
+@app.post("/api/jellyfin/nfo-actor-repair")
+def api_jellyfin_nfo_actor_repair_apply() -> dict[str, object]:
+    return {"result": nfo_actor_repair_candidates(apply=True)}
+
+
+@app.get("/api/jellyfin/actor-refresh")
+def api_jellyfin_actor_refresh_preview() -> dict[str, object]:
+    return {"result": jellyfin_actor_refresh_candidates(apply=False)}
+
+
+@app.post("/api/jellyfin/actor-refresh")
+def api_jellyfin_actor_refresh_apply() -> dict[str, object]:
+    return {"result": jellyfin_actor_refresh_candidates(apply=True)}
 
 
 @app.post("/api/integrations/jellyfin/resolve", dependencies=[Depends(require_subtitle_token)])

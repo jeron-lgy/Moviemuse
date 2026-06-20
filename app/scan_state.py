@@ -23,6 +23,10 @@ from .scanner import (
     scan_libraries,
 )
 
+SCAN_STALE_SECONDS = 10 * 60
+SCAN_INTERRUPTED_ERROR = "上次扫描异常中断，已保留旧结果，可重新扫描。"
+SCAN_RESET_ERROR = "扫描状态已重置，旧扫描结果会被忽略。"
+
 
 @dataclass
 class ScanSnapshot:
@@ -40,6 +44,7 @@ class ScanSnapshot:
     missing_files: int = 0
     changed_paths: tuple[str, ...] = ()
     current_path: str | None = None
+    last_progress_at: float | None = None
 
     @property
     def progress(self) -> float:
@@ -172,6 +177,7 @@ def _snapshot_to_dict(snapshot: ScanSnapshot) -> dict[str, Any]:
         "missing_files": snapshot.missing_files,
         "changed_paths": list(snapshot.changed_paths),
         "current_path": snapshot.current_path,
+        "last_progress_at": snapshot.last_progress_at,
     }
 
 
@@ -192,6 +198,7 @@ def _snapshot_from_dict(data: dict[str, Any]) -> ScanSnapshot:
         missing_files=int(data.get("missing_files") or 0),
         changed_paths=tuple(str(path) for path in data.get("changed_paths") or []),
         current_path=data.get("current_path"),
+        last_progress_at=data.get("last_progress_at"),
     )
 
 
@@ -213,13 +220,41 @@ class ScanCache:
         self._init_db(db_path)
         loaded = self._load_snapshot(db_path)
         if loaded:
+            if loaded.status == "running":
+                loaded = self._interrupted_snapshot(loaded, SCAN_INTERRUPTED_ERROR)
+                self._save_snapshot(loaded)
             with self._lock:
                 if self._snapshot.status != "running" and self._snapshot.result is None:
                     self._snapshot = loaded
 
     def snapshot(self) -> ScanSnapshot:
+        self._mark_dead_scan_interrupted()
         with self._lock:
             return self._snapshot
+
+    def scan_alive(self) -> bool:
+        with self._lock:
+            return bool(self._thread and self._thread.is_alive() and self._snapshot.status == "running")
+
+    def scan_stale(self, now: float | None = None) -> bool:
+        now = now or time.time()
+        with self._lock:
+            if self._snapshot.status != "running":
+                return False
+            last_progress_at = self._snapshot.last_progress_at or self._snapshot.started_at
+            if not last_progress_at:
+                return False
+            return now - float(last_progress_at) >= SCAN_STALE_SECONDS
+
+    def reset_running(self, message: str = SCAN_RESET_ERROR) -> bool:
+        with self._lock:
+            if self._snapshot.status != "running":
+                return False
+            self._run_id += 1
+            self._snapshot = self._interrupted_snapshot(self._snapshot, message)
+            snapshot = self._snapshot
+        self._save_snapshot(snapshot)
+        return True
 
     def start(
         self,
@@ -230,18 +265,21 @@ class ScanCache:
         completion_callback: Callable[[ScanSnapshot], None] | None = None,
     ) -> bool:
         normalized_mode = "full" if mode == "full" else "incremental"
+        self._mark_dead_scan_interrupted()
         with self._lock:
             if self._snapshot.status == "running" and not force:
                 return False
             self._run_id += 1
             run_id = self._run_id
             excluded_dirs = list(excluded_dirs or [])
+            started_at = time.time()
             self._snapshot = ScanSnapshot(
                 status="running",
                 mode=normalized_mode,
-                started_at=time.time(),
+                started_at=started_at,
                 result=self._snapshot.result,
                 scanned_dirs=tuple(media_dirs),
+                last_progress_at=started_at,
             )
             snapshot = self._snapshot
             self._thread = threading.Thread(
@@ -265,9 +303,11 @@ class ScanCache:
             with self._lock:
                 if run_id != self._run_id:
                     return
+                now = time.time()
                 self._snapshot.processed_files = processed
                 self._snapshot.total_files = total
                 self._snapshot.current_path = str(current_path) if current_path else None
+                self._snapshot.last_progress_at = now
 
         try:
             if mode == "full":
@@ -292,6 +332,7 @@ class ScanCache:
                 self._snapshot.finished_at = time.time()
                 self._snapshot.error = str(exc)
                 self._snapshot.scanned_dirs = tuple(media_dirs)
+                self._snapshot.last_progress_at = time.time()
                 snapshot = self._snapshot
             self._save_snapshot(snapshot)
             if completion_callback:
@@ -312,6 +353,7 @@ class ScanCache:
             self._snapshot.missing_files = missing_files
             self._snapshot.changed_paths = tuple(changed_paths) if mode != "full" else ()
             self._snapshot.current_path = None
+            self._snapshot.last_progress_at = time.time()
             snapshot = self._snapshot
         self._save_snapshot(snapshot)
         if completion_callback:
@@ -414,6 +456,37 @@ class ScanCache:
                 continue
             parts.append(f"{sidecar.name}\0{stat.st_size}\0{stat.st_mtime_ns}")
         return "\n".join(parts)
+
+    def _interrupted_snapshot(self, snapshot: ScanSnapshot, message: str) -> ScanSnapshot:
+        return ScanSnapshot(
+            status="interrupted",
+            mode=snapshot.mode,
+            started_at=snapshot.started_at,
+            finished_at=time.time(),
+            error=message,
+            result=snapshot.result,
+            scanned_dirs=snapshot.scanned_dirs,
+            processed_files=snapshot.processed_files,
+            total_files=snapshot.total_files,
+            reused_files=snapshot.reused_files,
+            changed_files=snapshot.changed_files,
+            missing_files=snapshot.missing_files,
+            changed_paths=snapshot.changed_paths,
+            current_path=snapshot.current_path,
+            last_progress_at=snapshot.last_progress_at,
+        )
+
+    def _mark_dead_scan_interrupted(self) -> bool:
+        with self._lock:
+            if self._snapshot.status != "running":
+                return False
+            if self._thread and self._thread.is_alive():
+                return False
+            self._run_id += 1
+            self._snapshot = self._interrupted_snapshot(self._snapshot, SCAN_INTERRUPTED_ERROR)
+            snapshot = self._snapshot
+        self._save_snapshot(snapshot)
+        return True
 
     def _cached_files_for_roots(self, media_dirs: list[Path]) -> dict[str, dict[str, Any]]:
         conn = self._connect()

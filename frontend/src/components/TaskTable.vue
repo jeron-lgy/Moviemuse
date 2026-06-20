@@ -200,6 +200,10 @@ function progressWidth(job) {
   background: color-mix(in srgb, var(--mm-muted) 35%, var(--mm-surface));
 }
 
+.progress-track.detached i {
+  background: color-mix(in srgb, var(--mm-muted) 55%, var(--mm-surface));
+}
+
 .progress-track.failed i {
   background: var(--mm-danger);
 }
@@ -247,6 +251,11 @@ function progressWidth(job) {
 .status-pill.completed {
   background: var(--mm-success-soft);
   color: var(--mm-success);
+}
+
+.status-pill.detached {
+  background: var(--mm-surface);
+  color: var(--mm-muted);
 }
 
 </style>

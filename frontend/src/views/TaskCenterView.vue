@@ -406,17 +406,20 @@ const adaptedJobs = computed(() => [...adaptedPostprocessJobs.value, ...adaptedS
 const runningJobs = computed(() => adaptedJobs.value.filter((job) => ['running', 'translating'].includes(job.statusKey)))
 const waitingJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'queued'))
 const failedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'failed'))
+const detachedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'detached'))
 const completedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'completed'))
-const activeJobs = computed(() => adaptedJobs.value.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)))
-const historyJobs = computed(() => adaptedJobs.value.filter((job) => ['completed', 'failed'].includes(job.statusKey)))
+const activeJobs = computed(() => adaptedJobs.value.filter((job) => ['queued', 'running', 'translating', 'detached'].includes(job.statusKey)))
+const historyJobs = computed(() => adaptedJobs.value.filter((job) => ['completed', 'failed', 'detached'].includes(job.statusKey)))
 const runningCount = computed(() => runningJobs.value.length)
 const waitingCount = computed(() => waitingJobs.value.length)
 const failedCount = computed(() => failedJobs.value.length)
+const detachedCount = computed(() => detachedJobs.value.length)
 const activePostprocessCount = computed(() => adaptedPostprocessJobs.value.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)).length)
 const statusTabs = computed(() => [
   { key: 'all', label: '全部', count: activeJobs.value.length, items: activeJobs.value },
   { key: 'running', label: '运行中', count: runningCount.value, items: runningJobs.value },
   { key: 'waiting', label: '等待中', count: waitingCount.value, items: waitingJobs.value },
+  { key: 'detached', label: '已清理', count: detachedCount.value, items: detachedJobs.value },
   { key: 'failed', label: '失败', count: failedCount.value, items: failedJobs.value },
   { key: 'completed', label: '已完成', count: completedJobs.value.length, items: completedJobs.value }
 ])
@@ -840,7 +843,7 @@ function adaptSubtitleJob(job) {
 function adaptPostprocessJob(task) {
   const phase = postprocessPhase(task.status)
   const qbIssue = postprocessQbIssue(task)
-  const statusKey = qbIssue ? 'failed' : postprocessStatusKey(task.status)
+  const statusKey = qbIssue ? qbIssue.statusKey : postprocessStatusKey(task.status)
   const avId = task.av_id || task.id || '后处理任务'
   const workerJob = findTranscodeJob(task)
   const progressInfo = postprocessProgressInfo(task, phase, statusKey, workerJob, qbIssue)
@@ -882,8 +885,18 @@ function findTranscodeJob(task) {
 function postprocessQbIssue(task) {
   const state = String(task?.data?.qb_state || '').trim()
   if (state === 'missingFiles') {
+    if (postprocessQbMissingIsExpected(task)) {
+      return {
+        type: 'qb_source_trashed',
+        statusKey: 'detached',
+        label: '源文件已清理',
+        path: task?.output_path || task?.input_path || task?.data?.content_path || '源文件已移动到 trash',
+        detail: '源文件已移动到 trash，qB 显示文件丢失是正常现象。'
+      }
+    }
     return {
       type: 'qb_missing_files',
+      statusKey: 'failed',
       label: '文件丢失',
       path: task?.data?.content_path || task?.input_path || task?.output_path || 'qB 文件丢失',
       detail: 'qB 标记文件丢失，请在 qB 中重新校验或重新下载。'
@@ -892,12 +905,25 @@ function postprocessQbIssue(task) {
   return null
 }
 
+function postprocessQbMissingIsExpected(task) {
+  const data = task?.data || {}
+  const sourceTrash = data.source_trash || {}
+  const status = String(task?.status || '')
+  return status === 'completed'
+    || sourceTrash.status === 'moved'
+    || sourceTrash.status === 'skipped'
+    || !!sourceTrash.target
+    || !!data.version_id
+    || !!data.activation
+}
+
 function postprocessProgressInfo(task, phase, statusKey, workerJob, qbIssue = null) {
   if (qbIssue) {
+    const completed = statusKey === 'detached'
     return {
-      showProgress: false,
-      progressPercent: 0,
-      progressLabel: '',
+      showProgress: completed,
+      progressPercent: completed ? 100 : 0,
+      progressLabel: completed ? '100%' : '',
       progressDetail: qbIssue.detail
     }
   }
@@ -1004,6 +1030,7 @@ function postprocessStatusLabel(status, phase, statusKey, qbIssue = null) {
   }
   if (statusKey === 'failed') return '失败'
   if (statusKey === 'completed') return '已完成'
+  if (statusKey === 'detached') return '源文件已清理'
   return status || statusLabel(statusKey)
 }
 
@@ -1037,19 +1064,20 @@ function postprocessDisplayPath(task, waitingDetail, qbIssue = null) {
 
 function progressTone(statusKey) {
   if (statusKey === 'completed') return 'completed'
+  if (statusKey === 'detached') return 'detached'
   if (statusKey === 'failed') return 'failed'
   if (['running', 'translating'].includes(statusKey)) return 'running'
   return 'queued'
 }
 
 function postprocessProgressTone(status, statusKey, qbIssue = null) {
-  if (qbIssue) return 'failed'
+  if (qbIssue) return qbIssue.statusKey === 'detached' ? 'detached' : 'failed'
   if (String(status || '') === 'created') return 'idle'
   return progressTone(statusKey)
 }
 
 function statusLabel(status) {
-  return { queued: '等待中', running: '运行中', translating: '翻译中', failed: '失败', completed: '已完成' }[status] || status
+  return { queued: '等待中', running: '运行中', translating: '翻译中', failed: '失败', completed: '已完成', detached: '源文件已清理' }[status] || status
 }
 
 function normalizePostprocessSettings(payload = {}) {

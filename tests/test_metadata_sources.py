@@ -104,7 +104,14 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
         self.assertEqual(self.main.canonical_av_id("START579V"), "START-579")
         self.assertEqual(self.main.canonical_av_id("SNOS250BOD"), "SNOS-250")
         self.assertEqual(self.main.canonical_av_id("SNOS093"), "SNOS-093")
+        self.assertEqual(self.main.canonical_av_id("SNOS-71"), "SNOS-071")
         self.assertEqual(self.main.canonical_av_id("FWAY085"), "FWAY-085")
+
+    def test_detect_catalog_number_preserves_three_digit_number(self) -> None:
+        from app.scanner import detect_catalog_number
+
+        self.assertEqual(detect_catalog_number("SNOS-071-4K.mkv"), "SNOS-071")
+        self.assertEqual(detect_catalog_number("SNOS-71.mp4"), "SNOS-071")
 
     def test_jellyfin_probe_log_does_not_emit_library_notification(self) -> None:
         with patch.object(self.main, "send_notification_event") as sender:

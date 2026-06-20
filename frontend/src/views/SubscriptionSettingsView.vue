@@ -180,6 +180,91 @@
           <BaseSwitch v-model="system.jellyfin.dedupe_enabled" aria-label="启用 Jellyfin 查重" />
         </FormField>
       </div>
+      <div :class="['nfo-repair-panel', { 'is-busy': repairingNfo }]">
+        <div class="nfo-repair-head">
+          <div>
+            <h3>NFO 演员关系修复</h3>
+            <p>只处理转码目录内同一影片目录中已有演员节点的 NFO，把演员同步到缺少 actor 的 NFO。</p>
+          </div>
+          <div class="panel-actions">
+            <BaseButton type="button" :disabled="repairingNfo" @click="previewNfoActorRepair">
+              <span class="busy-button-content">
+                <i v-if="repairingNfo" class="busy-spinner" aria-hidden="true"></i>
+                {{ repairingNfo ? '扫描中' : '扫描候选' }}
+              </span>
+            </BaseButton>
+            <BaseButton
+              variant="primary"
+              type="button"
+              :disabled="repairingNfo || !nfoRepairResult?.target_files"
+              @click="applyNfoActorRepair"
+            >
+              执行修复
+            </BaseButton>
+          </div>
+        </div>
+        <div v-if="repairingNfo" class="busy-strip" aria-label="正在扫描 NFO 候选">
+          <i></i>
+        </div>
+        <div v-if="nfoRepairResult" class="nfo-repair-summary">
+          <span>目录 {{ nfoRepairResult.repairable_dirs || 0 }}</span>
+          <span>待修文件 {{ nfoRepairResult.target_files || 0 }}</span>
+          <span v-if="!nfoRepairResult.dry_run">已修 {{ nfoRepairResult.repaired_files || 0 }}</span>
+          <span v-if="!nfoRepairResult.dry_run && nfoRepairFailedCount">失败 {{ nfoRepairFailedCount }}</span>
+        </div>
+        <div v-if="nfoRepairItems.length" class="nfo-repair-list">
+          <div v-for="item in nfoRepairItems" :key="item.directory" class="nfo-repair-row">
+            <strong>{{ item.catalog_id || folderName(item.directory) }}</strong>
+            <span>{{ item.actors?.join('、') }}</span>
+            <small>{{ item.target_files?.join('、') }} ← {{ item.source_files?.join('、') }}</small>
+            <small v-if="repairResultText(item.results)" class="nfo-repair-result">{{ repairResultText(item.results) }}</small>
+          </div>
+        </div>
+        <div v-else-if="nfoRepairResult" class="empty-line">没有发现第一批可自动修复的 NFO。</div>
+      </div>
+      <div :class="['nfo-repair-panel', { 'is-busy': refreshingJellyfinActors }]">
+        <div class="nfo-repair-head">
+          <div>
+            <h3>Jellyfin 演员关系刷新</h3>
+            <p>扫描同名 NFO 已有 actor、但 Jellyfin 里演员为空的影片，只触发这些条目的单独元数据刷新。</p>
+          </div>
+          <div class="panel-actions">
+            <BaseButton type="button" :disabled="refreshingJellyfinActors" @click="previewJellyfinActorRefresh">
+              <span class="busy-button-content">
+                <i v-if="refreshingJellyfinActors" class="busy-spinner" aria-hidden="true"></i>
+                {{ refreshingJellyfinActors ? '扫描中' : '扫描缺失' }}
+              </span>
+            </BaseButton>
+            <BaseButton
+              variant="primary"
+              type="button"
+              :disabled="refreshingJellyfinActors || !jellyfinActorRefreshResult?.target_items"
+              @click="applyJellyfinActorRefresh"
+            >
+              刷新元数据
+            </BaseButton>
+          </div>
+        </div>
+        <div v-if="refreshingJellyfinActors" class="busy-strip" aria-label="正在扫描 Jellyfin 演员关系">
+          <i></i>
+        </div>
+        <div v-if="jellyfinActorRefreshResult" class="nfo-repair-summary">
+          <span>NFO {{ jellyfinActorRefreshResult.actor_nfos || 0 }}</span>
+          <span>命中 {{ jellyfinActorRefreshResult.matched_items || 0 }}</span>
+          <span>待刷新 {{ jellyfinActorRefreshResult.target_items || 0 }}</span>
+          <span v-if="!jellyfinActorRefreshResult.dry_run">已触发 {{ jellyfinActorRefreshResult.refreshed_items || 0 }}</span>
+          <span v-if="!jellyfinActorRefreshResult.dry_run && jellyfinActorRefreshFailedCount">失败 {{ jellyfinActorRefreshFailedCount }}</span>
+        </div>
+        <div v-if="jellyfinActorRefreshItems.length" class="nfo-repair-list">
+          <div v-for="item in jellyfinActorRefreshItems" :key="item.item_id || item.video" class="nfo-repair-row">
+            <strong>{{ item.av_id }}</strong>
+            <span>{{ item.actors?.join('、') }}</span>
+            <small>{{ item.item_name || 'Jellyfin 条目' }} · {{ item.video }}</small>
+            <small v-if="repairResultText(item.results)" class="nfo-repair-result">{{ repairResultText(item.results) }}</small>
+          </div>
+        </div>
+        <div v-else-if="jellyfinActorRefreshResult" class="empty-line">没有发现需要刷新演员关系的 Jellyfin 条目。</div>
+      </div>
       <div class="panel-footer">
         <BaseButton type="button" :disabled="loading" @click="loadAll">刷新</BaseButton>
         <BaseButton variant="primary" type="button" :disabled="saving" @click="saveAll">
@@ -487,7 +572,7 @@
 </template>
 
 <script setup>
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, postJson } from '../lib/api'
 import { useDemoStore } from '../stores/demo'
@@ -532,6 +617,10 @@ const jellyfinLibraries = ref([])
 const selectedJellyfinLibrary = ref('')
 const notificationsView = ref(null)
 const proxyStatus = ref(null)
+const repairingNfo = ref(false)
+const nfoRepairResult = ref(null)
+const refreshingJellyfinActors = ref(false)
+const jellyfinActorRefreshResult = ref(null)
 const loadingAssetCache = ref(false)
 const maintainingAssetCache = ref(false)
 const assetCache = ref({})
@@ -543,6 +632,18 @@ const identityQuery = ref('')
 const actorIdentities = ref([])
 const mergeSourceIds = ref([])
 const identityAliasText = ref('')
+const nfoRepairItems = computed(() => Array.isArray(nfoRepairResult.value?.items) ? nfoRepairResult.value.items.slice(0, 20) : [])
+const nfoRepairFailedCount = computed(() => nfoRepairItems.value.reduce((total, item) => {
+  const results = Array.isArray(item.results) ? item.results : []
+  return total + results.filter((result) => result.status === 'failed').length
+}, 0))
+const jellyfinActorRefreshItems = computed(() => (
+  Array.isArray(jellyfinActorRefreshResult.value?.items) ? jellyfinActorRefreshResult.value.items.slice(0, 20) : []
+))
+const jellyfinActorRefreshFailedCount = computed(() => jellyfinActorRefreshItems.value.reduce((total, item) => {
+  const results = Array.isArray(item.results) ? item.results : []
+  return total + results.filter((result) => result.status === 'failed').length
+}, 0))
 
 const emptyIdentityForm = () => ({
   canonical_id: '',
@@ -883,6 +984,92 @@ async function loadJellyfinLibraries() {
   }
 }
 
+async function previewNfoActorRepair() {
+  repairingNfo.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await api('/api/jellyfin/nfo-actor-repair')
+    nfoRepairResult.value = payload.result || null
+    const count = Number(nfoRepairResult.value?.target_files || 0)
+    message.value = count ? `发现 ${count} 个可修复 NFO` : '没有发现可自动修复的 NFO'
+  } catch (err) {
+    errorMessage.value = err.message || '扫描 NFO 失败'
+  } finally {
+    repairingNfo.value = false
+  }
+}
+
+async function applyNfoActorRepair() {
+  const count = Number(nfoRepairResult.value?.target_files || 0)
+  if (!count) return
+  const ok = window.confirm(`将备份并修复 ${count} 个 NFO 文件。继续吗？`)
+  if (!ok) return
+  repairingNfo.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await postJson('/api/jellyfin/nfo-actor-repair', {})
+    nfoRepairResult.value = payload.result || null
+    message.value = `NFO 修复完成：${nfoRepairResult.value?.repaired_files || 0} 个文件`
+  } catch (err) {
+    errorMessage.value = err.message || '执行 NFO 修复失败'
+  } finally {
+    repairingNfo.value = false
+  }
+}
+
+function folderName(path) {
+  return String(path || '').split(/[\\/]/).filter(Boolean).pop() || ''
+}
+
+function repairResultText(results) {
+  if (!Array.isArray(results) || !results.length) return ''
+  return results.map((result) => {
+    const file = result.file || '条目'
+    if (result.status === 'updated') return `${file} 已修复`
+    if (result.status === 'refreshed') return '已触发 Jellyfin 刷新'
+    if (result.status === 'skipped') return `${file} 跳过：${result.reason || '无需修复'}`
+    if (result.status === 'failed') return `${file} 失败：${result.reason || '未知错误'}`
+    return `${file} ${result.status || ''}`.trim()
+  }).join('；')
+}
+
+async function previewJellyfinActorRefresh() {
+  refreshingJellyfinActors.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await api('/api/jellyfin/actor-refresh')
+    jellyfinActorRefreshResult.value = payload.result || null
+    const count = Number(jellyfinActorRefreshResult.value?.target_items || 0)
+    message.value = count ? `发现 ${count} 个需要刷新演员关系的 Jellyfin 条目` : '没有发现需要刷新演员关系的 Jellyfin 条目'
+  } catch (err) {
+    errorMessage.value = err.message || '扫描 Jellyfin 演员关系失败'
+  } finally {
+    refreshingJellyfinActors.value = false
+  }
+}
+
+async function applyJellyfinActorRefresh() {
+  const count = Number(jellyfinActorRefreshResult.value?.target_items || 0)
+  if (!count) return
+  const ok = window.confirm(`将触发 ${count} 个 Jellyfin 条目的单独元数据刷新。继续吗？`)
+  if (!ok) return
+  refreshingJellyfinActors.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await postJson('/api/jellyfin/actor-refresh', {})
+    jellyfinActorRefreshResult.value = payload.result || null
+    message.value = `Jellyfin 刷新已触发：${jellyfinActorRefreshResult.value?.refreshed_items || 0} 个条目`
+  } catch (err) {
+    errorMessage.value = err.message || '执行 Jellyfin 演员刷新失败'
+  } finally {
+    refreshingJellyfinActors.value = false
+  }
+}
+
 function syncJellyfinLibrary() {
   if (jellyfinLibraries.value.length) {
     const library = jellyfinLibraries.value.find((item) => item.id === selectedJellyfinLibrary.value)
@@ -1189,6 +1376,150 @@ async function deleteActorIdentity() {
   font-weight: var(--mm-font-weight-semibold);
 }
 
+.nfo-repair-panel {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--mm-border);
+  border-radius: 14px;
+  background: var(--mm-control-muted-bg);
+}
+
+.nfo-repair-panel.is-busy {
+  border-color: color-mix(in srgb, var(--mm-primary) 34%, var(--mm-border));
+}
+
+.busy-button-content {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.busy-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  animation: busy-spin 0.8s linear infinite;
+}
+
+.busy-strip {
+  position: relative;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mm-primary) 12%, var(--mm-control-bg));
+}
+
+.busy-strip i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -35%;
+  width: 35%;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--mm-primary) 72%, white),
+    transparent
+  );
+  animation: busy-scan 1.15s ease-in-out infinite;
+}
+
+@keyframes busy-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes busy-scan {
+  0% {
+    transform: translateX(0);
+  }
+
+  100% {
+    transform: translateX(385%);
+  }
+}
+
+.nfo-repair-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.nfo-repair-head h3 {
+  margin: 0;
+  color: var(--mm-text);
+  font-size: 18px;
+  font-weight: var(--mm-font-weight-semibold);
+}
+
+.nfo-repair-head p {
+  margin: 6px 0 0;
+  color: var(--mm-muted);
+  line-height: 1.6;
+}
+
+.compact-grid {
+  gap: 14px;
+}
+
+.span-2 {
+  grid-column: span 2;
+}
+
+.nfo-repair-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nfo-repair-summary span {
+  padding: 6px 10px;
+  border: 1px solid var(--mm-border);
+  border-radius: 999px;
+  background: var(--mm-control-bg);
+  color: var(--mm-muted);
+  font-size: var(--mm-font-size-sm);
+}
+
+.nfo-repair-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.nfo-repair-row {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--mm-border);
+  border-radius: 12px;
+  background: var(--mm-control-bg);
+}
+
+.nfo-repair-row strong {
+  color: var(--mm-text);
+  font-weight: var(--mm-font-weight-semibold);
+}
+
+.nfo-repair-row span,
+.nfo-repair-row small {
+  overflow: hidden;
+  color: var(--mm-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .maintenance-result {
   min-height: 0;
 }
@@ -1331,6 +1662,7 @@ input[type="checkbox"] {
 
 @media (max-width: 760px) {
   .panel-head,
+  .nfo-repair-head,
   .form-grid,
   .maker-row,
   .identity-tools,
@@ -1338,6 +1670,10 @@ input[type="checkbox"] {
   .cache-summary {
     grid-template-columns: 1fr;
     display: grid;
+  }
+
+  .span-2 {
+    grid-column: auto;
   }
 }
 </style>
