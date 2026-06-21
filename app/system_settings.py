@@ -102,6 +102,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "cover_url": "",
         "hide_system_settings": True,
     },
+    "duplicate_scan": {
+        "selected_scan_dirs": [],
+    },
 }
 
 
@@ -116,6 +119,7 @@ class SystemSettingsService:
         self._normalize_notifications()
         self._normalize_auth()
         self._normalize_demo()
+        self._normalize_duplicate_scan()
 
     def _load(self) -> dict[str, Any]:
         data = json.loads(json.dumps(DEFAULT_SETTINGS))
@@ -150,7 +154,7 @@ class SystemSettingsService:
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            for section in ("mteam", "qbittorrent", "jellyfin", "network", "notifications", "demo"):
+            for section in ("mteam", "qbittorrent", "jellyfin", "network", "notifications", "demo", "duplicate_scan"):
                 value = payload.get(section)
                 if isinstance(value, dict):
                     self.data.setdefault(section, {})
@@ -171,8 +175,21 @@ class SystemSettingsService:
             self._normalize_notifications()
             self._normalize_auth()
             self._normalize_demo()
+            self._normalize_duplicate_scan()
             self._save()
             return self.get()
+
+    def duplicate_scan(self) -> dict[str, Any]:
+        with self._lock:
+            self._normalize_duplicate_scan()
+            return json.loads(json.dumps(self.data.get("duplicate_scan", {})))
+
+    def update_duplicate_scan(self, selected_scan_dirs: list[str]) -> dict[str, Any]:
+        with self._lock:
+            self.data["duplicate_scan"] = {"selected_scan_dirs": selected_scan_dirs}
+            self._normalize_duplicate_scan()
+            self._save()
+            return self.duplicate_scan()
 
     def _normalize_network(self) -> None:
         network = self.data.setdefault("network", {})
@@ -211,6 +228,24 @@ class SystemSettingsService:
         demo["enabled"] = bool(demo.get("enabled", False))
         demo["hide_system_settings"] = bool(demo.get("hide_system_settings", True))
         demo["cover_url"] = str(demo.get("cover_url") or "").strip()
+
+    def _normalize_duplicate_scan(self) -> None:
+        duplicate_scan = self.data.setdefault("duplicate_scan", {})
+        defaults = DEFAULT_SETTINGS["duplicate_scan"]
+        for key, default in defaults.items():
+            duplicate_scan.setdefault(key, json.loads(json.dumps(default)))
+        raw_dirs = duplicate_scan.get("selected_scan_dirs")
+        if not isinstance(raw_dirs, list):
+            raw_dirs = []
+        selected_dirs: list[str] = []
+        seen: set[str] = set()
+        for item in raw_dirs:
+            value = str(item or "").strip()
+            if not value or value in seen:
+                continue
+            selected_dirs.append(value)
+            seen.add(value)
+        duplicate_scan["selected_scan_dirs"] = selected_dirs
 
 def merge_dict(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key, value in source.items():

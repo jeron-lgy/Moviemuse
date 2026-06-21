@@ -387,6 +387,7 @@ class SubtitleService:
         self.queue: queue.Queue[str] = queue.Queue()
         self.translation_queue: queue.Queue[str] = queue.Queue()
         self.jobs: dict[str, SubtitleJob] = {}
+        self.cancelled_jobs: set[str] = set()
         self._model_cache: dict[tuple[str, str, str, str], Any] = {}
         self._load_jobs()
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -499,10 +500,27 @@ class SubtitleService:
             if not job:
                 raise FileNotFoundError("任务不存在")
             if job.status in {"queued", "running", "translating"}:
-                raise ValueError("运行中或排队中的任务不能删除，请先等待结束")
+                self.cancelled_jobs.add(job_id)
             removed = self.jobs.pop(job_id)
             self._save_jobs_locked()
             return removed
+
+    def cancel_job(self, job_id: str, message: str = "用户手动取消") -> SubtitleJob:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                raise FileNotFoundError("任务不存在")
+            if job.status == "completed":
+                raise ValueError("已完成任务不能取消")
+            self.cancelled_jobs.add(job_id)
+            job.status = "cancelled"
+            job.progress = 1.0
+            job.message = message
+            job.error = message
+            job.finished_at = time.time()
+            job.updated_at = time.time()
+            self._save_jobs_locked()
+            return replace(job)
 
     def retry_job(self, job_id: str, translate_backend: str | None = None) -> SubtitleJob:
         source = self.get_job(job_id)
@@ -624,16 +642,20 @@ class SubtitleService:
 
     def _run_job(self, job_id: str) -> None:
         job = self.get_job(job_id)
-        if not job:
+        if not job or self._is_cancelled(job_id):
             return
         print(f"[MovieMuse] job started id={job.id} file={job.video_path}", flush=True)
         self._update(job_id, status="running", progress=0.02, message="加载 Whisper 模型", started_at=time.time())
         try:
+            if self._is_cancelled(job_id):
+                return
             video_path = Path(job.video_path)
             output_dir = Path(job.output_dir)
             output_stem = output_dir / video_path.stem
             model = self._get_model(job.model)
 
+            if self._is_cancelled(job_id):
+                return
             self._update(job_id, progress=0.08, message="正在识别语音")
             segments_iter, info = model.transcribe(
                 str(video_path),
@@ -645,12 +667,16 @@ class SubtitleService:
             duration = float(getattr(info, "duration", 0.0) or 0.0)
             detected_language = getattr(info, "language", None)
             for raw_segment in segments_iter:
+                if self._is_cancelled(job_id):
+                    return
                 text = " ".join(str(raw_segment.text).split())
                 if text:
                     segments.append(SubtitleSegment(start=float(raw_segment.start), end=float(raw_segment.end), text=text))
                 if duration:
                     self._update(job_id, progress=min(0.78, 0.10 + (float(raw_segment.end) / duration) * 0.68))
 
+            if self._is_cancelled(job_id):
+                return
             original_srt = output_stem.with_suffix(".srt")
             original_vtt = output_stem.with_suffix(".vtt")
             write_srt(original_srt, segments)
@@ -666,11 +692,15 @@ class SubtitleService:
             )
 
             if job.translate:
+                if self._is_cancelled(job_id):
+                    return
                 self._update(job_id, status="translating", progress=0.84, message=f"等待翻译字幕 ({job.translate_backend})")
                 self.translation_queue.put(job_id)
                 print(f"[MovieMuse] transcription completed id={job.id} output={original_srt}", flush=True)
                 return
 
+            if self._is_cancelled(job_id):
+                return
             self._update(
                 job_id,
                 status="completed",
@@ -686,7 +716,7 @@ class SubtitleService:
 
     def _run_translation_job(self, job_id: str) -> None:
         job = self.get_job(job_id)
-        if not job:
+        if not job or self._is_cancelled(job_id):
             return
         try:
             original_srt = self._existing_original_srt(job)
@@ -704,6 +734,8 @@ class SubtitleService:
             video_path = Path(job.video_path)
             output_dir = Path(job.output_dir)
             output_stem = output_dir / video_path.stem
+            if self._is_cancelled(job_id):
+                return
             self._update(
                 job_id,
                 status="translating",
@@ -721,6 +753,8 @@ class SubtitleService:
                 job.target_language,
                 job.translate_backend,
             )
+            if self._is_cancelled(job_id):
+                return
             translated_srt = output_stem.with_name(f"{output_stem.name}.{job.target_language}").with_suffix(".srt")
             translated_vtt = output_stem.with_name(f"{output_stem.name}.{job.target_language}").with_suffix(".vtt")
             bilingual_srt = output_stem.with_name(f"{output_stem.name}.bilingual").with_suffix(".srt")
@@ -745,6 +779,8 @@ class SubtitleService:
             print(f"[MovieMuse] translation failed id={job.id} error={current.error if current else exc}", flush=True)
 
     def _fail_job(self, job_id: str, job: SubtitleJob, exc: Exception, message: str = "任务失败") -> None:
+        if self._is_cancelled(job_id):
+            return
         error = str(exc)
         if "Invalid data found when processing input" in error:
             error = f"视频无法解码，可能不是有效媒体文件或文件已损坏: {job.video_path}"
@@ -1358,11 +1394,18 @@ class SubtitleService:
 
     def _update(self, job_id: str, **changes: Any) -> None:
         with self.lock:
-            job = self.jobs[job_id]
+            job = self.jobs.get(job_id)
+            if not job or job_id in self.cancelled_jobs or job.status == "cancelled":
+                return
             for key, value in changes.items():
                 setattr(job, key, value)
             job.updated_at = time.time()
             self._save_jobs_locked()
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return job_id in self.cancelled_jobs or not job or job.status == "cancelled"
 
     def _load_jobs(self) -> None:
         if not self.jobs_path.exists():

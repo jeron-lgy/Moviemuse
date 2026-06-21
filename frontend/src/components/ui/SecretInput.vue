@@ -1,16 +1,19 @@
 <template>
-  <div class="mm-secret-input">
+  <div class="mm-secret-input" :class="{ saved: isSavedPlaceholder }">
     <input
       v-bind="$attrs"
-      :type="visible ? 'text' : 'password'"
-      :value="modelValue"
+      :type="inputType"
+      :value="displayValue"
+      :placeholder="placeholderText"
       @input="onInput"
     >
+    <span v-if="isSavedPlaceholder" class="mm-secret-saved">已保存</span>
     <button
       type="button"
       class="mm-secret-toggle"
-      :aria-label="visible ? '隐藏内容' : '显示内容'"
-      :title="visible ? '隐藏内容' : '显示内容'"
+      :aria-label="toggleLabel"
+      :title="toggleLabel"
+      :disabled="isSavedPlaceholder"
       @click="visible = !visible"
     >
       <EyeOff v-if="visible" :size="18" stroke-width="2" />
@@ -20,7 +23,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, ref, useAttrs } from 'vue'
 import { Eye, EyeOff } from '@lucide/vue'
 
 defineOptions({ inheritAttrs: false })
@@ -37,10 +40,26 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['update:modelValue'])
+const attrs = useAttrs()
 const visible = ref(false)
+const SECRET_PLACEHOLDER = '********'
+
+const normalizedValue = computed(() => String(props.modelValue ?? ''))
+const isSavedPlaceholder = computed(() => normalizedValue.value.trim() === SECRET_PLACEHOLDER)
+const displayValue = computed(() => (isSavedPlaceholder.value ? '' : props.modelValue))
+const inputType = computed(() => (visible.value && !isSavedPlaceholder.value ? 'text' : 'password'))
+const placeholderText = computed(() => {
+  if (isSavedPlaceholder.value) return '已保存，输入新值可替换'
+  return attrs.placeholder || ''
+})
+const toggleLabel = computed(() => {
+  if (isSavedPlaceholder.value) return '已保存密钥不会回显，输入新值可替换'
+  return visible.value ? '隐藏内容' : '显示内容'
+})
 
 function onInput(event) {
   const next = props.modelModifiers.trim ? event.target.value.trim() : event.target.value
+  visible.value = false
   emit('update:modelValue', next)
 }
 </script>
@@ -62,6 +81,29 @@ function onInput(event) {
   font: inherit;
 }
 
+.mm-secret-input.saved input {
+  padding-right: 116px;
+}
+
+.mm-secret-saved {
+  position: absolute;
+  top: 50%;
+  right: 46px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--mm-primary);
+  border-radius: 999px;
+  background: var(--mm-primary-soft);
+  color: var(--mm-primary);
+  font-size: var(--mm-font-size-sm);
+  font-weight: var(--mm-font-weight-medium);
+  line-height: 1;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
 .mm-secret-toggle {
   position: absolute;
   top: 50%;
@@ -77,6 +119,11 @@ function onInput(event) {
   color: var(--mm-muted);
   cursor: pointer;
   transform: translateY(-50%);
+}
+
+.mm-secret-toggle:disabled {
+  cursor: help;
+  opacity: .58;
 }
 
 .mm-secret-toggle svg {

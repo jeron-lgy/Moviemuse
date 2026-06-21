@@ -6,13 +6,13 @@
       <div class="scan-recovery-notice">
         <span>{{ scanRecoveryMessage }}</span>
         <BaseButton
-          v-if="scan.can_reset"
+          v-if="scan.can_cancel"
           type="button"
           size="sm"
-          :disabled="resettingScan"
-          @click="resetScanState"
+          :disabled="cancellingScan"
+          @click="cancelScanState"
         >
-          {{ resettingScan ? '重置中' : '重置状态' }}
+          {{ cancellingScan ? '终止中' : '终止扫描' }}
         </BaseButton>
       </div>
     </NoticeBanner>
@@ -25,6 +25,15 @@
       >
         <template #actions>
           <BaseButton type="button" :disabled="loading" @click="loadScan">刷新</BaseButton>
+          <BaseButton
+            v-if="scan.status === 'running'"
+            type="button"
+            variant="danger"
+            :disabled="cancellingScan"
+            @click="cancelScanState"
+          >
+            {{ cancellingScan ? '终止中' : '终止扫描' }}
+          </BaseButton>
           <BaseButton type="button" :disabled="scanRunning" @click="runScan('full')">
             全量扫描
           </BaseButton>
@@ -54,8 +63,19 @@
           </div>
           <div class="scan-tools">
             <BaseButton type="button" size="sm" :disabled="!(scan.selectable_scan_dirs || []).length" @click="invertSelectedPaths">反选</BaseButton>
-            <span class="mm-pill">{{ selectedPaths.length }} 个目录</span>
+            <BaseButton
+              type="button"
+              size="sm"
+              :disabled="savingSelection || !selectedPaths.length || !scanDirSelectionDirty"
+              @click="saveSelectedPathDefaults"
+            >
+              {{ savingSelection ? '保存中' : '保存默认' }}
+            </BaseButton>
+            <span class="mm-pill">{{ selectedPaths.length }} / {{ selectableDirCount }} 个目录</span>
           </div>
+        </div>
+        <div class="scan-default-note" :class="{ dirty: scanDirSelectionDirty }">
+          {{ scanDirSelectionDirty ? '当前选择尚未保存为默认范围。' : `已保存默认范围：${savedDirCount} 个目录。` }}
         </div>
         <div class="dir-list">
           <label v-for="path in scan.selectable_scan_dirs || []" :key="path" class="dir-row" :title="path">
@@ -242,7 +262,8 @@ const selectedPaths = ref([])
 const selectedPathsTouched = ref(false)
 const loading = ref(false)
 const running = ref(false)
-const resettingScan = ref(false)
+const cancellingScan = ref(false)
+const savingSelection = ref(false)
 const submittingAction = ref(false)
 const message = ref('')
 const errorMessage = ref('')
@@ -299,12 +320,19 @@ const percent = computed(() => Math.round(Number(scan.value.progress || 0) * 100
 const scanModeLabel = computed(() => scan.value.mode === 'full' ? '全量' : '增量')
 const scanStatusLabel = computed(() => formatStatus(scan.value.status))
 const scanRunning = computed(() => running.value || scan.value.status === 'running')
+const selectableDirCount = computed(() => (scan.value.selectable_scan_dirs || []).length)
+const savedSelectedPaths = computed(() => scan.value.selected_scan_dirs || [])
+const savedDirCount = computed(() => savedSelectedPaths.value.length)
+const scanDirSelectionDirty = computed(() => !samePathSelection(selectedPaths.value, savedSelectedPaths.value))
 const scanRecoveryMessage = computed(() => {
   if (scan.value.scan_stale) {
-    return '扫描长时间没有进度，可能卡在文件系统读取。可以先重置状态，再重新扫描。'
+    return '扫描长时间没有进度，可能卡在文件系统读取。可以终止本次扫描后重新选择目录。'
   }
   if (scan.value.status === 'interrupted') {
     return scan.value.error || '上次扫描异常中断，已保留旧结果，可以重新扫描。'
+  }
+  if (scan.value.status === 'cancelled') {
+    return scan.value.error || '扫描已终止，可以重新选择目录扫描。'
   }
   return ''
 })
@@ -342,10 +370,12 @@ async function loadScan() {
   errorMessage.value = ''
   try {
     scan.value = await api('/api/scan')
+    const available = new Set(scan.value.selectable_scan_dirs || [])
+    const savedPaths = (scan.value.selected_scan_dirs || []).filter((path) => available.has(path))
+    const defaultPaths = savedPaths.length ? savedPaths : (scan.value.selectable_scan_dirs || [])
     if (!selectedPathsTouched.value) {
-      selectedPaths.value = [...(scan.value.selectable_scan_dirs || [])]
+      selectedPaths.value = [...defaultPaths]
     } else {
-      const available = new Set(scan.value.selectable_scan_dirs || [])
       selectedPaths.value = selectedPaths.value.filter((path) => available.has(path))
     }
   } catch (error) {
@@ -366,6 +396,7 @@ async function runScan(mode = 'incremental') {
     for (const path of selectedPaths.value) form.append('paths', path)
     const payload = await postFormData('/api/scan/run', form)
     message.value = `${payload.mode === 'full' ? '全量扫描' : '增量扫描'}已启动：${payload.scan_dirs?.length || 0} 个目录`
+    selectedPathsTouched.value = false
     await loadScan()
   } catch (error) {
     errorMessage.value = error.message || '启动扫描失败'
@@ -374,18 +405,41 @@ async function runScan(mode = 'incremental') {
   }
 }
 
-async function resetScanState() {
-  resettingScan.value = true
+async function saveSelectedPathDefaults() {
+  savingSelection.value = true
   message.value = ''
   errorMessage.value = ''
   try {
-    const payload = await api('/api/scan/reset', { method: 'POST' })
-    message.value = payload.reset ? '扫描状态已重置，可以重新扫描。' : '当前没有运行中的扫描任务。'
+    const form = new FormData()
+    for (const path of selectedPaths.value) form.append('paths', path)
+    const payload = await postFormData('/api/scan/selection', form)
+    const selected = payload.selected_scan_dirs || []
+    scan.value = {
+      ...scan.value,
+      selected_scan_dirs: selected
+    }
+    selectedPaths.value = [...selected]
+    selectedPathsTouched.value = false
+    message.value = `已保存默认扫描范围：${selected.length} 个目录`
+  } catch (error) {
+    errorMessage.value = error.message || '保存默认扫描范围失败'
+  } finally {
+    savingSelection.value = false
+  }
+}
+
+async function cancelScanState() {
+  cancellingScan.value = true
+  message.value = ''
+  errorMessage.value = ''
+  try {
+    const payload = await api('/api/scan/cancel', { method: 'POST' })
+    message.value = payload.cancelled ? '扫描已终止，可以重新选择目录扫描。' : '当前没有运行中的扫描任务。'
     await loadScan()
   } catch (error) {
-    errorMessage.value = error.message || '重置扫描状态失败'
+    errorMessage.value = error.message || '终止扫描失败'
   } finally {
-    resettingScan.value = false
+    cancellingScan.value = false
   }
 }
 
@@ -487,6 +541,13 @@ function invertSelectedPaths() {
 
 function markSelectedPathsTouched() {
   selectedPathsTouched.value = true
+}
+
+function samePathSelection(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false
+  if (left.length !== right.length) return false
+  const rightSet = new Set(right)
+  return left.every((path) => rightSet.has(path))
 }
 
 function clearScanPoll() {
@@ -617,7 +678,8 @@ function formatStatus(status) {
     running: '扫描中',
     completed: '已完成',
     failed: '失败',
-    interrupted: '已中断'
+    interrupted: '已中断',
+    cancelled: '已终止'
   }
   return labels[status] || status || '待扫描'
 }
@@ -764,6 +826,17 @@ function formatStatus(status) {
   align-items: center;
   gap: 8px;
   white-space: nowrap;
+}
+
+.scan-default-note {
+  margin: 10px 0 14px;
+  color: var(--mm-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.scan-default-note.dirty {
+  color: var(--mm-primary);
 }
 
 .panel-head h2,

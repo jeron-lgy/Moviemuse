@@ -16,6 +16,9 @@ class DuplicateScanCacheTest(unittest.TestCase):
         while time.time() < deadline:
             snapshot = cache.snapshot()
             if snapshot.status != "running":
+                thread = cache._thread
+                if thread:
+                    thread.join(1)
                 return snapshot
             time.sleep(0.02)
         self.fail("scan did not finish")
@@ -63,7 +66,7 @@ class DuplicateScanCacheTest(unittest.TestCase):
             cache = ScanCache()
             cache.configure(data)
 
-            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh):
+            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh, should_continue=None):
                 started.set()
                 release.wait(2)
                 return ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple()), 0, 0, 0, ()
@@ -115,7 +118,7 @@ class DuplicateScanCacheTest(unittest.TestCase):
             cache = ScanCache()
             cache.configure(data)
 
-            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh):
+            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh, should_continue=None):
                 started.set()
                 release.wait(2)
                 return ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple()), 0, 0, 0, ()
@@ -141,7 +144,7 @@ class DuplicateScanCacheTest(unittest.TestCase):
             cache = ScanCache()
             cache.configure(data)
 
-            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh):
+            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh, should_continue=None):
                 started.set()
                 release.wait(2)
                 return ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple()), 0, 0, 0, ()
@@ -153,10 +156,42 @@ class DuplicateScanCacheTest(unittest.TestCase):
             self.assertEqual(cache.snapshot().status, "interrupted")
 
             release.set()
+            if cache._thread:
+                cache._thread.join(1)
             time.sleep(0.1)
             snapshot = cache.snapshot()
             self.assertEqual(snapshot.status, "interrupted")
             self.assertIn("重置", snapshot.error)
+
+    def test_cancel_running_scan_prevents_old_thread_from_overwriting_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "media"
+            data = Path(tmp) / "data"
+            media.mkdir()
+            started = threading.Event()
+            release = threading.Event()
+
+            cache = ScanCache()
+            cache.configure(data)
+
+            def slow_scan(media_dirs, excluded_dirs, progress, force_refresh, should_continue=None):
+                started.set()
+                release.wait(2)
+                return ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple()), 0, 0, 0, ()
+
+            cache._scan_with_cache = slow_scan  # type: ignore[method-assign]
+            self.assertTrue(cache.start([media], mode="incremental"))
+            self.assertTrue(started.wait(2))
+            self.assertTrue(cache.cancel_running())
+            self.assertEqual(cache.snapshot().status, "cancelled")
+
+            release.set()
+            if cache._thread:
+                cache._thread.join(1)
+            time.sleep(0.1)
+            snapshot = cache.snapshot()
+            self.assertEqual(snapshot.status, "cancelled")
+            self.assertIn("终止", snapshot.error)
 
 
 if __name__ == "__main__":

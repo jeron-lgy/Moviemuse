@@ -49,7 +49,7 @@
           <BaseButton variant="primary"  type="button" :disabled="!selectedJobs.length || retryingSelected" @click="retrySelected">
             {{ retryingSelected ? '重试中' : '批量重试' }}
           </BaseButton>
-          <BaseButton variant="danger" type="button" :disabled="!deletableSelectedJobs.length || deletingSelected" @click="deleteSelected">
+          <BaseButton variant="danger" type="button" :disabled="!selectedJobs.length || deletingSelected" @click="deleteSelected">
             {{ deletingSelected ? '删除中' : '批量删除' }}
           </BaseButton>
         </div>
@@ -425,7 +425,6 @@ const pageCount = computed(() => Math.max(1, Math.ceil(visibleJobs.value.length 
 const visiblePagedJobs = computed(() => visibleJobs.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE))
 const selectedJobs = computed(() => adaptedJobs.value.filter((job) => selectedIds.has(job.id)))
 const runnableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canRun))
-const deletableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canDelete))
 const allVisibleSelected = computed(() => visiblePagedJobs.value.length > 0 && visiblePagedJobs.value.every((job) => selectedIds.has(job.id)))
 const memoryLabel = computed(() => {
   const memory = backendStatus.value.hardware?.memory
@@ -740,25 +739,30 @@ async function runSelected() {
 }
 
 async function deleteSelected() {
-  const deletable = deletableSelectedJobs.value
-  if (!deletable.length) {
-    notice.value = '选中的任务里没有可删除的已结束任务。'
+  const targets = selectedJobs.value
+  if (!targets.length) {
+    notice.value = '请先选择要删除的任务。'
     return
   }
-  const skipped = selectedJobs.value.length - deletable.length
-  const names = deletable.slice(0, 5).map((job) => job.title).join('、')
-  const targetLabel = `${deletable.length} 个已结束任务`
-  const skippedLabel = skipped > 0 ? `\n其中 ${skipped} 个运行中或等待中的任务会保留。` : ''
-  const ok = window.confirm(`将删除 ${targetLabel} 的任务记录${names ? `：${names}` : ''}。不会删除媒体文件或字幕结果。${skippedLabel}\n继续吗？`)
+  const activeCount = targets.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)).length
+  const names = targets.slice(0, 5).map((job) => job.title).join('、')
+  const activeLabel = activeCount > 0 ? `\n其中 ${activeCount} 个运行中/等待中的任务会先终止，再删除记录。` : ''
+  const ok = window.confirm(`将删除 ${targets.length} 个任务记录${names ? `：${names}` : ''}。不会删除媒体文件或字幕结果。${activeLabel}\n继续吗？`)
   if (!ok) return
   deletingSelected.value = true
   errorMessage.value = ''
   try {
     let deleted = 0
-    for (const job of deletable) {
+    for (const job of targets) {
       if (job.sourceType === 'postprocess') {
+        if (['queued', 'running', 'translating'].includes(job.statusKey)) {
+          await postJson(`/api/postprocess/tasks/${job.rawId}/cancel`, {})
+        }
         await deleteJson(`/api/postprocess/tasks/${job.rawId}`)
       } else {
+        if (['queued', 'running', 'translating'].includes(job.statusKey)) {
+          await postJson(`/api/subtitle/jobs/${job.fileId}/cancel`, {})
+        }
         await deleteJson(`/api/subtitle/jobs/${job.fileId}`)
       }
       selectedIds.delete(job.id)
@@ -802,7 +806,7 @@ function adaptSubtitleJob(job) {
     finishedAt: job.finished_at,
     modelLabel: `${job.model || 'large-v3'} / ${job.source_language || 'auto'} => ${job.target_language || 'zh'}`,
     canRetry: ['failed', 'completed'].includes(statusKey),
-    canDelete: ['failed', 'completed'].includes(statusKey),
+    canDelete: true,
     canCancel: false,
     resultSrt: job.translated_srt || job.bilingual_srt
   }
@@ -838,7 +842,7 @@ function adaptPostprocessJob(task) {
     progressDetail: progressInfo.progressDetail || waitingDetail,
     canRun: ['waiting_worker', 'ready_to_run'].includes(String(task.status || '')),
     canRetry: ['failed', 'ignored', 'conflict', 'expired'].includes(String(task.status || '')),
-    canDelete: ['completed', 'failed', 'ignored', 'conflict', 'expired'].includes(String(task.status || '')),
+    canDelete: true,
     canCancel: !['completed', 'ignored'].includes(String(task.status || '')),
     resultSrt: ''
   }

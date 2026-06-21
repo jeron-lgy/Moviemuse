@@ -26,6 +26,11 @@ from .scanner import (
 SCAN_STALE_SECONDS = 10 * 60
 SCAN_INTERRUPTED_ERROR = "上次扫描异常中断，已保留旧结果，可重新扫描。"
 SCAN_RESET_ERROR = "扫描状态已重置，旧扫描结果会被忽略。"
+SCAN_CANCELLED_ERROR = "扫描已终止，旧扫描结果会被忽略。"
+
+
+class ScanCancelled(RuntimeError):
+    pass
 
 
 @dataclass
@@ -256,6 +261,16 @@ class ScanCache:
         self._save_snapshot(snapshot)
         return True
 
+    def cancel_running(self, message: str = SCAN_CANCELLED_ERROR) -> bool:
+        with self._lock:
+            if self._snapshot.status != "running":
+                return False
+            self._run_id += 1
+            self._snapshot = self._terminal_snapshot(self._snapshot, "cancelled", message)
+            snapshot = self._snapshot
+        self._save_snapshot(snapshot)
+        return True
+
     def start(
         self,
         media_dirs: list[Path],
@@ -316,6 +331,7 @@ class ScanCache:
                     excluded_dirs=excluded_dirs,
                     progress=progress,
                     force_refresh=True,
+                    should_continue=lambda: self._run_is_current(run_id),
                 )
             else:
                 result, reused_files, changed_files, missing_files, changed_paths = self._scan_with_cache(
@@ -323,7 +339,10 @@ class ScanCache:
                     excluded_dirs=excluded_dirs,
                     progress=progress,
                     force_refresh=False,
+                    should_continue=lambda: self._run_is_current(run_id),
                 )
+        except ScanCancelled:
+            return
         except Exception as exc:
             with self._lock:
                 if run_id != self._run_id:
@@ -365,7 +384,12 @@ class ScanCache:
         excluded_dirs: list[Path],
         progress: Callable[[int, int, Path | None], None] | None,
         force_refresh: bool,
+        should_continue: Callable[[], bool] | None = None,
     ) -> tuple[ScanResult, int, int, int, tuple[str, ...]]:
+        def ensure_active() -> None:
+            if should_continue and not should_continue():
+                raise ScanCancelled()
+
         if not self._db_path:
             return scan_libraries(media_dirs, excluded_dirs=excluded_dirs, progress=progress), 0, 0, 0, ()
 
@@ -374,10 +398,13 @@ class ScanCache:
         videos: list[Path] = []
         excluded_roots = normalized_roots(excluded_dirs)
         for media_dir in media_dirs:
+            ensure_active()
             if not media_dir.exists():
                 missing_dirs.append(media_dir)
                 continue
-            videos.extend(iter_video_files(media_dir, excluded_roots))
+            for video in iter_video_files(media_dir, excluded_roots):
+                ensure_active()
+                videos.append(video)
 
         total = len(videos)
         if progress:
@@ -390,6 +417,7 @@ class ScanCache:
         changed_paths: list[str] = []
 
         for index, video in enumerate(videos, start=1):
+            ensure_active()
             path_key = str(video)
             current_paths.add(path_key)
             try:
@@ -418,15 +446,18 @@ class ScanCache:
                     movie = None
 
             if movie is None:
+                ensure_active()
                 movie = analyze_video(video)
                 changed_files += 1
                 changed_paths.append(path_key)
 
             files.append(movie)
+            ensure_active()
             self._upsert_cached_file(movie, self._scan_root_for(video, media_dirs), size_bytes, mtime_ns, sidecar_signature)
             if progress:
                 progress(index, total, video)
 
+        ensure_active()
         missing_files = self._mark_missing(media_dirs, current_paths)
         result = build_scan_result(files, media_dirs, missing_dirs)
         return result, reused_files, changed_files, missing_files, tuple(changed_paths)
@@ -458,8 +489,11 @@ class ScanCache:
         return "\n".join(parts)
 
     def _interrupted_snapshot(self, snapshot: ScanSnapshot, message: str) -> ScanSnapshot:
+        return self._terminal_snapshot(snapshot, "interrupted", message)
+
+    def _terminal_snapshot(self, snapshot: ScanSnapshot, status: str, message: str) -> ScanSnapshot:
         return ScanSnapshot(
-            status="interrupted",
+            status=status,
             mode=snapshot.mode,
             started_at=snapshot.started_at,
             finished_at=time.time(),
@@ -475,6 +509,10 @@ class ScanCache:
             current_path=snapshot.current_path,
             last_progress_at=snapshot.last_progress_at,
         )
+
+    def _run_is_current(self, run_id: int) -> bool:
+        with self._lock:
+            return run_id == self._run_id and self._snapshot.status == "running"
 
     def _mark_dead_scan_interrupted(self) -> bool:
         with self._lock:

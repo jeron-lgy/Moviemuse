@@ -118,6 +118,45 @@ def selected_scan_dirs(
     return selected
 
 
+def scan_dir_identity(path: Path) -> str:
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path.absolute()).casefold()
+
+
+def saved_duplicate_scan_dirs(media_dirs: list[Path], trash_dir: Path, choices: list[Path]) -> list[Path]:
+    settings_data = get_system_settings_service().duplicate_scan()
+    raw_dirs = settings_data.get("selected_scan_dirs")
+    if not isinstance(raw_dirs, list):
+        raw_dirs = []
+    choice_by_key = {scan_dir_identity(path): path for path in choices}
+    selected: list[Path] = []
+    seen: set[str] = set()
+    for path in selected_scan_dirs(media_dirs, [str(item) for item in raw_dirs], [trash_dir]):
+        key = scan_dir_identity(path)
+        if key in choice_by_key and key not in seen:
+            selected.append(choice_by_key[key])
+            seen.add(key)
+    return selected or choices
+
+
+def save_duplicate_scan_dirs(media_dirs: list[Path], trash_dir: Path, raw_dirs: list[str]) -> list[Path]:
+    choices = selectable_scan_dirs(media_dirs, [trash_dir])
+    choice_by_key = {scan_dir_identity(path): path for path in choices}
+    selected: list[Path] = []
+    seen: set[str] = set()
+    for path in selected_scan_dirs(media_dirs, raw_dirs, [trash_dir]):
+        key = scan_dir_identity(path)
+        if key in choice_by_key and key not in seen:
+            selected.append(choice_by_key[key])
+            seen.add(key)
+    if not selected:
+        raise HTTPException(status_code=400, detail="请至少选择一个媒体子目录")
+    get_system_settings_service().update_duplicate_scan([str(path) for path in selected])
+    return selected
+
+
 def resolved_roots(paths: list[Path]) -> tuple[Path, ...]:
     roots: list[Path] = []
     for path in paths:
@@ -2028,6 +2067,8 @@ def api_scan() -> dict[str, object]:
     scan_stale = scan_cache.scan_stale()
     result = snapshot.result or ScanResult(tuple(), 0, 0, tuple(media_dirs), tuple(), tuple())
     duplicate_group_keys = {group.key for group in result.groups}
+    scan_choices = selectable_scan_dirs(media_dirs, [trash_dir])
+    saved_scan_dirs = saved_duplicate_scan_dirs(media_dirs, trash_dir, scan_choices)
     return {
         "status": snapshot.status,
         "mode": snapshot.mode,
@@ -2046,8 +2087,10 @@ def api_scan() -> dict[str, object]:
         "scan_alive": scan_alive,
         "scan_stale": scan_stale,
         "can_reset": snapshot.status == "running",
+        "can_cancel": snapshot.status == "running",
         "active_scan_dirs": [str(path) for path in snapshot.scanned_dirs],
-        "selectable_scan_dirs": [str(path) for path in selectable_scan_dirs(media_dirs, [trash_dir])],
+        "selectable_scan_dirs": [str(path) for path in scan_choices],
+        "selected_scan_dirs": [str(path) for path in saved_scan_dirs],
         "total_files": result.total_files,
         "duplicate_groups": len(result.groups),
         "duplicate_files": result.duplicate_files,
@@ -2063,18 +2106,39 @@ def api_scan() -> dict[str, object]:
     }
 
 
+@app.post("/api/scan/selection")
+def api_save_scan_selection(paths: list[str] = Form(default=[])) -> dict[str, object]:
+    media_dirs, trash_dir, _ = settings()
+    selected = save_duplicate_scan_dirs(media_dirs, trash_dir, paths)
+    return {
+        "status": "saved",
+        "selected_scan_dirs": [str(path) for path in selected],
+    }
+
+
 @app.post("/api/scan/run")
 def api_scan_run(paths: list[str] = Form(default=[]), mode: str = Form(default="incremental")) -> dict[str, object]:
     media_dirs, trash_dir, data_dir = settings()
     scan_cache.configure(data_dir)
-    scan_dirs = selected_scan_dirs(media_dirs, paths, [trash_dir])
-    if not scan_dirs:
-        raise HTTPException(status_code=400, detail="请至少选择一个媒体子目录")
+    scan_dirs = save_duplicate_scan_dirs(media_dirs, trash_dir, paths)
     scan_mode = "full" if mode == "full" else "incremental"
     started = scan_cache.start(scan_dirs, force=False, mode=scan_mode, excluded_dirs=[trash_dir], completion_callback=notify_scan_completed)
     if not started:
         raise HTTPException(status_code=409, detail="已有扫描任务在运行")
     return {"status": "running", "started": started, "mode": scan_mode, "scan_dirs": [str(path) for path in scan_dirs]}
+
+
+@app.post("/api/scan/cancel")
+def api_scan_cancel() -> dict[str, object]:
+    _, _, data_dir = settings()
+    scan_cache.configure(data_dir)
+    cancelled = scan_cache.cancel_running()
+    snapshot = scan_cache.snapshot()
+    return {
+        "status": snapshot.status,
+        "cancelled": cancelled,
+        "error": snapshot.error,
+    }
 
 
 @app.post("/api/scan/reset")
@@ -2883,6 +2947,19 @@ async def api_retry_subtitle_job(job_id: str, request: Request) -> dict[str, obj
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "ok", "job": job_payload(job)}
+
+
+@app.post("/api/subtitle/jobs/{job_id}/cancel", dependencies=[Depends(require_subtitle_token)])
+def api_cancel_subtitle_job(job_id: str) -> dict[str, object]:
+    if backend_url():
+        return remote_post_json(f"/api/subtitle/jobs/{job_id}/cancel", {})
+    try:
+        job = get_subtitle_service().cancel_job(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "cancelled", "job": job_payload(job)}
 
 
 @app.delete("/api/subtitle/jobs/{job_id}", dependencies=[Depends(require_subtitle_token)])
