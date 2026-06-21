@@ -30,9 +30,93 @@ Unraid /media 下的视频
 - 字幕翻译支持 Google 免费翻译、DeepL API、DeepSeek API 和本地 Ollama。
 - 控制台集中配置 Windows 算力端地址、模型设置、翻译服务和路径映射。
 
-## 首次部署
+## Docker 部署
 
-### 1. Unraid 控制台
+### 镜像状态
+
+当前仓库已经加入 GitHub Container Registry 发布流程，后续发布 GitHub Release 时会自动构建并推送：
+
+```text
+ghcr.io/jeron-lgy/moviemuse
+```
+
+正式部署使用 `deploy/unraid-frontend/docker-compose.release.yml`，从 GHCR 拉取镜像，不需要在 Unraid 上保留完整源码。
+
+本地测试和源码构建使用 `deploy/unraid-frontend/docker-compose.yml` 或 `deploy/unraid-frontend/docker-compose.ui-test.yml`，会在本机执行 `docker build`。
+
+| 场景 | Compose 文件 | 镜像来源 | 媒体挂载 | 用途 |
+| --- | --- | --- | --- | --- |
+| 正式发布 | `deploy/unraid-frontend/docker-compose.release.yml` | `ghcr.io/jeron-lgy/moviemuse` | 默认读写 | 普通用户一键部署 |
+| 本地源码构建 | `deploy/unraid-frontend/docker-compose.yml` | 本地 `docker build` | 默认读写 | 开发者从源码构建 |
+| 本地/Unraid 联调 | `deploy/unraid-frontend/docker-compose.ui-test.yml` | 本地 `docker build` | 默认只读 | 测试扫描、字幕联调，避免误移动 |
+
+### 正式发布部署
+
+首次安装只需要准备一个目录保存 compose 文件和数据目录，例如：
+
+```bash
+mkdir -p /mnt/user/appdata/moviemuse
+cd /mnt/user/appdata/moviemuse
+```
+
+下载正式发布 compose：
+
+```bash
+curl -L -o docker-compose.release.yml \
+  https://raw.githubusercontent.com/jeron-lgy/Moviemuse/main/deploy/unraid-frontend/docker-compose.release.yml
+```
+
+初始化配置目录权限：
+
+```bash
+mkdir -p /mnt/user/appdata/moviemuse/data
+chown -R 99:100 /mnt/user/appdata/moviemuse/data
+chmod -R u+rwX,g+rwX /mnt/user/appdata/moviemuse/data
+```
+
+编辑 `docker-compose.release.yml`，至少确认媒体目录和对外端口，然后启动：
+
+```bash
+docker compose -f docker-compose.release.yml up -d
+```
+
+访问控制台：
+
+```text
+http://UNRAID-IP:18188
+```
+
+### 正式 yml 关键参数
+
+| 参数 | 默认值 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `MOVIEMUSE_IMAGE_TAG` | `latest` | 否 | 拉取的镜像标签。正式版本建议固定为 `v0.1.0` 这类版本号。 |
+| `MOVIEMUSE_HTTP_PORT` | `18188` | 否 | Unraid 对外 WebUI 端口；容器内固定为 `18180`。 |
+| `MOVIEMUSE_MEDIA_DIR` | `/mnt/user/media` | 是 | Unraid 上真实媒体库目录，挂载到容器 `/media`。 |
+| `MOVIEMUSE_DATA_DIR` | `/mnt/user/appdata/moviemuse/data` | 是 | 保存设置、任务状态和 SQLite 数据；不要放进媒体目录。 |
+| `UNRAID_ROOT` | `/mnt` | 建议保留 | 挂载 Unraid 根目录到 `/unraid`，用于识别同盘路径并优化移动。 |
+| `PUID` / `PGID` | `99` / `100` | 否 | Unraid 常用 `nobody:users` 权限。 |
+| `UMASK` | `022` | 否 | 容器创建文件的默认权限掩码。 |
+| `MOVIEMUSE_MEM_LIMIT` | `2g` | 否 | 控制台容器内存限制。 |
+| `MEDIA_DIRS` | `/media` | 不建议改 | 容器内扫描路径，应与媒体挂载目标一致。 |
+| `TRASH_DIR` | `/media/trash` | 不建议改 | 容器内回收站路径。 |
+| `APP_DATA_DIR` | `/data` | 不建议改 | 容器内数据目录。 |
+| `SUBTITLE_BACKEND_URL` | 空 | 字幕功能需要 | Unraid 控制台访问 Windows 算力端的地址，例如 `http://WINDOWS-IP:18181`。 |
+| `SUBTITLE_BACKEND_PUBLIC_URL` | 空 | 可选 | 展示/保存给前端的 Windows 算力端地址，通常与 `SUBTITLE_BACKEND_URL` 一致。 |
+| `CONSOLE_PUBLIC_URL` | 空 | 转码回调需要 | Windows 算力端回调 Unraid 控制台的地址，例如 `http://UNRAID-IP:18188`。 |
+| `SUBTITLE_PROXY_PATH_MAP` | 空 | 字幕/转码需要 | 容器路径到 Windows 可访问路径的映射，例如 `/media=\\NAS\media`。 |
+| `SUBTITLE_BACKEND_TOKEN` | 空 | 可选 | 控制台调用 Windows 算力端时使用的 token。 |
+| `SUBTITLE_API_TOKEN` | 空 | 可选 | 控制台对字幕/算力 API 的访问 token。 |
+| `WHISPER_MODEL` | `large-v3-turbo` | 否 | 远程算力端默认展示/任务模型名；实际模型文件在 Windows 算力端。 |
+| `POSTPROCESS_DOWNLOAD_DIR` | `/media/study3` | 按需 | 后处理下载目录，建议保持在 `/media` 下。 |
+| `POSTPROCESS_OUTPUT_DIR` | `/media/压制` | 按需 | 后处理输出目录，建议保持在 `/media` 下。 |
+| `POSTPROCESS_DOWNLOAD_UNRAID_RELATIVE` | `media/study3` | 按需 | 下载目录相对 `/mnt` 的路径，用于同盘路径识别。 |
+| `POSTPROCESS_OUTPUT_UNRAID_RELATIVE` | `media/压制` | 按需 | 输出目录相对 `/mnt` 的路径。 |
+| `UNRAID_TRASH_RELATIVE` | `media/trash` | 否 | 回收站相对 `/mnt` 的路径。 |
+| `JAVLIBRARY_FLARESOLVERR_URL` | 空 | 可选 | JavLibrary 反爬代理地址；不使用可留空。 |
+| `NO_PROXY` / `no_proxy` | 局域网默认值 | 否 | 避免局域网请求走代理。 |
+
+### 本地源码构建
 
 需要复制到 Unraid 的主要目录：
 
