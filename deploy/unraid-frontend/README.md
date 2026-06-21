@@ -36,16 +36,15 @@ chown -R 99:100 /mnt/user/appdata/moviemuse/data
 chmod -R u+rwX,g+rwX /mnt/user/appdata/moviemuse/data
 ```
 
-编辑 `docker-compose.release.yml`，至少确认：
+编辑 `docker-compose.release.yml`，通常只需要确认：
 
 | 参数 | 说明 |
 | --- | --- |
 | `MOVIEMUSE_MEDIA_DIR` | Unraid 媒体目录，例如 `/mnt/user/media`。 |
 | `MOVIEMUSE_DATA_DIR` | 配置和任务数据目录，例如 `/mnt/user/appdata/moviemuse/data`。 |
 | `MOVIEMUSE_HTTP_PORT` | WebUI 对外端口，默认 `18188`。 |
-| `SUBTITLE_BACKEND_URL` | Windows 算力端地址，例如 `http://WINDOWS-IP:18181`。 |
-| `CONSOLE_PUBLIC_URL` | Windows 回调 Unraid 的地址，例如 `http://UNRAID-IP:18188`。 |
-| `SUBTITLE_PROXY_PATH_MAP` | 容器路径到 Windows UNC 路径映射，例如 `/media=\\NAS\media`。 |
+
+Windows 算力端地址、Unraid 回调地址、路径映射、翻译 API 和后处理目录都在 WebUI 里配置，不需要写进正式 yml。
 
 启动：
 
