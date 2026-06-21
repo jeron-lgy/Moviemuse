@@ -3,15 +3,15 @@ setlocal
 
 cd /d "%~dp0"
 
-set "WHISPER_MODEL=large-v3"
-set "WHISPER_MODEL_DIR=%CD%\data\local-backend\whisper-models"
-set "WHISPER_DEVICE=cuda"
-set "WHISPER_COMPUTE_TYPE=float16"
-set "SUBTITLE_MAX_WORKERS=1"
-set "HOST=0.0.0.0"
-set "PORT=18181"
-set "SUBTITLE_PATH_MAP="
-set "COMPUTE_NODE_ONLY=1"
+if "%WHISPER_MODEL%"=="" set "WHISPER_MODEL=large-v3-turbo"
+if "%WHISPER_MODEL_DIR%"=="" set "WHISPER_MODEL_DIR=%CD%\data\local-backend\whisper-models"
+if "%WHISPER_DEVICE%"=="" set "WHISPER_DEVICE=cuda"
+if "%WHISPER_COMPUTE_TYPE%"=="" set "WHISPER_COMPUTE_TYPE=float16"
+if "%SUBTITLE_MAX_WORKERS%"=="" set "SUBTITLE_MAX_WORKERS=1"
+if "%HOST%"=="" set "HOST=0.0.0.0"
+if "%PORT%"=="" set "PORT=18181"
+if "%SUBTITLE_PATH_MAP%"=="" set "SUBTITLE_PATH_MAP="
+if "%COMPUTE_NODE_ONLY%"=="" set "COMPUTE_NODE_ONLY=1"
 
 if not exist "%WHISPER_MODEL_DIR%" mkdir "%WHISPER_MODEL_DIR%"
 
