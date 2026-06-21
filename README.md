@@ -118,19 +118,107 @@ Windows 算力端的模型目录：
 data\local-backend\whisper-models
 ```
 
-RTX 5090 推荐先使用：
+推荐先使用：
+
+```text
+large-v3-turbo / cuda / float16 / 并发 1
+```
+
+追求最高识别质量时可改用：
 
 ```text
 large-v3 / cuda / float16 / 并发 1
 ```
 
-模型下载参考：
+低显存或需要兜底时可改用：
+
+```text
+medium / cuda / int8_float16 / 并发 1
+```
+
+### 新电脑下载模型
+
+新电脑只需要先安装 Python 和 Hugging Face CLI，不需要先安装 MovieMuse 或 CUDA 才能下载模型。
+
+```powershell
+winget install Python.Python.3.12
+python -m pip install -U huggingface_hub
+```
+
+新版 `huggingface_hub` 使用 `hf download`。旧命令 `huggingface-cli download` 已废弃，可能只显示提示但不会下载。
+
+只下载推荐的 turbo 模型：
+
+```powershell
+mkdir C:\MoviemuseModels -Force
+cd C:\MoviemuseModels
+
+$root = "whisper-models"
+mkdir $root -Force
+
+hf download h2oai/faster-whisper-large-v3-turbo `
+  --local-dir "$root\large-v3-turbo"
+```
+
+一次下载常用三个模型：
+
+```powershell
+mkdir C:\MoviemuseModels -Force
+cd C:\MoviemuseModels
+
+$root = "whisper-models"
+mkdir $root -Force
+
+hf download h2oai/faster-whisper-large-v3-turbo `
+  --local-dir "$root\large-v3-turbo"
+
+hf download Systran/faster-whisper-large-v3 `
+  --local-dir "$root\large-v3"
+
+hf download Systran/faster-whisper-medium `
+  --local-dir "$root\medium"
+```
+
+下载完成后，模型目录应包含 `model.bin`、`config.json`、`tokenizer.json`、词表文件等。例如：
+
+```text
+whisper-models\
+  large-v3-turbo\
+    config.json
+    model.bin
+    tokenizer.json
+    vocabulary.json
+  large-v3\
+    config.json
+    model.bin
+    tokenizer.json
+    vocabulary.json
+  medium\
+    config.json
+    model.bin
+    tokenizer.json
+    vocabulary.txt
+```
+
+把整个 `whisper-models` 文件夹复制到 Windows 算力端的：
+
+```text
+data\local-backend\whisper-models
+```
+
+然后在控制台“字幕任务”页面填写：
+
+```text
+模型目录：data\local-backend\whisper-models
+模型名：large-v3-turbo
+```
+
+模型链接参考：
 
 - [faster-whisper 项目](https://github.com/SYSTRAN/faster-whisper)
 - [faster-whisper-large-v3 模型](https://huggingface.co/Systran/faster-whisper-large-v3)
-- [faster-whisper-large-v3-turbo 模型](https://huggingface.co/Systran/faster-whisper-large-v3-turbo)
-
-下载后的完整模型文件夹放入 `data\local-backend\whisper-models`，然后在控制台选择对应模型目录或模型名称。
+- [faster-whisper-large-v3-turbo 模型](https://huggingface.co/h2oai/faster-whisper-large-v3-turbo)
+- [faster-whisper-medium 模型](https://huggingface.co/Systran/faster-whisper-medium)
 
 ## 本机开发
 
