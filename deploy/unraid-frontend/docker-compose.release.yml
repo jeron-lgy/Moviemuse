@@ -4,9 +4,9 @@ services:
   moviemuse:
     image: ghcr.io/jeron-lgy/moviemuse:${MOVIEMUSE_IMAGE_TAG:-latest}
     container_name: moviemuse
-    user: "${PUID:-99}:${PGID:-100}"
-    mem_limit: ${MOVIEMUSE_MEM_LIMIT:-2g}
-    memswap_limit: ${MOVIEMUSE_MEMSWAP_LIMIT:-2g}
+    user: "99:100"
+    mem_limit: 2g
+    memswap_limit: 2g
 
     ports:
       # 左边是 Unraid 对外 WebUI 端口，冲突时只改左边。
@@ -16,36 +16,20 @@ services:
       MEDIA_DIRS: /media
       TRASH_DIR: /media/trash
       APP_DATA_DIR: /data
-      UMASK: ${UMASK:-022}
-      MOVIEMUSE_TIMEZONE: ${MOVIEMUSE_TIMEZONE:-Asia/Shanghai}
-      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo}
-
-      # Windows 算力端。首次部署后也可以在 WebUI 的“字幕任务”页面保存。
-      SUBTITLE_BACKEND_URL: ${SUBTITLE_BACKEND_URL:-}
-      SUBTITLE_BACKEND_PUBLIC_URL: ${SUBTITLE_BACKEND_PUBLIC_URL:-}
-      CONSOLE_PUBLIC_URL: ${CONSOLE_PUBLIC_URL:-}
-      SUBTITLE_PROXY_PATH_MAP: ${SUBTITLE_PROXY_PATH_MAP:-}
-      SUBTITLE_BACKEND_TOKEN: ${SUBTITLE_BACKEND_TOKEN:-}
-      SUBTITLE_API_TOKEN: ${SUBTITLE_API_TOKEN:-}
-
-      # 后处理默认目录，需保持在 /media 下，便于路径映射和同盘移动。
-      POSTPROCESS_DOWNLOAD_DIR: ${POSTPROCESS_DOWNLOAD_DIR:-/media/study3}
-      POSTPROCESS_OUTPUT_DIR: ${POSTPROCESS_OUTPUT_DIR:-/media/压制}
-      POSTPROCESS_DOWNLOAD_UNRAID_RELATIVE: ${POSTPROCESS_DOWNLOAD_UNRAID_RELATIVE:-media/study3}
-      POSTPROCESS_OUTPUT_UNRAID_RELATIVE: ${POSTPROCESS_OUTPUT_UNRAID_RELATIVE:-media/压制}
+      UMASK: "022"
       UNRAID_MOUNT_ROOT: /unraid
-      UNRAID_TRASH_RELATIVE: ${UNRAID_TRASH_RELATIVE:-media/trash}
-
-      JAVLIBRARY_FLARESOLVERR_URL: ${JAVLIBRARY_FLARESOLVERR_URL:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
-      no_proxy: ${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+      UNRAID_TRASH_RELATIVE: media/trash
+      MOVIEMUSE_TIMEZONE: Asia/Shanghai
+      WHISPER_MODEL: large-v3-turbo
+      NO_PROXY: localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+      no_proxy: localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
 
     volumes:
       # 左边换成你的 Unraid 媒体真实目录。
       - ${MOVIEMUSE_MEDIA_DIR:-/mnt/user/media}:/media
       - ${MOVIEMUSE_DATA_DIR:-/mnt/user/appdata/moviemuse/data}:/data
       # 同盘快速移动需要保留；回收站默认在 /mnt/user/media/trash。
-      - ${UNRAID_ROOT:-/mnt}:/unraid
+      - /mnt:/unraid
 
     command: >
       sh -c "umask $${UMASK:-022} && uvicorn app.main:app --host 0.0.0.0 --port 18180"
