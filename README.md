@@ -1,8 +1,58 @@
 # MovieMuse
 
-Unraid 媒体整理控制台 + Windows 字幕算力端。
+MovieMuse 是一个面向 NAS / Unraid 媒体库的整理控制台，重点解决重复视频清理、洗版后处理、字幕生成和字幕翻译这些日常维护问题。
 
-MovieMuse 用于扫描 NAS 媒体目录中的重复版本，预览并移动低优先级文件，同时把需要字幕的视频任务发送到 Windows GPU 主机，使用 `faster-whisper` 生成字幕并按配置翻译。
+它由两部分组成：Unraid 上运行的 Web 控制台，以及可选的 Windows GPU 算力端。控制台负责扫描媒体库、管理任务和保存配置；Windows 算力端负责使用 `faster-whisper` 生成字幕、执行转码/后处理任务，并把结果回写到媒体目录。
+
+## 项目能做什么
+
+- 扫描 NAS 媒体目录，按番号/标题识别重复视频和不同版本。
+- 在移动文件前预览目标，降低误删或误移动风险。
+- 把低优先级版本移动到回收站，而不是直接删除。
+- 支持 Unraid 同盘快速移动，减少大文件跨盘复制。
+- 管理番号订阅、下载状态、洗版任务和后处理队列。
+- 对接 qBittorrent、MTeam、Jellyfin 等媒体工作流。
+- 把字幕任务发送到 Windows GPU 主机，用 Whisper / faster-whisper 生成字幕。
+- 支持 Google 免费翻译、DeepL API、DeepSeek API、本地 Ollama 等字幕翻译后端。
+- 通过浏览器扩展辅助 Jellyfin 页面里的字幕和转码操作。
+
+## 需要准备什么
+
+| 项目 | 用途 | 是否必须 |
+| --- | --- | --- |
+| Unraid 或 Linux Docker 环境 | 运行 MovieMuse Web 控制台 | 必须 |
+| 媒体目录 | 例如 `/mnt/user/media`，容器内挂载为 `/media` | 必须 |
+| 数据目录 | 保存设置、任务记录和数据库，例如 `/mnt/user/appdata/moviemuse/data` | 必须 |
+| Windows GPU 主机 | 运行字幕/转码算力端 | 字幕和转码功能需要 |
+| NVIDIA 显卡驱动 | Windows 算力端使用 CUDA 推理 | GPU 字幕需要 |
+| Whisper 模型 | 例如 `large-v3-turbo` | 字幕功能需要 |
+| qBittorrent / MTeam / Jellyfin | 下载、洗版、媒体库联动 | 按需 |
+
+推荐目录结构：
+
+```text
+/mnt/user/media/
+  study3/
+  study3_h265/
+  trash/
+
+/mnt/user/appdata/moviemuse/
+  data/
+```
+
+如果 `study3`、`study3_h265`、`trash` 都在同一个媒体根目录下，只需要在正式 yml 里挂载媒体根目录即可：
+
+```yaml
+MOVIEMUSE_MEDIA_DIR: /mnt/user/media
+```
+
+容器内会自动对应为：
+
+```text
+/media/study3
+/media/study3_h265
+/media/trash
+```
 
 ## 部署结构
 
@@ -19,16 +69,6 @@ Unraid /media 下的视频
     -> Windows Worker 通过共享路径读取视频
     -> 生成同目录 .srt 字幕文件
 ```
-
-## 主要功能
-
-- 扫描指定媒体目录，按版本分组查看重复视频。
-- 手动选择或按策略命中待移动文件，移动前提供预览。
-- 回收站移动支持 Unraid 同盘路径处理，避免无意义的大文件复制。
-- 从扫描页提交视频到字幕任务队列。
-- Windows 算力端使用 `faster-whisper` 与 CUDA 转写视频。
-- 字幕翻译支持 Google 免费翻译、DeepL API、DeepSeek API 和本地 Ollama。
-- 控制台集中配置 Windows 算力端地址、模型设置、翻译服务和路径映射。
 
 ## Docker 部署
 
