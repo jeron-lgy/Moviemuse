@@ -1,87 +1,78 @@
-﻿# Unraid Frontend
+# Unraid Docker 部署
 
-This folder contains the Docker frontend/proxy for Unraid.
+这个目录包含 MovieMuse 控制台的 Docker 部署文件。
 
-It does not run Whisper locally. Subtitle jobs are forwarded to the Windows backend configured by:
+MovieMuse 控制台不在容器内运行 Whisper。字幕和转码任务会转发到 Windows 算力端。
 
-```yaml
-SUBTITLE_BACKEND_URL: http://WINDOWS-IP:18181
-SUBTITLE_BACKEND_PUBLIC_URL: http://WINDOWS-IP:18181
-CONSOLE_PUBLIC_URL: http://UNRAID-IP:18188
+## Compose 文件
+
+| 文件 | 场景 | 镜像来源 | 说明 |
+| --- | --- | --- | --- |
+| `docker-compose.release.yml` | 正式发布 | `ghcr.io/jeron-lgy/moviemuse` | 普通用户部署首选，不需要源码构建。 |
+| `docker-compose.yml` | 本地源码构建 | 本地 `docker build` | 开发者或发布前验证使用。 |
+| `docker-compose.ui-test.yml` | 联调测试 | 本地 `docker build` | 默认只读挂载媒体，避免误移动。 |
+
+## 正式发布部署
+
+在 Unraid 上准备目录：
+
+```bash
+mkdir -p /mnt/user/appdata/moviemuse
+cd /mnt/user/appdata/moviemuse
 ```
 
-`SUBTITLE_BACKEND_URL` is used by Unraid to call Windows. `CONSOLE_PUBLIC_URL`
-is used by Windows to call back Unraid after a transcode job finishes. In the
-WebUI, set `CONSOLE_PUBLIC_URL` from “Windows 算力端 -> Unraid 回调地址”.
+下载正式 compose：
 
-## Run On Unraid
-
-Copy the project root to:
-
-```text
-/mnt/user/appdata/moviemuse
+```bash
+curl -L -o docker-compose.release.yml \
+  https://raw.githubusercontent.com/jeron-lgy/Moviemuse/main/deploy/unraid-frontend/docker-compose.release.yml
 ```
 
-Then run from the project root:
+首次安装初始化数据目录权限：
 
 ```bash
 mkdir -p /mnt/user/appdata/moviemuse/data
 chown -R 99:100 /mnt/user/appdata/moviemuse/data
 chmod -R u+rwX,g+rwX /mnt/user/appdata/moviemuse/data
+```
+
+编辑 `docker-compose.release.yml`，至少确认：
+
+| 参数 | 说明 |
+| --- | --- |
+| `MOVIEMUSE_MEDIA_DIR` | Unraid 媒体目录，例如 `/mnt/user/media`。 |
+| `MOVIEMUSE_DATA_DIR` | 配置和任务数据目录，例如 `/mnt/user/appdata/moviemuse/data`。 |
+| `MOVIEMUSE_HTTP_PORT` | WebUI 对外端口，默认 `18188`。 |
+| `SUBTITLE_BACKEND_URL` | Windows 算力端地址，例如 `http://WINDOWS-IP:18181`。 |
+| `CONSOLE_PUBLIC_URL` | Windows 回调 Unraid 的地址，例如 `http://UNRAID-IP:18188`。 |
+| `SUBTITLE_PROXY_PATH_MAP` | 容器路径到 Windows UNC 路径映射，例如 `/media=\\NAS\media`。 |
+
+启动：
+
+```bash
+docker compose -f docker-compose.release.yml up -d
+```
+
+访问：
+
+```text
+http://UNRAID-IP:18188
+```
+
+## 本地源码构建
+
+从项目根目录运行：
+
+```bash
 docker compose -f deploy/unraid-frontend/docker-compose.yml up -d --build
 ```
 
-The three permission commands are required on the first Unraid installation.
-The console container runs as `99:100` and needs write access to `/data` to
-save the Windows worker address, translation settings, and task state.
+## 联调测试
 
-The scan/dedupe UI will be available at:
+测试 yml 默认只读挂载媒体目录：
 
-```text
-http://UNRAID_IP:18180/
+```bash
+docker compose -f deploy/unraid-frontend/docker-compose.ui-test.yml up -d --build
 ```
 
-Use these views to verify scanning:
-
-```text
-http://UNRAID_IP:18180/?view=all
-http://UNRAID_IP:18180/?view=no-subtitle
-http://UNRAID_IP:18180/api/scan
-```
-
-The subtitle task UI will be available at:
-
-```text
-http://UNRAID_IP:18180/subtitles
-```
-
-If the compose port maps `18188:18180`, the callback URL should use the left
-host port:
-
-```text
-http://UNRAID_IP:18188
-```
-
-## Path Mapping
-
-Inside the container, media is mounted as:
-
-```text
-/media
-```
-
-Before requests are forwarded to Windows, paths are rewritten by the console:
-
-```text
-/media -> //UNRAID/media
-```
-
-Post-processing download and output directories should also stay under `/media`,
-for example `/media/study3` and `/media/压制`, so one mapping covers subtitles and transcoding.
-
-The Windows backend can stay simple and does not need its own path map if the console sends Windows-readable UNC paths:
-
-```powershell
-$env:SUBTITLE_PATH_MAP=''
-.\start_dev.bat
-```
+如需验证移动/回收站行为，再按测试范围去掉媒体挂载的 `:ro`。
