@@ -1,0 +1,41 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+trash/
+sample-media/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.env
+.env
+.env.*
+!.env.example
+local.*
+*.local
+secrets.*
+
+# Python / local runtime
+*.pyo
+*.pyd
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Frontend dependencies and generated build output.
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
+frontend/.vite/
+
+# Generated packages / temporary work dirs
+/dist/
+/moviemuse-move-*/
+.tmp-*/
+tmp-tests/
+
+# Local OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,55 @@
+name: moviemuse-ui-test
+
+services:
+  moviemuse-ui-test:
+    build:
+      context: ../..
+      dockerfile: deploy/unraid-frontend/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    image: moviemuse-unraid-ui-test:latest
+    container_name: moviemuse-ui-test
+    user: "99:100"
+
+    ports:
+      # 第一次测试：需要换端口时只改左边，避免和正式实例冲突。
+      - "18182:18180"
+
+    environment:
+      MEDIA_DIRS: /media
+      TRASH_DIR: /media/trash
+      APP_DATA_DIR: /data
+      POSTPROCESS_DOWNLOAD_DIR: /media/study3
+      POSTPROCESS_OUTPUT_DIR: /media/压制
+      POSTPROCESS_DOWNLOAD_UNRAID_RELATIVE: media/study3
+      POSTPROCESS_OUTPUT_UNRAID_RELATIVE: media/压制
+      WHISPER_MODEL: large-v3
+      PUID: "99"
+      PGID: "100"
+      UMASK: "022"
+      UNRAID_MOUNT_ROOT: /unraid
+      UNRAID_TRASH_RELATIVE: media/trash
+
+      # 第一次测试：改为 Windows 算力端实际 IP。
+      SUBTITLE_BACKEND_URL: "http://WINDOWS-IP:18181"
+      SUBTITLE_BACKEND_PUBLIC_URL: "http://WINDOWS-IP:18181"
+      SUBTITLE_BACKEND_TOKEN: ""
+      SUBTITLE_API_TOKEN: ""
+      # 本机 Docker Desktop 测试可用 http://host.docker.internal:8281/v1；Unraid 上按实际 FlareSolverr 地址填写。
+      JAVLIBRARY_FLARESOLVERR_URL: ${JAVLIBRARY_FLARESOLVERR_URL:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+      no_proxy: ${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+
+      # 第一次测试：改为 Windows 可以访问的 Unraid 共享路径。
+      SUBTITLE_PROXY_PATH_MAP: '/media=\\NAS\media'
+
+    volumes:
+      # 第一次字幕联调保持只读；验证移动前去掉 :ro，并且只选测试目录。
+      - /mnt/user/media:/media:ro
+      - /mnt/user/appdata/moviemuse-ui-test/data:/data
+      - /mnt:/unraid:ro
+
+    command: >
+      sh -c "umask $${UMASK:-022} && uvicorn app.main:app --host 0.0.0.0 --port 18180"
+
+    restart: unless-stopped

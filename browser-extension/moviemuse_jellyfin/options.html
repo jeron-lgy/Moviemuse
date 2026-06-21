@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>moviemuse_jellyfin</title>
+  <style>
+    :root {
+      --mm-primary: #FF385C;
+      --mm-primary-hover: #E00B41;
+      --mm-primary-soft: #FFF0F3;
+      --mm-success: #008A05;
+      --mm-text: #222222;
+      --mm-muted: #6A6A6A;
+      --mm-border: #DDDDDD;
+      --mm-surface: #F7F7F7;
+      color: var(--mm-text);
+      background: #FFFFFF;
+      font-family: "Airbnb Cereal VF", Inter, "HarmonyOS Sans SC", MiSans, system-ui, sans-serif;
+    }
+    body {
+      min-width: 340px;
+      margin: 0;
+      padding: 14px;
+      background: #FFFFFF;
+    }
+    main {
+      display: grid;
+      gap: 12px;
+    }
+    header {
+      display: grid;
+      gap: 3px;
+    }
+    h1 {
+      margin: 0;
+      color: var(--mm-primary);
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.2;
+    }
+    p {
+      margin: 0;
+      color: var(--mm-muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .settings {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid var(--mm-border);
+      border-radius: 8px;
+      background: var(--mm-surface);
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--mm-muted);
+      font-size: 12px;
+      font-weight: 550;
+    }
+    input {
+      min-height: 32px;
+      box-sizing: border-box;
+      border: 1px solid var(--mm-border);
+      border-radius: 8px;
+      padding: 0 10px;
+      background: #fff;
+      color: var(--mm-text);
+      font: inherit;
+      font-size: 12px;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--mm-primary);
+      box-shadow: 0 0 0 2px var(--mm-primary-soft);
+    }
+    button {
+      min-height: 32px;
+      border: 1px solid var(--mm-primary);
+      border-radius: 8px;
+      background: var(--mm-primary);
+      color: #fff;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 550;
+      transition: background .16s ease, border-color .16s ease, transform .16s ease;
+    }
+    button:hover {
+      border-color: var(--mm-primary-hover);
+      background: var(--mm-primary-hover);
+    }
+    #status {
+      min-height: 16px;
+      color: var(--mm-success);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>moviemuse_jellyfin</h1>
+      <p>用于从 Jellyfin 页面发送字幕和转码任务到本地 MovieMuse。</p>
+    </header>
+    <section class="settings">
+      <label>
+        MovieMuse API 地址
+        <input id="apiBase" placeholder="http://127.0.0.1:18183">
+      </label>
+      <label>
+        API Key
+        <input id="apiKey" type="password" autocomplete="off" placeholder="未设置 SUBTITLE_API_TOKEN 时可留空">
+      </label>
+      <button id="save" type="button">保存</button>
+    </section>
+    <div id="status" role="status"></div>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+name: moviemuse
+
+services:
+  moviemuse:
+    build:
+      context: ../..
+      dockerfile: deploy/unraid-frontend/Dockerfile
+    image: moviemuse-unraid:latest
+    container_name: moviemuse
+    user: "99:100"
+    mem_limit: 2g
+    memswap_limit: 2g
+
+    ports:
+      # 左边是 Unraid 对外 WebUI 端口，冲突时只改左边。
+      - "18188:18180"
+
+    environment:
+      MEDIA_DIRS: /media
+      TRASH_DIR: /media/trash
+      APP_DATA_DIR: /data
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+      no_proxy: ${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
+
+    volumes:
+      # 左边换成你的 Unraid 媒体真实目录。
+      - /mnt/user/media:/media
+      - /mnt/user/appdata/moviemuse/data:/data
+      # 同盘快速移动需要保留；回收站默认在 /mnt/user/media/trash。
+      - /mnt:/unraid
+
+    command: >
+      sh -c "umask 022 && uvicorn app.main:app --host 0.0.0.0 --port 18180"
+
+    restart: unless-stopped
