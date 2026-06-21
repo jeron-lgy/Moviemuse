@@ -31,8 +31,8 @@ services:
       UNRAID_TRASH_RELATIVE: media/trash
 
       # 第一次测试：改为 Windows 算力端实际 IP。
-      SUBTITLE_BACKEND_URL: "http://192.168.2.46:18181"
-      SUBTITLE_BACKEND_PUBLIC_URL: "http://192.168.2.46:18181"
+      SUBTITLE_BACKEND_URL: "http://WINDOWS-IP:18181"
+      SUBTITLE_BACKEND_PUBLIC_URL: "http://WINDOWS-IP:18181"
       SUBTITLE_BACKEND_TOKEN: ""
       SUBTITLE_API_TOKEN: ""
       # 本机 Docker Desktop 测试可用 http://host.docker.internal:8281/v1；Unraid 上按实际 FlareSolverr 地址填写。
@@ -41,7 +41,7 @@ services:
       no_proxy: ${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}
 
       # 第一次测试：改为 Windows 可以访问的 Unraid 共享路径。
-      SUBTITLE_PROXY_PATH_MAP: '/media=\\192.168.2.9\media'
+      SUBTITLE_PROXY_PATH_MAP: '/media=\\NAS\media'
 
     volumes:
       # 第一次字幕联调保持只读；验证移动前去掉 :ro，并且只选测试目录。

@@ -93,7 +93,7 @@
               <input v-model.trim="connection.subtitle_backend_url" placeholder="http://WINDOWS-IP:18181">
             </FormField>
             <FormField label="回调地址">
-              <input v-model.trim="settings.console_public_url" placeholder="http://192.168.2.9:18188">
+              <input v-model.trim="settings.console_public_url" placeholder="http://unraid-host.local:18188">
             </FormField>
             <FormField label="API Token" wide>
               <SecretInput v-model.trim="connection.subtitle_backend_token" autocomplete="off" placeholder="未设置可留空" />
@@ -129,7 +129,7 @@
             <strong>路径映射</strong>
           </div>
           <FormField label="映射规则" wide>
-            <textarea v-model="settings.subtitle_path_map" rows="3" placeholder="/media=\\192.168.2.9\media"></textarea>
+            <textarea v-model="settings.subtitle_path_map" rows="3" placeholder="/media=\\NAS\media"></textarea>
           </FormField>
         </section>
 
@@ -366,7 +366,7 @@ const backendOnline = computed(() => !!backendStatus.value.online)
 const computeCallbackWarning = computed(() => {
   if (!computeEnabled.value) return ''
   const value = String(settings.console_public_url || '').trim()
-  if (!value) return '请填写 Unraid 回调地址，例如 http://192.168.2.9:18188。否则 Windows 算力端转码完成后无法通知控制端。'
+  if (!value) return '请填写 Unraid 回调地址，例如 http://unraid-host.local:18188。否则 Windows 算力端转码完成后无法通知控制端。'
   try {
     const parsed = new URL(value)
     const host = parsed.hostname.toLowerCase()
@@ -377,7 +377,7 @@ const computeCallbackWarning = computed(() => {
       return 'Unraid 回调地址需要以 http:// 或 https:// 开头。'
     }
   } catch {
-    return 'Unraid 回调地址格式不正确，请填写类似 http://192.168.2.9:18188 的完整地址。'
+    return 'Unraid 回调地址格式不正确，请填写类似 http://unraid-host.local:18188 的完整地址。'
   }
   return ''
 })

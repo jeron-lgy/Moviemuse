@@ -219,7 +219,7 @@ def require_remote_callback_url(task_id: str) -> str:
     if invalid_public_url(public_url):
         raise RuntimeError(
             "远程算力端回调地址未正确配置。请在算力端设置里填写 Unraid 回调地址，"
-            "例如 http://192.168.2.9:18188，不能使用 UNRAID-IP、localhost 或 127.0.0.1。"
+            "例如 http://unraid-host.local:18188，不能使用 UNRAID-IP、localhost 或 127.0.0.1。"
         )
     return f"{public_url}/api/postprocess/tasks/{task_id}/worker-done"
 

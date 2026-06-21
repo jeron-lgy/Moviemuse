@@ -5,6 +5,15 @@ data/
 trash/
 sample-media/
 *.sqlite3
+*.sqlite3-*
+*.db
+*.env
+.env
+.env.*
+!.env.example
+local.*
+*.local
+secrets.*
 
 # Python / local runtime
 *.pyo

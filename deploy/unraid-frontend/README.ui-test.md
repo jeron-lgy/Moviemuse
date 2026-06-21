@@ -23,10 +23,10 @@ docker compose -f deploy/unraid-frontend/docker-compose.ui-test.yml up -d --buil
 打开：
 
 ```text
-http://192.168.2.9:18182/subtitles
+http://UNRAID-IP:18182/subtitles
 ```
 
-默认配置已经指向 Windows 算力端 `http://192.168.2.46:18181`，路径映射为 `/media=\\192.168.2.9\media`。如果 IP 或共享名不同，修改 `docker-compose.ui-test.yml` 对应两项。
+默认配置使用占位符 `http://WINDOWS-IP:18181` 和 `/media=\\NAS\media`。首次联调前，按你的 Windows 算力端地址和 SMB 共享路径修改 `docker-compose.ui-test.yml` 对应两项。
 
 首次联调保持媒体挂载为只读。控制台可以扫描并提交字幕任务，Windows 算力端仍然通过 SMB 共享路径写入生成的 SRT。
 

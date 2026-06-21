@@ -101,13 +101,13 @@ Windows Worker 只负责提供算力；地址、模型、翻译后端和路径�
 
 ```text
 控制台路径：/media/study3/movie.mp4
-Windows 路径：\\192.168.2.9\media\study3\movie.mp4
+Windows 路径：\\NAS\media\study3\movie.mp4
 ```
 
 在控制台的路径映射设置中填写：
 
 ```text
-/media=\\192.168.2.9\media
+/media=\\NAS\media
 ```
 
 ## Whisper 模型
