@@ -27,6 +27,7 @@ class SubtitleSettings:
     api_token: str = ""
     path_map: list[tuple[str, str]] = field(default_factory=list)
     max_workers: int = 1
+    translation_max_workers: int = 1
     default_translate_backend: str = "google"
     google_translate_url: str = "https://translate.google.com/translate_a/single"
     deepl_api_url: str = "https://api-free.deepl.com/v2/translate"
@@ -162,6 +163,12 @@ def load_subtitle_settings(data_dir: Path) -> SubtitleSettings:
         api_token=config_value(config, "subtitle_api_token", "SUBTITLE_API_TOKEN"),
         path_map=parse_path_map(config_value(config, "subtitle_path_map", "SUBTITLE_PATH_MAP")),
         max_workers=config_int(config, "subtitle_max_workers", "SUBTITLE_MAX_WORKERS", 1),
+        translation_max_workers=config_int(
+            config,
+            "translation_max_workers",
+            "TRANSLATION_MAX_WORKERS",
+            config_int(config, "openai_max_concurrency", "TRANSLATE_OPENAI_MAX_CONCURRENCY", 1),
+        ),
         default_translate_backend=config_value(config, "default_translate_backend", "DEFAULT_TRANSLATE_BACKEND", "google"),
         google_translate_url=config_value(
             config,
@@ -394,8 +401,9 @@ class SubtitleService:
         for _ in range(settings.max_workers):
             worker = threading.Thread(target=self._worker_loop, daemon=True)
             worker.start()
-        translation_worker = threading.Thread(target=self._translation_worker_loop, daemon=True)
-        translation_worker.start()
+        for _ in range(max(1, min(4, int(settings.translation_max_workers or 1)))):
+            translation_worker = threading.Thread(target=self._translation_worker_loop, daemon=True)
+            translation_worker.start()
         if os.getenv("COMPUTE_NODE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
             status_worker = threading.Thread(target=self._status_loop, daemon=True)
             status_worker.start()
@@ -915,7 +923,7 @@ class SubtitleService:
                 values[target] = Path(str(value)) if value not in (None, "") else None
             elif target == "path_map":
                 values[target] = parse_path_map(str(value or ""))
-            elif target in {"max_workers", "openai_batch_size", "openai_max_concurrency"}:
+            elif target in {"max_workers", "translation_max_workers", "openai_batch_size", "openai_max_concurrency"}:
                 try:
                     values[target] = max(1, int(value))
                 except (TypeError, ValueError):

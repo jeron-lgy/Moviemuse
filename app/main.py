@@ -55,6 +55,7 @@ from .subtitle_service import (
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 SUBTITLE_FILE_KINDS = {"original_srt", "translated_srt", "bilingual_srt", "original_vtt", "translated_vtt"}
+SUBTITLE_REMOTE_JOBS_CACHE_FILE = "subtitle_remote_jobs_cache.json"
 
 
 def split_dirs(value: str) -> list[Path]:
@@ -138,10 +139,10 @@ def saved_duplicate_scan_dirs(media_dirs: list[Path], trash_dir: Path, choices: 
         if key in choice_by_key and key not in seen:
             selected.append(choice_by_key[key])
             seen.add(key)
-    return selected or choices
+    return selected
 
 
-def save_duplicate_scan_dirs(media_dirs: list[Path], trash_dir: Path, raw_dirs: list[str]) -> list[Path]:
+def save_duplicate_scan_dirs(media_dirs: list[Path], trash_dir: Path, raw_dirs: list[str], allow_empty: bool = False) -> list[Path]:
     choices = selectable_scan_dirs(media_dirs, [trash_dir])
     choice_by_key = {scan_dir_identity(path): path for path in choices}
     selected: list[Path] = []
@@ -151,7 +152,7 @@ def save_duplicate_scan_dirs(media_dirs: list[Path], trash_dir: Path, raw_dirs: 
         if key in choice_by_key and key not in seen:
             selected.append(choice_by_key[key])
             seen.add(key)
-    if not selected:
+    if not selected and not allow_empty:
         raise HTTPException(status_code=400, detail="请至少选择一个媒体子目录")
     get_system_settings_service().update_duplicate_scan([str(path) for path in selected])
     return selected
@@ -325,6 +326,7 @@ def remote_settings() -> dict[str, Any]:
         "whisper_device": "cuda",
         "whisper_compute_type": "float16",
         "subtitle_max_workers": 1,
+        "translation_max_workers": 1,
         "subtitle_output_dir": os.getenv("SUBTITLE_OUTPUT_DIR", ""),
         "subtitle_path_map": "",
         "default_translate_backend": "google",
@@ -401,7 +403,11 @@ def restore_secret_placeholders(payload: dict[str, Any], existing: dict[str, Any
     restored = dict(payload or {})
     for key in SECRET_SETTING_KEYS:
         if key in restored and is_secret_placeholder(restored.get(key)):
-            restored[key] = existing.get(key, "")
+            existing_value = existing.get(key)
+            if existing_value not in (None, ""):
+                restored[key] = existing_value
+            else:
+                restored.pop(key, None)
     return restored
 
 
@@ -524,6 +530,7 @@ def compute_settings_payload(settings_obj: Any, config: dict[str, Any] | None = 
         "whisper_device": value("whisper_device", "device", "cuda"),
         "whisper_compute_type": value("whisper_compute_type", "compute_type", "float16"),
         "subtitle_max_workers": value("subtitle_max_workers", "max_workers", 1),
+        "translation_max_workers": value("translation_max_workers", "translation_max_workers", 1),
         "subtitle_output_dir": str(value("subtitle_output_dir", "default_output_dir", "") or ""),
         "subtitle_path_map": config.get("subtitle_path_map", ""),
         "console_public_url": str(config.get("console_public_url", "") or console_public_url()),
@@ -552,6 +559,7 @@ SAVED_COMPUTE_SETTING_KEYS = {
     "whisper_device",
     "whisper_compute_type",
     "subtitle_max_workers",
+    "translation_max_workers",
     "subtitle_output_dir",
     "subtitle_path_map",
     "console_public_url",
@@ -579,6 +587,7 @@ REMOTE_COMPUTE_SETTING_KEYS = {
     "whisper_device",
     "whisper_compute_type",
     "subtitle_max_workers",
+    "translation_max_workers",
     "default_translate_backend",
     "google_translate_url",
     "deepl_api_url",
@@ -919,6 +928,117 @@ def job_payload(job: SubtitleJob | dict[str, Any]) -> dict[str, object]:
     }
 
 
+def subtitle_jobs_cache_path(data_dir: Path) -> Path:
+    return data_dir / SUBTITLE_REMOTE_JOBS_CACHE_FILE
+
+
+def normalize_subtitle_job_items(jobs: Any) -> list[dict[str, Any]]:
+    if not isinstance(jobs, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in jobs:
+        if not isinstance(item, dict):
+            continue
+        job_id = str(item.get("id") or "").strip()
+        if not job_id:
+            continue
+        normalized.append(dict(item))
+    return normalized
+
+
+def save_subtitle_jobs_cache(jobs: Any) -> dict[str, Any]:
+    _, _, data_dir = settings()
+    normalized = normalize_subtitle_job_items(jobs)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "jobs": normalized,
+        "total": len(normalized),
+        "updated_at": time.time(),
+    }
+    target = subtitle_jobs_cache_path(data_dir)
+    tmp = target.with_suffix(f"{target.suffix}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(target)
+    return payload
+
+
+def load_subtitle_jobs_cache(limit: int | None = None) -> dict[str, Any]:
+    _, _, data_dir = settings()
+    target = subtitle_jobs_cache_path(data_dir)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        payload = {}
+    jobs = normalize_subtitle_job_items(payload.get("jobs") if isinstance(payload, dict) else [])
+    active = [job for job in jobs if job.get("status") in {"queued", "running", "translating"}]
+    visible_jobs = jobs[:limit] if limit and limit > 0 else jobs
+    return {
+        "jobs": visible_jobs,
+        "total": len(jobs),
+        "active": len(active),
+        "cached": True,
+        "cache_updated_at": payload.get("updated_at") if isinstance(payload, dict) else None,
+    }
+
+
+def upsert_subtitle_job_cache(job: Any) -> None:
+    if not isinstance(job, dict) or not str(job.get("id") or "").strip():
+        return
+    cached = load_subtitle_jobs_cache(limit=0)
+    jobs = [dict(item) for item in cached.get("jobs", []) if isinstance(item, dict)]
+    job_id = str(job.get("id"))
+    updated = False
+    for index, item in enumerate(jobs):
+        if str(item.get("id") or "") == job_id:
+            jobs[index] = dict(job)
+            updated = True
+            break
+    if not updated:
+        jobs.insert(0, dict(job))
+    save_subtitle_jobs_cache(jobs)
+
+
+def subtitle_job_from_result(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    nested = result.get("job")
+    if isinstance(nested, dict):
+        return nested
+    if str(result.get("id") or "").strip():
+        return result
+    return None
+
+
+def remove_subtitle_job_cache(job_id: str) -> None:
+    cached = load_subtitle_jobs_cache(limit=0)
+    jobs = [
+        dict(item)
+        for item in cached.get("jobs", [])
+        if isinstance(item, dict) and str(item.get("id") or "") != str(job_id)
+    ]
+    save_subtitle_jobs_cache(jobs)
+
+
+def subtitle_jobs_payload_from_remote_or_cache(limit: int = 0) -> dict[str, Any]:
+    suffix = f"?limit={limit}" if limit else "?limit=0"
+    try:
+        payload = remote_get(f"/api/subtitle/jobs{suffix}")
+        jobs = normalize_subtitle_job_items(payload.get("jobs") if isinstance(payload, dict) else [])
+        save_subtitle_jobs_cache(jobs)
+        active = [job for job in jobs if job.get("status") in {"queued", "running", "translating"}]
+        return {
+            **(payload if isinstance(payload, dict) else {}),
+            "jobs": jobs[:limit] if limit and limit > 0 else jobs,
+            "total": len(jobs),
+            "active": len(active),
+            "cached": False,
+        }
+    except HTTPException as exc:
+        cached = load_subtitle_jobs_cache(limit or None)
+        cached["backend_error"] = str(exc.detail)
+        return cached
+
+
 def scan_file_payload(file: Any) -> dict[str, object]:
     return {
         "path": str(file.path),
@@ -1019,7 +1139,9 @@ def submit_subtitle_job(
         "translate_backend": translate_backend or "google",
     }
     if backend_url():
-        return remote_post_json("/api/subtitle/jobs", rewrite_subtitle_payload(payload))
+        result = remote_post_json("/api/subtitle/jobs", rewrite_subtitle_payload(payload))
+        upsert_subtitle_job_cache(subtitle_job_from_result(result))
+        return result
     service = get_subtitle_service()
     job = service.create_job(**payload)
     return job_payload(job)
@@ -1030,7 +1152,11 @@ def submit_subtitle_jobs_bulk(payloads: list[dict[str, object]]) -> dict[str, ob
         return {"status": "ok", "submitted": 0, "jobs": []}
     if backend_url():
         rewritten = [rewrite_subtitle_payload(dict(payload)) for payload in payloads]
-        return remote_post_json("/api/subtitle/jobs/bulk", {"jobs": rewritten}, timeout=120)
+        result = remote_post_json("/api/subtitle/jobs/bulk", {"jobs": rewritten}, timeout=120)
+        if isinstance(result, dict):
+            for item in result.get("jobs", []) or []:
+                upsert_subtitle_job_cache(item)
+        return result
     service = get_subtitle_service()
     jobs = service.create_jobs([dict(payload) for payload in payloads])
     return {"status": "ok", "submitted": len(jobs), "jobs": [job_payload(job) for job in jobs]}
@@ -1720,6 +1846,7 @@ def local_node_status() -> dict[str, object]:
 
 
 def offline_backend_status(error: str) -> dict[str, object]:
+    cached_jobs = load_subtitle_jobs_cache(limit=10)
     return {
         "status": "offline",
         "online": False,
@@ -1728,7 +1855,13 @@ def offline_backend_status(error: str) -> dict[str, object]:
         "error": error,
         "settings": console_settings_payload(),
         "hardware": None,
-        "jobs": {"total": 0, "active": 0, "items": []},
+        "jobs": {
+            "total": cached_jobs.get("total", 0),
+            "active": cached_jobs.get("active", 0),
+            "items": cached_jobs.get("jobs", []),
+            "cached": True,
+            "cache_updated_at": cached_jobs.get("cache_updated_at"),
+        },
         "path_map": [],
         "updated_at": time.time(),
     }
@@ -1749,18 +1882,7 @@ def subtitle_backend_status() -> dict[str, object]:
         status["backend_url"] = backend_url()
         return status
     except HTTPException as exc:
-        return {
-            "status": "offline",
-            "online": False,
-            "mode": "remote",
-            "backend_url": backend_url(),
-            "error": str(exc.detail),
-            "settings": console_settings_payload(),
-            "hardware": None,
-            "jobs": {"total": 0, "active": 0, "items": []},
-            "path_map": [],
-            "updated_at": time.time(),
-        }
+        return offline_backend_status(str(exc.detail))
 
 
 def subtitle_console_payload() -> dict[str, object]:
@@ -1770,11 +1892,9 @@ def subtitle_console_payload() -> dict[str, object]:
     jobs: list[Any] = []
     backend_error = None
     if backend_url():
-        if status.get("online"):
-            payload, backend_error = remote_get_safe("/api/subtitle/jobs?limit=0")
-            jobs = list(payload.get("jobs", [])) if payload else []
-        else:
-            backend_error = str(status.get("error") or "后端暂不可用")
+        payload = subtitle_jobs_payload_from_remote_or_cache(limit=0)
+        jobs = list(payload.get("jobs", []))
+        backend_error = str(payload.get("backend_error") or status.get("error") or "") or None
     else:
         jobs = [job_payload(job) for job in get_subtitle_service().list_jobs()]
     visible_settings = redact_secret_settings(overlay_saved_console_settings(status.get("settings"), console_config))
@@ -2109,7 +2229,7 @@ def api_scan() -> dict[str, object]:
 @app.post("/api/scan/selection")
 def api_save_scan_selection(paths: list[str] = Form(default=[])) -> dict[str, object]:
     media_dirs, trash_dir, _ = settings()
-    selected = save_duplicate_scan_dirs(media_dirs, trash_dir, paths)
+    selected = save_duplicate_scan_dirs(media_dirs, trash_dir, paths, allow_empty=True)
     return {
         "status": "saved",
         "selected_scan_dirs": [str(path) for path in selected],
@@ -2227,6 +2347,7 @@ def save_terminal_settings(
     whisper_device: str = Form(default="cuda"),
     whisper_compute_type: str = Form(default="float16"),
     subtitle_max_workers: int = Form(default=1),
+    translation_max_workers: int = Form(default=1),
     subtitle_output_dir: str = Form(default=""),
     subtitle_path_map: str = Form(default=""),
     default_translate_backend: str = Form(default="google"),
@@ -2253,6 +2374,7 @@ def save_terminal_settings(
             "whisper_device": whisper_device,
             "whisper_compute_type": whisper_compute_type,
             "subtitle_max_workers": subtitle_max_workers,
+            "translation_max_workers": translation_max_workers,
             "subtitle_output_dir": subtitle_output_dir,
             "subtitle_path_map": subtitle_path_map,
             "default_translate_backend": default_translate_backend,
@@ -2316,6 +2438,7 @@ def save_subtitle_backend_settings(
     whisper_device: str = Form(default="cuda"),
     whisper_compute_type: str = Form(default="float16"),
     subtitle_max_workers: int = Form(default=1),
+    translation_max_workers: int = Form(default=1),
     subtitle_output_dir: str = Form(default=""),
     subtitle_path_map: str = Form(default=""),
     default_translate_backend: str = Form(default="google"),
@@ -2341,6 +2464,7 @@ def save_subtitle_backend_settings(
         "whisper_device": whisper_device,
         "whisper_compute_type": whisper_compute_type,
         "subtitle_max_workers": subtitle_max_workers,
+        "translation_max_workers": translation_max_workers,
         "subtitle_output_dir": subtitle_output_dir,
         "subtitle_path_map": subtitle_path_map,
         "default_translate_backend": default_translate_backend,
@@ -2455,6 +2579,9 @@ async def api_test_translate_backend(request: Request) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="翻译测试请求格式不正确")
     if backend_url():
+        payload = dict(payload)
+        if isinstance(payload.get("settings"), dict):
+            payload["settings"] = restore_secret_placeholders(payload["settings"], load_compute_config(settings()[2]))
         return remote_post_json("/api/subtitle/translate/test", payload, timeout=180)
 
     backend = str(payload.get("backend") or payload.get("translate_backend") or "google").strip().lower()
@@ -2466,6 +2593,8 @@ async def api_test_translate_backend(request: Request) -> dict[str, object]:
     settings_override = payload.get("settings")
     if settings_override is not None and not isinstance(settings_override, dict):
         raise HTTPException(status_code=400, detail="翻译设置格式不正确")
+    if isinstance(settings_override, dict):
+        settings_override = restore_secret_placeholders(settings_override, load_compute_config(settings()[2]))
     try:
         result = get_subtitle_service().test_translation_backend(
             backend=backend,
@@ -2871,8 +3000,7 @@ def api_get_transcode_job(job_id: str) -> dict[str, object]:
 @app.get("/api/subtitle/jobs", dependencies=[Depends(require_subtitle_token)])
 def api_list_subtitle_jobs(limit: int = 0) -> dict[str, object]:
     if backend_url():
-        suffix = f"?limit={limit}" if limit else "?limit=0"
-        return remote_get(f"/api/subtitle/jobs{suffix}")
+        return subtitle_jobs_payload_from_remote_or_cache(limit)
     service = get_subtitle_service()
     jobs = [job_payload(job) for job in service.list_jobs(limit or None)]
     active = [job for job in jobs if job.get("status") in {"queued", "running", "translating"}]
@@ -2882,7 +3010,9 @@ def api_list_subtitle_jobs(limit: int = 0) -> dict[str, object]:
 @app.post("/api/subtitle/jobs", dependencies=[Depends(require_subtitle_token)])
 def api_create_subtitle_job(payload: SubtitleJobCreate) -> dict[str, object]:
     if backend_url():
-        return remote_post_json("/api/subtitle/jobs", rewrite_subtitle_payload(payload.model_dump()))
+        result = remote_post_json("/api/subtitle/jobs", rewrite_subtitle_payload(payload.model_dump()))
+        upsert_subtitle_job_cache(subtitle_job_from_result(result))
+        return result
     service = get_subtitle_service()
     try:
         job = service.create_job(
@@ -2908,7 +3038,11 @@ def api_create_subtitle_jobs_bulk(payload: dict[str, Any]) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="jobs must be a list")
     if backend_url():
         rewritten = [rewrite_subtitle_payload(dict(item)) for item in raw_jobs if isinstance(item, dict)]
-        return remote_post_json("/api/subtitle/jobs/bulk", {"jobs": rewritten}, timeout=120)
+        result = remote_post_json("/api/subtitle/jobs/bulk", {"jobs": rewritten}, timeout=120)
+        if isinstance(result, dict):
+            for item in result.get("jobs", []) or []:
+                upsert_subtitle_job_cache(item)
+        return result
     service = get_subtitle_service()
     jobs = service.create_jobs([dict(item) for item in raw_jobs if isinstance(item, dict)])
     return {"status": "ok", "submitted": len(jobs), "jobs": [job_payload(job) for job in jobs]}
@@ -2922,7 +3056,11 @@ async def api_retry_failed_subtitle_jobs(request: Request) -> dict[str, object]:
     translate_backend = str(payload.get("translate_backend") or current_subtitle_job_defaults()["translate_backend"])
     retry_payload = {"translate_backend": translate_backend}
     if backend_url():
-        return remote_post_json("/api/subtitle/jobs/retry-failed", retry_payload)
+        result = remote_post_json("/api/subtitle/jobs/retry-failed", retry_payload)
+        if isinstance(result, dict):
+            for item in result.get("jobs", []) or []:
+                upsert_subtitle_job_cache(item)
+        return result
     jobs = get_subtitle_service().retry_failed_jobs(translate_backend=translate_backend)
     return {
         "status": "ok",
@@ -2939,7 +3077,9 @@ async def api_retry_subtitle_job(job_id: str, request: Request) -> dict[str, obj
     translate_backend = str(payload.get("translate_backend") or current_subtitle_job_defaults()["translate_backend"])
     retry_payload = {"translate_backend": translate_backend}
     if backend_url():
-        return remote_post_json(f"/api/subtitle/jobs/{job_id}/retry", retry_payload)
+        result = remote_post_json(f"/api/subtitle/jobs/{job_id}/retry", retry_payload)
+        upsert_subtitle_job_cache(subtitle_job_from_result(result))
+        return result
     try:
         job = get_subtitle_service().retry_job(job_id, translate_backend=translate_backend)
     except FileNotFoundError as exc:
@@ -2952,7 +3092,9 @@ async def api_retry_subtitle_job(job_id: str, request: Request) -> dict[str, obj
 @app.post("/api/subtitle/jobs/{job_id}/cancel", dependencies=[Depends(require_subtitle_token)])
 def api_cancel_subtitle_job(job_id: str) -> dict[str, object]:
     if backend_url():
-        return remote_post_json(f"/api/subtitle/jobs/{job_id}/cancel", {})
+        result = remote_post_json(f"/api/subtitle/jobs/{job_id}/cancel", {})
+        upsert_subtitle_job_cache(subtitle_job_from_result(result))
+        return result
     try:
         job = get_subtitle_service().cancel_job(job_id)
     except FileNotFoundError as exc:
@@ -2965,7 +3107,9 @@ def api_cancel_subtitle_job(job_id: str) -> dict[str, object]:
 @app.delete("/api/subtitle/jobs/{job_id}", dependencies=[Depends(require_subtitle_token)])
 def api_delete_subtitle_job(job_id: str) -> dict[str, object]:
     if backend_url():
-        return remote_delete(f"/api/subtitle/jobs/{job_id}")
+        result = remote_delete(f"/api/subtitle/jobs/{job_id}")
+        remove_subtitle_job_cache(job_id)
+        return result
     try:
         job = get_subtitle_service().delete_job(job_id)
     except FileNotFoundError as exc:
