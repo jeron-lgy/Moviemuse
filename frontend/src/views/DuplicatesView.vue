@@ -34,10 +34,10 @@
           >
             {{ cancellingScan ? '终止中' : '终止扫描' }}
           </BaseButton>
-          <BaseButton type="button" :disabled="scanRunning" @click="runScan('full')">
+          <BaseButton type="button" :disabled="scanRunning || !selectedPaths.length" @click="runScan('full')">
             全量扫描
           </BaseButton>
-          <BaseButton variant="primary" type="button" :disabled="scanRunning" @click="runScan('incremental')">
+          <BaseButton variant="primary" type="button" :disabled="scanRunning || !selectedPaths.length" @click="runScan('incremental')">
             {{ scanRunning ? '扫描中' : '增量扫描' }}
           </BaseButton>
         </template>
@@ -62,26 +62,86 @@
             <p>选择扫描范围。</p>
           </div>
           <div class="scan-tools">
-            <BaseButton type="button" size="sm" :disabled="!(scan.selectable_scan_dirs || []).length" @click="invertSelectedPaths">反选</BaseButton>
-            <BaseButton
-              type="button"
-              size="sm"
-              :disabled="savingSelection || !selectedPaths.length || !scanDirSelectionDirty"
-              @click="saveSelectedPathDefaults"
-            >
-              {{ savingSelection ? '保存中' : '保存默认' }}
-            </BaseButton>
-            <span class="mm-pill">{{ selectedPaths.length }} / {{ selectableDirCount }} 个目录</span>
+            <span class="mm-pill">已选 {{ selectedPaths.length }} / {{ selectableDirCount }}</span>
           </div>
         </div>
         <div class="scan-default-note" :class="{ dirty: scanDirSelectionDirty }">
-          {{ scanDirSelectionDirty ? '当前选择尚未保存为默认范围。' : `已保存默认范围：${savedDirCount} 个目录。` }}
+          {{ scanDefaultNote }}
         </div>
-        <div class="dir-list">
-          <label v-for="path in scan.selectable_scan_dirs || []" :key="path" class="dir-row" :title="path">
-            <input v-model="selectedPaths" type="checkbox" :value="path" @change="markSelectedPathsTouched">
-            <span>{{ path }}</span>
-          </label>
+
+        <div class="selected-dir-summary">
+          <span class="summary-label">当前扫描范围</span>
+          <div v-if="selectedPaths.length" class="selected-dir-list">
+            <div v-for="path in selectedPathPreview" :key="path" class="selected-dir-chip" :title="path">
+              <span class="dir-icon" aria-hidden="true"></span>
+              <span>{{ compactPath(path) }}</span>
+              <button type="button" aria-label="移除目录" @click="removeSelectedPath(path)">×</button>
+            </div>
+            <span v-if="selectedPathOverflow > 0" class="selected-more">+ {{ selectedPathOverflow }} 个目录</span>
+          </div>
+          <div v-else class="compact-empty">还没有选择扫描目录。</div>
+        </div>
+
+        <div class="scan-card-actions">
+          <BaseButton
+            type="button"
+            variant="primary"
+            :disabled="!selectableDirCount"
+            @click="openDirectoryManager"
+          >
+            管理目录
+          </BaseButton>
+          <BaseButton
+            type="button"
+            :disabled="savingSelection || !scanDirSelectionDirty"
+            @click="saveSelectedPathDefaults"
+          >
+            {{ savingSelection ? '保存中' : '保存为默认' }}
+          </BaseButton>
+        </div>
+
+        <div v-if="directoryManagerOpen" class="directory-manager" role="dialog" aria-label="管理扫描目录">
+          <input
+            v-model="directoryManagerQuery"
+            class="directory-search"
+            type="search"
+            placeholder="搜索目录"
+          >
+          <div class="directory-quick-actions">
+            <button type="button" @click="selectAllDraftPaths">全选</button>
+            <button type="button" @click="invertDraftSelectedPaths">反选</button>
+            <button type="button" @click="clearDraftSelectedPaths">清空</button>
+          </div>
+          <div class="directory-tabs" aria-label="目录筛选">
+            <button
+              type="button"
+              :class="{ active: directoryManagerTab === 'selected' }"
+              @click="directoryManagerTab = 'selected'"
+            >
+              已选 ({{ draftSelectedPaths.length }})
+            </button>
+            <button
+              type="button"
+              :class="{ active: directoryManagerTab === 'all' }"
+              @click="directoryManagerTab = 'all'"
+            >
+              全部 ({{ selectableDirCount }})
+            </button>
+          </div>
+          <div class="directory-picker-list">
+            <label v-for="path in filteredManagerDirs" :key="path" class="dir-row" :title="path">
+              <input v-model="draftSelectedPaths" type="checkbox" :value="path">
+              <span class="dir-icon" aria-hidden="true"></span>
+              <span>{{ compactPath(path) }}</span>
+            </label>
+          </div>
+          <div v-if="!filteredManagerDirs.length" class="compact-empty">没有匹配目录。</div>
+          <div class="directory-manager-actions">
+            <BaseButton type="button" @click="closeDirectoryManager">取消</BaseButton>
+            <BaseButton type="button" variant="primary" @click="applyDirectorySelection">
+              应用选择
+            </BaseButton>
+          </div>
         </div>
         <div v-if="!(scan.selectable_scan_dirs || []).length" class="compact-empty">没有可扫描目录。</div>
       </BaseCard>
@@ -269,6 +329,10 @@ const message = ref('')
 const errorMessage = ref('')
 const searchQuery = ref('')
 const resultFilter = ref('all')
+const directoryManagerOpen = ref(false)
+const directoryManagerQuery = ref('')
+const directoryManagerTab = ref('selected')
+const draftSelectedPaths = ref([])
 const scanPanelWidth = ref(readScanPanelWidth())
 const autoRules = reactive({ move: false, subtitle: false })
 const manualMove = reactive(new Set())
@@ -324,6 +388,20 @@ const selectableDirCount = computed(() => (scan.value.selectable_scan_dirs || []
 const savedSelectedPaths = computed(() => scan.value.selected_scan_dirs || [])
 const savedDirCount = computed(() => savedSelectedPaths.value.length)
 const scanDirSelectionDirty = computed(() => !samePathSelection(selectedPaths.value, savedSelectedPaths.value))
+const scanDefaultNote = computed(() => {
+  if (scanDirSelectionDirty.value) return '当前选择尚未保存。'
+  return savedDirCount.value ? '使用上次选择的扫描范围。' : '还没有默认扫描范围。'
+})
+const selectedPathPreview = computed(() => selectedPaths.value.slice(0, 4))
+const selectedPathOverflow = computed(() => Math.max(0, selectedPaths.value.length - selectedPathPreview.value.length))
+const filteredManagerDirs = computed(() => {
+  const query = directoryManagerQuery.value.trim().toLowerCase()
+  const draftSet = new Set(draftSelectedPaths.value)
+  return (scan.value.selectable_scan_dirs || []).filter((path) => {
+    if (directoryManagerTab.value === 'selected' && !draftSet.has(path)) return false
+    return !query || String(path).toLowerCase().includes(query)
+  })
+})
 const scanRecoveryMessage = computed(() => {
   if (scan.value.scan_stale) {
     return '扫描长时间没有进度，可能卡在文件系统读取。可以终止本次扫描后重新选择目录。'
@@ -372,9 +450,8 @@ async function loadScan() {
     scan.value = await api('/api/scan')
     const available = new Set(scan.value.selectable_scan_dirs || [])
     const savedPaths = (scan.value.selected_scan_dirs || []).filter((path) => available.has(path))
-    const defaultPaths = savedPaths.length ? savedPaths : (scan.value.selectable_scan_dirs || [])
     if (!selectedPathsTouched.value) {
-      selectedPaths.value = [...defaultPaths]
+      selectedPaths.value = [...savedPaths]
     } else {
       selectedPaths.value = selectedPaths.value.filter((path) => available.has(path))
     }
@@ -543,11 +620,55 @@ function markSelectedPathsTouched() {
   selectedPathsTouched.value = true
 }
 
+function openDirectoryManager() {
+  draftSelectedPaths.value = [...selectedPaths.value]
+  directoryManagerQuery.value = ''
+  directoryManagerTab.value = 'all'
+  directoryManagerOpen.value = true
+}
+
+function closeDirectoryManager() {
+  directoryManagerOpen.value = false
+}
+
+function applyDirectorySelection() {
+  const available = new Set(scan.value.selectable_scan_dirs || [])
+  selectedPaths.value = draftSelectedPaths.value.filter((path) => available.has(path))
+  selectedPathsTouched.value = true
+  directoryManagerOpen.value = false
+}
+
+function selectAllDraftPaths() {
+  draftSelectedPaths.value = [...(scan.value.selectable_scan_dirs || [])]
+  directoryManagerTab.value = 'selected'
+}
+
+function invertDraftSelectedPaths() {
+  const selected = new Set(draftSelectedPaths.value)
+  draftSelectedPaths.value = (scan.value.selectable_scan_dirs || []).filter((path) => !selected.has(path))
+  directoryManagerTab.value = 'all'
+}
+
+function clearDraftSelectedPaths() {
+  draftSelectedPaths.value = []
+  directoryManagerTab.value = 'all'
+}
+
+function removeSelectedPath(path) {
+  selectedPaths.value = selectedPaths.value.filter((item) => item !== path)
+  selectedPathsTouched.value = true
+}
+
 function samePathSelection(left, right) {
   if (!Array.isArray(left) || !Array.isArray(right)) return false
   if (left.length !== right.length) return false
   const rightSet = new Set(right)
   return left.every((path) => rightSet.has(path))
+}
+
+function compactPath(path) {
+  const text = String(path || '')
+  return text.replace(/^\\\\[^\\]+\\media\\?/i, '/media/').replace(/\\/g, '/')
 }
 
 function clearScanPoll() {
@@ -803,6 +924,7 @@ function formatStatus(status) {
 }
 
 .scan-card {
+  position: relative;
   display: grid;
   align-content: start;
   min-height: 640px;
@@ -837,6 +959,168 @@ function formatStatus(status) {
 
 .scan-default-note.dirty {
   color: var(--mm-primary);
+}
+
+.selected-dir-summary {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.summary-label {
+  color: var(--mm-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.selected-dir-list {
+  display: grid;
+  gap: 8px;
+}
+
+.selected-dir-chip,
+.directory-picker-list .dir-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 38px;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: var(--mm-control-bg);
+}
+
+.selected-dir-chip span:nth-child(2),
+.directory-picker-list .dir-row span:last-child {
+  overflow: hidden;
+  color: var(--mm-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dir-icon {
+  width: 14px;
+  height: 10px;
+  border: 1.5px solid var(--mm-primary);
+  border-radius: 2px;
+  opacity: .9;
+  position: relative;
+}
+
+.dir-icon::before {
+  content: "";
+  position: absolute;
+  left: 1px;
+  top: -5px;
+  width: 7px;
+  height: 4px;
+  border: 1.5px solid var(--mm-primary);
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+}
+
+.selected-dir-chip button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: var(--mm-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.selected-dir-chip button:hover {
+  color: var(--mm-primary);
+  background: color-mix(in srgb, var(--mm-primary) 10%, transparent);
+}
+
+.selected-more {
+  color: var(--mm-muted);
+  font-size: 12px;
+}
+
+.scan-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.directory-manager {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  top: 220px;
+  z-index: 10;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
+  max-height: calc(100% - 238px);
+  gap: 12px;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--mm-border);
+  border-radius: 12px;
+  background: var(--mm-card-bg);
+  box-shadow: var(--mm-shadow-lg, 0 18px 48px rgba(0, 0, 0, .22));
+}
+
+.directory-search {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  color: var(--mm-text);
+  background: var(--mm-control-bg);
+}
+
+.directory-quick-actions,
+.directory-tabs,
+.directory-manager-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.directory-quick-actions button,
+.directory-tabs button {
+  flex: 1;
+  min-height: 32px;
+  border: 1px solid var(--mm-border);
+  border-radius: 7px;
+  color: var(--mm-text);
+  background: var(--mm-control-bg);
+  cursor: pointer;
+}
+
+.directory-tabs button.active {
+  border-color: var(--mm-primary);
+  color: var(--mm-primary-contrast, #fff);
+  background: var(--mm-primary);
+}
+
+.directory-picker-list {
+  display: grid;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  gap: 6px;
+  padding-right: 4px;
+}
+
+.directory-picker-list .dir-row {
+  grid-template-columns: 18px 16px minmax(0, 1fr);
+}
+
+.directory-picker-list .dir-row input {
+  accent-color: var(--mm-primary);
+}
+
+.directory-manager-actions {
+  justify-content: space-between;
+  padding-top: 2px;
 }
 
 .panel-head h2,

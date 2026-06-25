@@ -13,7 +13,6 @@
       class="mm-secret-toggle"
       :aria-label="toggleLabel"
       :title="toggleLabel"
-      :disabled="isSavedPlaceholder"
       @click="visible = !visible"
     >
       <EyeOff v-if="visible" :size="18" stroke-width="2" />
@@ -46,14 +45,17 @@ const SECRET_PLACEHOLDER = '********'
 
 const normalizedValue = computed(() => String(props.modelValue ?? ''))
 const isSavedPlaceholder = computed(() => normalizedValue.value.trim() === SECRET_PLACEHOLDER)
-const displayValue = computed(() => (isSavedPlaceholder.value ? '' : props.modelValue))
-const inputType = computed(() => (visible.value && !isSavedPlaceholder.value ? 'text' : 'password'))
+const displayValue = computed(() => {
+  if (isSavedPlaceholder.value) return visible.value ? SECRET_PLACEHOLDER : ''
+  return props.modelValue
+})
+const inputType = computed(() => (visible.value ? 'text' : 'password'))
 const placeholderText = computed(() => {
   if (isSavedPlaceholder.value) return '已保存，输入新值可替换'
   return attrs.placeholder || ''
 })
 const toggleLabel = computed(() => {
-  if (isSavedPlaceholder.value) return '已保存密钥不会回显，输入新值可替换'
+  if (isSavedPlaceholder.value) return visible.value ? '隐藏已保存占位符' : '显示已保存占位符'
   return visible.value ? '隐藏内容' : '显示内容'
 })
 
@@ -119,11 +121,6 @@ function onInput(event) {
   color: var(--mm-muted);
   cursor: pointer;
   transform: translateY(-50%);
-}
-
-.mm-secret-toggle:disabled {
-  cursor: help;
-  opacity: .58;
 }
 
 .mm-secret-toggle svg {

@@ -172,6 +172,15 @@
           <FormField label="上下文参考">
           <input v-model.number="settings.openai_context_lines" type="number" min="0" max="6">
         </FormField>
+          <FormField label="翻译任务并发数" hint="控制同时进入翻译中的字幕任务数量，建议 1-2。">
+          <input v-model.number="settings.translation_max_workers" type="number" min="1" max="4">
+        </FormField>
+          <FormField label="单任务 API 并发数" hint="控制单个字幕任务内同时请求 DeepSeek 的批次数，建议 1-2。">
+          <input v-model.number="settings.openai_max_concurrency" type="number" min="1" max="2">
+        </FormField>
+          <FormField label="每批字幕段数" hint="每次 API 请求包含的字幕段数，建议 8-12。">
+          <input v-model.number="settings.openai_batch_size" type="number" min="1" max="12">
+        </FormField>
         </template>
       </div>
       <template #actions>
@@ -305,6 +314,7 @@ const settings = reactive({
   whisper_device: 'cuda',
   whisper_compute_type: 'float16',
   subtitle_max_workers: 1,
+  translation_max_workers: 1,
   subtitle_output_dir: '',
   subtitle_path_map: '',
   console_public_url: '',
@@ -389,7 +399,7 @@ const translationReady = computed(() => {
   return false
 })
 
-const adaptedSubtitleJobs = computed(() => jobs.value.map(adaptSubtitleJob))
+const adaptedSubtitleJobs = computed(() => coalesceSubtitleJobs(jobs.value).map(adaptSubtitleJob))
 const transcodeJobLookup = computed(() => {
   const lookup = new Map()
   const items = backendStatus.value?.transcode_jobs?.items || []
@@ -401,12 +411,16 @@ const transcodeJobLookup = computed(() => {
 })
 const adaptedPostprocessJobs = computed(() => postprocessTasks.value.map(adaptPostprocessJob))
 const adaptedJobs = computed(() => [...adaptedPostprocessJobs.value, ...adaptedSubtitleJobs.value].sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0)))
-const runningJobs = computed(() => adaptedJobs.value.filter((job) => ['running', 'translating'].includes(job.statusKey)))
-const waitingJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'queued'))
+const runningStatusKeys = ['running', 'translating']
+const waitingStatusKeys = ['queued', 'translation_queued']
+const activeStatusKeys = [...runningStatusKeys, ...waitingStatusKeys, 'detached']
+const cancellableStatusKeys = [...runningStatusKeys, ...waitingStatusKeys]
+const runningJobs = computed(() => adaptedJobs.value.filter((job) => runningStatusKeys.includes(job.statusKey)))
+const waitingJobs = computed(() => adaptedJobs.value.filter((job) => waitingStatusKeys.includes(job.statusKey)))
 const failedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'failed'))
 const detachedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'detached'))
 const completedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'completed'))
-const activeJobs = computed(() => adaptedJobs.value.filter((job) => ['queued', 'running', 'translating', 'detached'].includes(job.statusKey)))
+const activeJobs = computed(() => adaptedJobs.value.filter((job) => activeStatusKeys.includes(job.statusKey)))
 const historyJobs = computed(() => adaptedJobs.value.filter((job) => ['completed', 'failed', 'detached'].includes(job.statusKey)))
 const runningCount = computed(() => runningJobs.value.length)
 const waitingCount = computed(() => waitingJobs.value.length)
@@ -744,7 +758,7 @@ async function deleteSelected() {
     notice.value = '请先选择要删除的任务。'
     return
   }
-  const activeCount = targets.filter((job) => ['queued', 'running', 'translating'].includes(job.statusKey)).length
+  const activeCount = targets.filter((job) => cancellableStatusKeys.includes(job.statusKey)).length
   const names = targets.slice(0, 5).map((job) => job.title).join('、')
   const activeLabel = activeCount > 0 ? `\n其中 ${activeCount} 个运行中/等待中的任务会先终止，再删除记录。` : ''
   const ok = window.confirm(`将删除 ${targets.length} 个任务记录${names ? `：${names}` : ''}。不会删除媒体文件或字幕结果。${activeLabel}\n继续吗？`)
@@ -755,12 +769,12 @@ async function deleteSelected() {
     let deleted = 0
     for (const job of targets) {
       if (job.sourceType === 'postprocess') {
-        if (['queued', 'running', 'translating'].includes(job.statusKey)) {
+        if (cancellableStatusKeys.includes(job.statusKey)) {
           await postJson(`/api/postprocess/tasks/${job.rawId}/cancel`, {})
         }
         await deleteJson(`/api/postprocess/tasks/${job.rawId}`)
       } else {
-        if (['queued', 'running', 'translating'].includes(job.statusKey)) {
+        if (cancellableStatusKeys.includes(job.statusKey)) {
           await postJson(`/api/subtitle/jobs/${job.fileId}/cancel`, {})
         }
         await deleteJson(`/api/subtitle/jobs/${job.fileId}`)
@@ -787,7 +801,7 @@ async function cancelJob(job) {
 function adaptSubtitleJob(job) {
   const path = String(job.video_path || '')
   const title = path.replaceAll('\\', '/').split('/').filter(Boolean).pop() || path || '未命名任务'
-  const statusKey = String(job.status || 'queued')
+  const statusKey = subtitleStatusKey(job)
   return {
     raw: job,
     id: `subtitle:${job.id}`,
@@ -810,6 +824,51 @@ function adaptSubtitleJob(job) {
     canCancel: false,
     resultSrt: job.translated_srt || job.bilingual_srt
   }
+}
+
+function subtitleStatusKey(job) {
+  const status = String(job?.status || 'queued')
+  if (status === 'translating' && String(job?.message || '').includes('等待翻译字幕')) {
+    return 'translation_queued'
+  }
+  return status
+}
+
+function coalesceSubtitleJobs(items) {
+  const groups = new Map()
+  for (const job of items || []) {
+    if (!job || typeof job !== 'object') continue
+    const key = subtitleJobGroupKey(job)
+    const group = groups.get(key) || []
+    group.push(job)
+    groups.set(key, group)
+  }
+  return Array.from(groups.values()).map((group) => group.reduce((best, job) => (
+    compareSubtitleJobState(job, best) > 0 ? job : best
+  )))
+}
+
+function subtitleJobGroupKey(job) {
+  const path = String(job.video_path || '').trim().replaceAll('\\', '/').toLowerCase()
+  return path || `id:${job.id || ''}`
+}
+
+function compareSubtitleJobState(left, right) {
+  const rankDelta = subtitleStatusRank(left?.status) - subtitleStatusRank(right?.status)
+  if (rankDelta) return rankDelta
+  return subtitleJobTime(left) - subtitleJobTime(right)
+}
+
+function subtitleStatusRank(status) {
+  const value = String(status || 'queued')
+  if (['queued', 'running', 'translating'].includes(value)) return 3
+  if (value === 'completed') return 2
+  if (value === 'failed') return 1
+  return 0
+}
+
+function subtitleJobTime(job) {
+  return Number(job?.updated_at || job?.finished_at || job?.created_at || 0)
 }
 
 function adaptPostprocessJob(task) {
@@ -1041,7 +1100,7 @@ function progressTone(statusKey) {
   if (statusKey === 'completed') return 'completed'
   if (statusKey === 'detached') return 'detached'
   if (statusKey === 'failed') return 'failed'
-  if (['running', 'translating'].includes(statusKey)) return 'running'
+  if (runningStatusKeys.includes(statusKey)) return 'running'
   return 'queued'
 }
 
@@ -1052,7 +1111,7 @@ function postprocessProgressTone(status, statusKey, qbIssue = null) {
 }
 
 function statusLabel(status) {
-  return { queued: '等待中', running: '运行中', translating: '翻译中', failed: '失败', completed: '已完成', detached: '源文件已清理' }[status] || status
+  return { queued: '等待中', translation_queued: '等待翻译', running: '运行中', translating: '翻译中', failed: '失败', completed: '已完成', detached: '源文件已清理' }[status] || status
 }
 
 function normalizePostprocessSettings(payload = {}) {
