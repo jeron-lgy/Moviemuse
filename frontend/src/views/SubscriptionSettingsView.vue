@@ -544,7 +544,7 @@
       <div class="panel-head">
         <div>
           <h2>用户设置</h2>
-          <p>修改控制台登录账号。默认账号密码为 admin / admin，建议首次登录后立即修改。</p>
+          <p>修改控制台登录账号。新环境首次密码会写入启动日志和数据目录提示文件，建议首次登录后立即修改。</p>
         </div>
         <BaseButton type="button" @click="logout">退出登录</BaseButton>
       </div>

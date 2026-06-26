@@ -72,7 +72,7 @@ services:
 ```bash
     volumes:
       - /mnt/user/media:/media
-      - /mnt/user/appdata/moviemuse:/data
+      - /mnt/user/appdata/moviemuse/data:/data
       - /mnt:/unraid
 ```
 
@@ -105,6 +105,15 @@ docker compose -f docker-compose.release.yml up -d
 ```text
 http://UNRAID-IP:18188
 ```
+
+首次启动会自动生成控制台初始密码。用户名默认为 `admin`，密码可在容器日志或数据目录提示文件中查看：
+
+```bash
+docker logs moviemuse
+cat /mnt/user/appdata/moviemuse/data/initial_admin_password.txt
+```
+
+首次登录后建议到“系统 / 用户设置”里修改密码；修改后提示文件会自动删除。
 
 ## 本地源码构建
 

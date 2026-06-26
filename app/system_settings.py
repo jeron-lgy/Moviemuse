@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import secrets
 import threading
 from pathlib import Path
 from typing import Any
@@ -95,7 +97,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "auth": {
         "username": "admin",
-        "password_hash": password_hash("admin"),
+        "password_hash": "",
     },
     "demo": {
         "enabled": False,
@@ -112,7 +114,10 @@ class SystemSettingsService:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.settings_file = data_dir / "system_settings.json"
+        self.initial_password_file = data_dir / "initial_admin_password.txt"
         self._lock = threading.RLock()
+        self._generated_initial_password: str | None = None
+        self._initialized_auth_password = False
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._normalize_network()
@@ -120,6 +125,10 @@ class SystemSettingsService:
         self._normalize_auth()
         self._normalize_demo()
         self._normalize_duplicate_scan()
+        if self._initialized_auth_password:
+            self._save()
+        if self._generated_initial_password:
+            self._write_initial_password_hint(self.data["auth"]["username"], self._generated_initial_password)
 
     def _load(self) -> dict[str, Any]:
         data = json.loads(json.dumps(DEFAULT_SETTINGS))
@@ -149,7 +158,10 @@ class SystemSettingsService:
         with self._lock:
             auth = self.data.setdefault("auth", {})
             username = str(auth.get("username") or "admin").strip() or "admin"
-            hashed = str(auth.get("password_hash") or password_hash("admin"))
+            hashed = str(auth.get("password_hash") or "")
+            if not hashed:
+                self._normalize_auth()
+                hashed = str(auth.get("password_hash") or "")
             return {"username": username, "password_hash": hashed}
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -170,6 +182,7 @@ class SystemSettingsService:
                     self.data["auth"]["username"] = username
                 if password:
                     self.data["auth"]["password_hash"] = password_hash(password)
+                    self._remove_initial_password_hint()
             self.data["mteam"]["enabled"] = bool(self.data.get("mteam", {}).get("enabled"))
             self._normalize_network()
             self._normalize_notifications()
@@ -216,9 +229,37 @@ class SystemSettingsService:
         username = str(auth.get("username") or "admin").strip() or "admin"
         hashed = str(auth.get("password_hash") or "").strip()
         legacy_password = str(auth.get("password") or "")
+        initial_password = str(os.getenv("MOVIEMUSE_ADMIN_PASSWORD") or "").strip()
+        if not hashed and not legacy_password and not initial_password:
+            initial_password = secrets.token_urlsafe(12)
+            self._generated_initial_password = initial_password
+        if not hashed:
+            self._initialized_auth_password = True
         auth["username"] = username
-        auth["password_hash"] = hashed or password_hash(legacy_password or "admin")
+        auth["password_hash"] = hashed or password_hash(legacy_password or initial_password)
         auth.pop("password", None)
+
+    def _write_initial_password_hint(self, username: str, password: str) -> None:
+        message = (
+            "MovieMuse initial admin account\n"
+            f"Username: {username}\n"
+            f"Password: {password}\n"
+            "Please change this password in System -> User Settings after first login.\n"
+        )
+        try:
+            self.initial_password_file.write_text(message, encoding="utf-8")
+        except Exception:
+            pass
+        print(
+            f"[MovieMuse] initial admin password generated: username={username} password={password}",
+            flush=True,
+        )
+
+    def _remove_initial_password_hint(self) -> None:
+        try:
+            self.initial_password_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _normalize_demo(self) -> None:
         demo = self.data.setdefault("demo", {})
