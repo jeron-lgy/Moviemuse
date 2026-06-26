@@ -34,7 +34,7 @@ import { BaseButton, BaseCard, FormField, NoticeBanner, SecretInput } from '../c
 const route = useRoute()
 const router = useRouter()
 const username = ref('admin')
-const password = ref('admin')
+const password = ref('')
 const loading = ref(false)
 const errorMessage = ref('')
 
