@@ -1434,6 +1434,117 @@ def append_tail(current: str, chunk: str, limit: int = 4000) -> str:
     return f"{current}{chunk}"[-limit:]
 
 
+def windows_filetime_from_ns(timestamp_ns: int) -> int:
+    return timestamp_ns // 100 + 11644473600 * 10000000
+
+
+def windows_filetime_struct(timestamp_ns: int) -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    ticks = windows_filetime_from_ns(timestamp_ns)
+    filetime = wintypes.FILETIME()
+    filetime.dwLowDateTime = ticks & 0xFFFFFFFF
+    filetime.dwHighDateTime = ticks >> 32
+    return filetime
+
+
+def copy_windows_file_times(source_stat: os.stat_result, target_path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.SetFileTime.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.SetFileTime.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    file_write_attributes = 0x0100
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle_value = wintypes.HANDLE(-1).value
+
+    handle = kernel32.CreateFileW(
+        str(target_path),
+        file_write_attributes,
+        file_share_read | file_share_write | file_share_delete,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise OSError(ctypes.get_last_error(), f"打开文件设置时间失败: {target_path}")
+    try:
+        creation_time = windows_filetime_struct(source_stat.st_ctime_ns)
+        access_time = windows_filetime_struct(source_stat.st_atime_ns)
+        write_time = windows_filetime_struct(source_stat.st_mtime_ns)
+        ok = kernel32.SetFileTime(
+            handle,
+            ctypes.byref(creation_time),
+            ctypes.byref(access_time),
+            ctypes.byref(write_time),
+        )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), f"设置文件时间失败: {target_path}")
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def copy_transcode_output_timestamps(source_path: str | Path, target_path: str | Path) -> dict[str, Any]:
+    source = Path(source_path)
+    target = Path(target_path)
+    result: dict[str, Any] = {
+        "ok": False,
+        "source_path": str(source),
+        "target_path": str(target),
+        "creation_time_copied": False,
+    }
+    if not source.exists():
+        result["error"] = "源文件不存在"
+        return result
+    if not target.exists():
+        result["error"] = "输出文件不存在"
+        return result
+
+    source_stat = source.stat()
+    os.utime(target, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+    result.update(
+        {
+            "ok": True,
+            "source_mtime": source_stat.st_mtime,
+            "target_mtime": target.stat().st_mtime,
+        }
+    )
+    if os.name == "nt":
+        try:
+            result["creation_time_copied"] = copy_windows_file_times(source_stat, target)
+        except Exception as exc:
+            result["creation_time_error"] = str(exc)
+    return result
+
+
 def normalize_target_codec(value: Any) -> str:
     codec = str(value or "av1").strip().lower()
     if codec in {"h265", "hevc", "x265"}:
@@ -1603,6 +1714,7 @@ def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict
         "updated_at": time.time(),
         "started_at": 0,
         "finished_at": 0,
+        "timestamp_copy": {},
     }
     with transcode_jobs_lock:
         transcode_jobs[job_id] = job
@@ -1691,6 +1803,10 @@ def run_transcode_job_background(job_id: str) -> None:
             )
             callback_payload = {"status": "failed", "job_id": job_id, "error": message, "stderr_tail": stderr_tail}
         else:
+            timestamp_copy = copy_transcode_output_timestamps(
+                str(job.get("input_path") or ""),
+                str(job.get("output_path") or ""),
+            )
             job = set_transcode_job(
                 job_id,
                 status="worker_done",
@@ -1700,6 +1816,7 @@ def run_transcode_job_background(job_id: str) -> None:
                 message="转码完成",
                 returncode=returncode,
                 finished_at=time.time(),
+                timestamp_copy=timestamp_copy,
             )
             callback_payload = {
                 "status": "worker_done",
@@ -1711,6 +1828,7 @@ def run_transcode_job_background(job_id: str) -> None:
                 "target_codec": job.get("target_codec", ""),
                 "progress": job.get("progress", 1),
                 "progress_percent": job.get("progress_percent", 100),
+                "timestamp_copy": timestamp_copy,
             }
     except Exception as exc:
         try:
