@@ -421,13 +421,14 @@ const failedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKe
 const detachedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'detached'))
 const completedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'completed'))
 const activeJobs = computed(() => adaptedJobs.value.filter((job) => activeStatusKeys.includes(job.statusKey)))
+const currentJobs = computed(() => adaptedJobs.value.filter((job) => activeStatusKeys.includes(job.statusKey) || job.statusKey === 'failed'))
 const historyJobs = computed(() => adaptedJobs.value.filter((job) => ['completed', 'failed', 'detached'].includes(job.statusKey)))
 const runningCount = computed(() => runningJobs.value.length)
 const waitingCount = computed(() => waitingJobs.value.length)
 const failedCount = computed(() => failedJobs.value.length)
 const detachedCount = computed(() => detachedJobs.value.length)
 const statusTabs = computed(() => [
-  { key: 'all', label: '全部', count: activeJobs.value.length, items: activeJobs.value },
+  { key: 'all', label: '全部', count: currentJobs.value.length, items: currentJobs.value },
   { key: 'running', label: '运行中', count: runningCount.value, items: runningJobs.value },
   { key: 'waiting', label: '等待中', count: waitingCount.value, items: waitingJobs.value },
   { key: 'detached', label: '已清理', count: detachedCount.value, items: detachedJobs.value },

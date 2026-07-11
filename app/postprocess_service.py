@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .log_service import append_json_log
+
 
 DEFAULT_POSTPROCESS_SETTINGS: dict[str, Any] = {
     "auto_transcode_enabled": False,
@@ -109,6 +111,8 @@ class PostprocessService:
         self.db_file = data_dir / "subscriptions.sqlite3"
         self.log_file = data_dir / "system_logs.jsonl"
         self._log_lock = threading.RLock()
+        self._task_lock = threading.RLock()
+        self._event_write_count = 0
         data_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -353,6 +357,85 @@ class PostprocessService:
                 params,
             ).fetchall()
         return [row_to_task(row) for row in rows]
+
+    def find_latest_task(self, av_id: str, task_type: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM postprocess_tasks WHERE av_id = ? AND task_type = ? ORDER BY created_at DESC LIMIT 1",
+                (av_id, task_type),
+            ).fetchone()
+        return row_to_task(row) if row else None
+
+    def find_active_task(self, av_id: str, task_type: str) -> dict[str, Any] | None:
+        terminal = sorted(TERMINAL_TASK_STATUSES)
+        placeholders = ",".join("?" for _ in terminal)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT * FROM postprocess_tasks
+                WHERE av_id = ? AND task_type = ? AND status NOT IN ({placeholders})
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (av_id, task_type, *terminal),
+            ).fetchone()
+        return row_to_task(row) if row else None
+
+    def ensure_task(
+        self,
+        *,
+        av_id: str,
+        task_type: str,
+        status: str,
+        target_codec: str = "",
+        needs_subtitle: bool = False,
+        data: dict[str, Any] | None = None,
+        reusable_error_codes: set[str] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        terminal = sorted(TERMINAL_TASK_STATUSES)
+        placeholders = ",".join("?" for _ in terminal)
+        with self._task_lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT * FROM postprocess_tasks
+                    WHERE av_id = ? AND task_type = ? AND status NOT IN ({placeholders})
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (av_id, task_type, *terminal),
+                ).fetchone()
+                if not row and reusable_error_codes:
+                    codes = sorted(reusable_error_codes)
+                    code_placeholders = ",".join("?" for _ in codes)
+                    row = conn.execute(
+                        f"""
+                        SELECT * FROM postprocess_tasks
+                        WHERE av_id = ? AND task_type = ? AND error_code IN ({code_placeholders})
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (av_id, task_type, *codes),
+                    ).fetchone()
+            if row:
+                task = row_to_task(row)
+                if str(task.get("status") or "") in TERMINAL_TASK_STATUSES:
+                    task = self.update_task(
+                        str(task["id"]),
+                        status=status,
+                        torrent_hash="",
+                        input_path="",
+                        output_path="",
+                        error_code="",
+                        error_message="",
+                        data=data or {},
+                    ) or task
+                return task, False
+            return self.create_task(
+                av_id=av_id,
+                task_type=task_type,
+                status=status,
+                target_codec=target_codec,
+                needs_subtitle=needs_subtitle,
+                data=data,
+            ), True
 
     def update_task(self, task_id: str, **fields: Any) -> dict[str, Any] | None:
         allowed = {
@@ -648,6 +731,26 @@ class PostprocessService:
                 (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
             )
         self._mirror_event_to_system_log(task_id, level, stage, message, payload, now)
+        self._event_write_count += 1
+        if self._event_write_count % 250 == 0:
+            self.prune_events()
+
+    def prune_events(self) -> dict[str, int]:
+        retention_days = max(1, int(os.getenv("TASK_EVENT_RETENTION_DAYS", "30")))
+        max_rows = max(1, int(os.getenv("TASK_EVENT_MAX_ROWS", "50000")))
+        cutoff = time.time() - retention_days * 86400
+        with self._connect() as conn:
+            expired = conn.execute("DELETE FROM task_events WHERE created_at < ?", (cutoff,)).rowcount
+            overflow = conn.execute(
+                """
+                DELETE FROM task_events
+                WHERE id IN (
+                    SELECT id FROM task_events ORDER BY created_at DESC LIMIT -1 OFFSET ?
+                )
+                """,
+                (max_rows,),
+            ).rowcount
+        return {"expired": max(0, expired), "overflow": max(0, overflow)}
 
     def _mirror_event_to_system_log(
         self,
@@ -669,8 +772,7 @@ class PostprocessService:
         }
         try:
             with self._log_lock:
-                with self.log_file.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                append_json_log(self.log_file, entry)
         except Exception:
             pass
 

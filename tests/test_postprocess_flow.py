@@ -980,6 +980,78 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(tasks[0]["status"], "failed")
         self.assertEqual(tasks[0]["error_code"], "mteam_missing_id")
 
+    def test_subscription_postprocess_task_reuses_active_task(self) -> None:
+        av = {"id": "TEST-IDEMPOTENT", "title": "reuse"}
+
+        first = self.main.create_subscription_postprocess_task(av)
+        second = self.main.create_subscription_postprocess_task(av)
+
+        tasks = [task for task in self.main.get_postprocess_service().list_tasks(limit=20) if task["av_id"] == av["id"]]
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(tasks), 1)
+
+    def test_acquisition_failure_retry_runs_mteam_download_again(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "TEST-RETRY-MTEAM"
+        service.subscribe_av({"id": av_id, "title": "retry", "status": "pending"})
+        task = post.create_task(av_id=av_id, task_type="subscription", status="failed")
+        post.update_task(task["id"], error_code="download_push_failed", error_message="timeout")
+        calls: list[dict[str, object]] = []
+
+        def fake_download(av: dict[str, object], **kwargs: object) -> dict[str, object]:
+            calls.append({"av": av, **kwargs})
+            post.update_task(task["id"], status="torrent_pushed", torrent_hash="retry-hash", error_code="", error_message="")
+            return {"av_id": av_id, "status": "sent", "message": "ok"}
+
+        with patch.object(self.main, "download_av_from_mteam", side_effect=fake_download):
+            result = self.main.api_retry_postprocess_task(task["id"])
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["post_task"]["id"], task["id"])
+        self.assertEqual(post.get_task(task["id"])["torrent_hash"], "retry-hash")
+
+    def test_subscription_state_tracks_waiting_worker(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "TEST-STATE-SYNC"
+        service.subscribe_av({"id": av_id, "title": "sync", "status": "pending", "download_status": "downloading"})
+        task = post.create_task(av_id=av_id, task_type="subscription", status="waiting_worker")
+        post.update_task(task["id"], torrent_hash="sync-hash", input_path=str(self.root / "sync.mp4"))
+
+        updated = self.main.sync_subscription_task_state(post.get_task(task["id"]))
+
+        self.assertEqual(updated["download_status"], "waiting_worker")
+        self.assertEqual(updated["qb_hash"], "sync-hash")
+        self.assertIn("等待算力端", updated["download_message"])
+
+    def test_bulk_download_returns_complete_summary(self) -> None:
+        items = [{"id": "A-1", "status": "pending"}, {"id": "A-2", "status": "pending"}, {"id": "A-3", "status": "pending"}]
+        results = iter([
+            {"av_id": "A-1", "status": "sent"},
+            {"av_id": "A-2", "status": "not_found"},
+            {"av_id": "A-3", "status": "error"},
+        ])
+        with patch.object(self.main, "subscribed_avs_with_global_filter", return_value=items), \
+            patch.object(self.main, "download_av_from_mteam", side_effect=lambda _item: next(results)):
+            payload = self.main.download_pending_subscriptions()
+
+        self.assertEqual(payload["sent"], 1)
+        self.assertEqual(payload["not_found"], 1)
+        self.assertEqual(payload["failed"], 1)
+
+    def test_task_event_retention_limits_rows(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="TEST-RETENTION", task_type="subscription", status="created")
+        for index in range(4):
+            post.add_event(task["id"], "info", f"stage-{index}", "event")
+        with patch.dict(os.environ, {"TASK_EVENT_MAX_ROWS": "2", "TASK_EVENT_RETENTION_DAYS": "30"}):
+            result = post.prune_events()
+
+        self.assertGreaterEqual(result["overflow"], 1)
+        self.assertEqual(len(post.list_events(task["id"], limit=20)), 2)
+
     def test_qb_file_pick_failure_updates_qb_row_status(self) -> None:
         post = self.main.get_postprocess_service()
         task = post.create_task(av_id="TEST-QB", task_type="subscription", status="torrent_pushed")

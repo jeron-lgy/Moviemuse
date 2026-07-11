@@ -3384,6 +3384,8 @@ notification_dedupe_lock = threading.RLock()
 notification_dedupe: dict[str, float] = {}
 asset_prewarm_lock = threading.RLock()
 asset_prewarm_pending: set[str] = set()
+subscription_download_locks_guard = threading.RLock()
+subscription_download_locks: dict[str, threading.RLock] = {}
 wechat_token_lock = threading.RLock()
 wechat_token_cache: dict[str, dict[str, Any]] = {}
 wechat_session_lock = threading.RLock()
@@ -6048,13 +6050,51 @@ def refresh_library_status_for_subscriptions(limit: int = 80) -> int:
 
 
 def download_pending_subscriptions() -> dict[str, Any]:
-    service = get_subscription_service()
-    items = [item for item in subscribed_avs_with_global_filter("bulk_download") if item.get("status", "pending") == "pending"]
+    items = [
+        item for item in subscribed_avs_with_global_filter("bulk_download")
+        if item.get("status", "pending") == "pending"
+        and str(item.get("download_status") or "") not in {"completed", "downloaded", "waiting_worker", "processing"}
+    ]
+    priority = {"error": 0, "not_found": 1, "": 2, "searching": 3, "downloading": 4}
+    items.sort(key=lambda item: (priority.get(str(item.get("download_status") or ""), 5), float(item.get("subscribed_at") or 0)))
     app_log("info", "download", "开始一键下载订阅中番号", {"stage": "bulk_download_start", "count": len(items)})
-    results = [download_av_from_mteam(item) for item in items]
+    results: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        av_id = str(item.get("id") or "")
+        try:
+            result = download_av_from_mteam(item)
+        except Exception as exc:
+            message = str(exc)
+            get_subscription_service().update_av_download(av_id, {"download_status": "error", "download_message": message})
+            app_log("error", "download", "批量订阅下载单项异常，继续处理后续番号", {
+                "stage": "bulk_download_item_error",
+                "av_id": av_id,
+                "index": index,
+                "count": len(items),
+                "error": message,
+            })
+            result = {"av_id": av_id, "status": "error", "message": message}
+        results.append(result)
+        app_log("info", "download", "批量订阅下载进度", {
+            "stage": "bulk_download_progress",
+            "av_id": av_id,
+            "index": index,
+            "count": len(items),
+            "status": result.get("status", ""),
+        })
     sent = len([item for item in results if item.get("status") in {"ok", "exists", "sent"}])
-    app_log("info", "download", "一键下载完成", {"stage": "bulk_download_done", "count": len(results), "sent": sent})
-    return {"results": results, "checked": len(items), "sent": sent}
+    not_found = len([item for item in results if item.get("status") == "not_found"])
+    failed = len([item for item in results if item.get("status") in {"error", "failed", "conflict"}])
+    active = len([item for item in results if item.get("status") == "active"])
+    app_log("info", "download", "一键下载完成", {
+        "stage": "bulk_download_done",
+        "count": len(results),
+        "sent": sent,
+        "not_found": not_found,
+        "failed": failed,
+        "active": active,
+    })
+    return {"results": results, "checked": len(items), "sent": sent, "not_found": not_found, "failed": failed, "active": active}
 
 
 def download_pending_wash_subscriptions() -> dict[str, Any]:
@@ -6676,20 +6716,97 @@ def scan_api_page() -> Response:
 
 def create_subscription_postprocess_task(av: dict[str, Any]) -> dict[str, Any]:
     post = get_postprocess_service()
-    task = post.create_task(
+    settings_payload = post.get_settings()
+    task, created = post.ensure_task(
         av_id=str(av.get("id") or ""),
         task_type="subscription",
         status="mteam_searching",
-        target_codec=str(post.get_settings().get("target_codec") or "av1"),
-        needs_subtitle=bool(post.get_settings().get("auto_subtitle_enabled")),
+        target_codec=str(settings_payload.get("target_codec") or "av1"),
+        needs_subtitle=bool(settings_payload.get("auto_subtitle_enabled")),
         data={"title": av.get("title", "")},
+        reusable_error_codes={"download_push_failed", "mteam_missing_id", "mteam_not_found"},
     )
-    app_log("info", "postprocess", "普通订阅后处理任务已创建", {
-        "stage": "postprocess_subscription_task_created",
+    app_log("info", "postprocess", "普通订阅后处理任务已准备", {
+        "stage": "postprocess_subscription_task_created" if created else "postprocess_subscription_task_reused",
         "task_id": task["id"],
         "av_id": av.get("id", ""),
+        "created": created,
     })
+    if not created:
+        post.add_event(str(task["id"]), "info", "task_reused", "复用番号现有后处理任务", {"av_id": av.get("id", "")})
     return task
+
+
+def subscription_download_lock(av_id: str) -> threading.RLock:
+    key = str(av_id or "").strip().upper()
+    with subscription_download_locks_guard:
+        lock = subscription_download_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            subscription_download_locks[key] = lock
+        return lock
+
+
+def sync_subscription_task_state(task: dict[str, Any]) -> dict[str, Any] | None:
+    if str(task.get("task_type") or "") != "subscription":
+        return None
+    task_status = str(task.get("status") or "")
+    status_map = {
+        "mteam_searching": ("searching", "正在搜索 MTeam 资源"),
+        "torrent_pushed": ("downloading", "已推送 qBittorrent，等待下载"),
+        "downloading": ("downloading", "qBittorrent 正在下载"),
+        "waiting_worker": ("waiting_worker", "下载完成，等待算力端"),
+        "waiting_input": ("downloaded", "qBittorrent 已完成，等待确认输入文件"),
+        "ready_to_run": ("downloaded", "下载完成，等待后处理"),
+        "dispatching": ("processing", "正在派发后处理任务"),
+        "sent_to_worker": ("processing", "算力端正在处理"),
+        "transcoding": ("processing", "正在转码"),
+        "worker_done": ("processing", "算力端处理完成，正在校验"),
+        "transcode_validating": ("processing", "正在校验转码结果"),
+        "transcode_done": ("processing", "转码完成，正在处理字幕"),
+        "subtitle_processing": ("processing", "正在生成字幕"),
+        "subtitle_validating": ("processing", "正在校验字幕"),
+        "jellyfin_refreshing": ("processing", "正在刷新 Jellyfin"),
+        "completed": ("completed", "后处理完成"),
+    }
+    mapped = status_map.get(task_status)
+    if not mapped:
+        if task_status in {"failed", "conflict"}:
+            mapped = ("error", str(task.get("error_message") or "下载或后处理失败"))
+        else:
+            return None
+    download_status, message = mapped
+    av_id = str(task.get("av_id") or "")
+    service = get_subscription_service()
+    current = next((item for item in service.get_subscribed_av() if str(item.get("id") or "") == av_id), None)
+    if not current:
+        return None
+    payload: dict[str, Any] = {}
+    if str(current.get("download_status") or "") != download_status:
+        payload.update({"download_status": download_status, "download_message": message})
+    if task.get("torrent_hash"):
+        if str(current.get("qb_hash") or "") != str(task.get("torrent_hash") or ""):
+            payload["qb_hash"] = task.get("torrent_hash")
+    if task_status == "completed" and str(current.get("status") or "") != "done":
+        payload.update({"status": "done", "downloaded_at": time.time()})
+    if not payload:
+        return None
+    return service.update_av_download(av_id, payload)
+
+
+def sync_subscription_postprocess_states(limit: int = 500) -> int:
+    changed = 0
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for task in get_postprocess_service().list_tasks(limit=limit):
+        av_id = str(task.get("av_id") or "")
+        if av_id and str(task.get("task_type") or "") == "subscription":
+            grouped.setdefault(av_id, []).append(task)
+    terminal = {"completed", "failed", "ignored", "expired", "conflict"}
+    for tasks in grouped.values():
+        task = next((item for item in tasks if str(item.get("status") or "") not in terminal), tasks[0])
+        if sync_subscription_task_state(task):
+            changed += 1
+    return changed
 
 
 def bind_qb_to_postprocess_task(task: dict[str, Any], qb_result: dict[str, Any], qb_config: dict[str, Any]) -> dict[str, Any]:
@@ -6777,7 +6894,13 @@ def postprocess_qb_config(qb_config: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = True) -> dict[str, Any]:
+def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = True, post_task: dict[str, Any] | None = None) -> dict[str, Any]:
+    av_id = str(av.get("id") or "").strip()
+    with subscription_download_lock(av_id):
+        return _download_av_from_mteam(av, save_to_subscription=save_to_subscription, post_task=post_task)
+
+
+def _download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = True, post_task: dict[str, Any] | None = None) -> dict[str, Any]:
     av_id = str(av.get("id") or "").strip()
     result: dict[str, Any] = {"av_id": av_id, "status": "skipped", "message": ""}
     if not av_id:
@@ -6806,7 +6929,17 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
 
     settings_data = get_system_settings_service().get()
     service = get_subscription_service()
-    post_task: dict[str, Any] | None = None
+    existing_task = post_task or get_postprocess_service().find_active_task(av_id, "subscription")
+    if existing_task and str(existing_task.get("status") or "") not in {"completed", "failed", "ignored", "expired", "conflict"}:
+        if str(existing_task.get("torrent_hash") or "") or str(existing_task.get("input_path") or ""):
+            sync_subscription_task_state(existing_task)
+            return {
+                "av_id": av_id,
+                "status": "active",
+                "message": "已有下载或后处理任务，跳过重复推送",
+                "task_id": existing_task.get("id", ""),
+            }
+    post_task = post_task if post_task and str(post_task.get("id") or "") else None
     app_log("info", "mteam", "开始搜索 MTeam 资源", {"stage": "mteam_search_start", "av_id": av_id})
     mteam_result = search_mteam(av_id, settings_data, limit=8)
     torrents_all = mteam_result.get("results") or []
@@ -6827,6 +6960,13 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         app_log("error", "mteam", "MTeam 未找到资源", {"stage": "mteam_search_empty", "av_id": av_id, "message": message, "raw_count": len(torrents_all)})
         if save_to_subscription:
             service.update_av_download(av_id, {"download_status": "not_found", "download_message": message})
+        if post_task:
+            get_postprocess_service().update_task(
+                str(post_task["id"]),
+                status="failed",
+                error_code="mteam_not_found",
+                error_message=message,
+            )
         return {"av_id": av_id, "status": "not_found", "message": message}
 
     torrent = choose_mteam_torrent(av_id, torrents)
@@ -6841,7 +6981,8 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         "torrent_title": torrent_title,
     })
     if save_to_subscription:
-        post_task = create_subscription_postprocess_task(av)
+        post_task = post_task or create_subscription_postprocess_task(av)
+        get_postprocess_service().update_task(post_task["id"], status="mteam_searching", error_code="", error_message="")
         get_postprocess_service().update_task(
             post_task["id"],
             data={
@@ -9526,6 +9667,7 @@ def poll_postprocess_once() -> dict[str, Any]:
                 "status": queue_result.get("status"),
                 "updated": queue_result.get("updated"),
             })
+    subscription_states_synced = sync_subscription_postprocess_states()
     return {
         "qb": qb_result,
         "subtitle": subtitle_result,
@@ -9534,6 +9676,7 @@ def poll_postprocess_once() -> dict[str, Any]:
         "worker_missing_recovery": recovered_missing,
         "worker_queue": worker_queue,
         "queue_auto_run": queue_result,
+        "subscription_states_synced": subscription_states_synced,
     }
 
 
@@ -10151,6 +10294,27 @@ def api_retry_postprocess_task(task_id: str) -> dict[str, object]:
     task = post.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="后处理任务不存在")
+    acquisition_errors = {"download_push_failed", "mteam_missing_id", "mteam_not_found"}
+    if (
+        str(task.get("task_type") or "") == "subscription"
+        and str(task.get("error_code") or "") in acquisition_errors
+        and not str(task.get("torrent_hash") or "").strip()
+        and not str(task.get("input_path") or "").strip()
+    ):
+        av_id = str(task.get("av_id") or "")
+        av = next((item for item in get_subscription_service().get_subscribed_av() if str(item.get("id") or "") == av_id), None)
+        if not av:
+            raise HTTPException(status_code=404, detail="订阅番号不存在，无法重新获取 MTeam 资源")
+        post.update_task(task_id, status="mteam_searching", error_code="", error_message="")
+        post.add_event(task_id, "info", "task_retry_acquisition", "用户手动重试 MTeam 获取和 qB 推送", {
+            "previous_status": task.get("status", ""),
+            "previous_error_code": task.get("error_code", ""),
+        })
+        result = download_av_from_mteam(av, post_task=post.get_task(task_id) or task)
+        updated = post.get_task(task_id)
+        if updated:
+            sync_subscription_task_state(updated)
+        return {"status": result.get("status", "error"), "task": updated, "download_result": result}
     next_status = reset_postprocess_task_for_retry(task)
     updated = post.get_task(task_id) or post.update_task(task_id, status=next_status, error_code="", error_message="")
     post.add_event(task_id, "info", "task_retry", "用户手动重试后处理任务", {
