@@ -4,6 +4,8 @@
 
 MovieMuse 控制台不在容器内运行 Whisper。字幕和转码任务会转发到 Windows 算力端。
 
+`monitoring/` 是独立运行在 Unraid 宿主机的临时稳定性监控工具，不会打包进控制台镜像，也不属于 Compose 服务。它的部署、数据和授权边界见 [`monitoring/README.md`](monitoring/README.md)。
+
 ## Compose 文件
 
 | 文件 | 场景 | 镜像来源 | 说明 |
