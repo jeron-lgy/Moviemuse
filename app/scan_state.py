@@ -527,11 +527,11 @@ class ScanCache:
         return True
 
     def _cached_files_for_roots(self, media_dirs: list[Path]) -> dict[str, dict[str, Any]]:
-        conn = self._connect()
-        if not conn:
-            return {}
         roots = [str(path) for path in media_dirs]
         if not roots:
+            return {}
+        conn = self._connect()
+        if not conn:
             return {}
         placeholders = ",".join("?" for _ in roots)
         try:
@@ -616,11 +616,11 @@ class ScanCache:
             conn.close()
 
     def _mark_missing(self, media_dirs: list[Path], current_paths: set[str]) -> int:
-        conn = self._connect()
-        if not conn:
-            return 0
         roots = [str(path) for path in media_dirs]
         if not roots:
+            return 0
+        conn = self._connect()
+        if not conn:
             return 0
         placeholders = ",".join("?" for _ in roots)
         try:

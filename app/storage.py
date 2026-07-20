@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -49,17 +50,18 @@ class Storage:
 
     def init_db(self) -> None:
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    """
-                    create table if not exists moves (
-                        id integer primary key autoincrement,
-                        source text not null,
-                        target text not null,
-                        moved_at text not null
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        create table if not exists moves (
+                            id integer primary key autoincrement,
+                            source text not null,
+                            target text not null,
+                            moved_at text not null
+                        )
+                        """
                     )
-                    """
-                )
         except sqlite3.Error:
             # Moving files must still work even if the optional history database
             # is owned by a previous container user or mounted read-only.
@@ -153,18 +155,19 @@ class Storage:
 
     def record_move(self, source: Path, target: Path) -> str | None:
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    "insert into moves (source, target, moved_at) values (?, ?, ?)",
-                    (str(source), str(target), datetime.now().isoformat(timespec="seconds")),
-                )
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                with conn:
+                    conn.execute(
+                        "insert into moves (source, target, moved_at) values (?, ?, ?)",
+                        (str(source), str(target), datetime.now().isoformat(timespec="seconds")),
+                    )
         except sqlite3.Error as exc:
             return str(exc)
         return None
 
     def recent_moves(self) -> list[tuple[str, str, str]]:
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn:
                 rows = conn.execute(
                     "select source, target, moved_at from moves order by id desc limit 20"
                 ).fetchall()
