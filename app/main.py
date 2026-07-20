@@ -3126,7 +3126,14 @@ def health() -> dict[str, str]:
 @app.get("/api/subtitle/node/status", dependencies=[Depends(require_subtitle_token)])
 def api_subtitle_node_status() -> dict[str, object]:
     if backend_url() and not compute_node_only():
-        return subtitle_backend_status()
+        return {
+            "status": "controller",
+            "online": False,
+            "mode": "remote_controller",
+            "backend_url": backend_url(),
+            "error": "当前实例配置为控制端，本地计算服务未启动",
+            "updated_at": time.time(),
+        }
     return local_node_status()
 
 

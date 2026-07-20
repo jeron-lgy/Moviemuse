@@ -87,6 +87,16 @@ class SubtitleJobCacheTest(unittest.TestCase):
         self.assertNotIn("openai_api_key", without_existing)
         self.assertEqual(without_existing["openai_model"], "deepseek-chat")
 
+    def test_controller_node_status_does_not_start_local_compute_service(self) -> None:
+        with patch.object(self.main, "backend_url", return_value="http://worker"), \
+            patch.object(self.main, "compute_node_only", return_value=False), \
+            patch.object(self.main, "local_node_status", side_effect=AssertionError("must stay lazy")):
+            payload = self.main.api_subtitle_node_status()
+
+        self.assertEqual(payload["status"], "controller")
+        self.assertEqual(payload["mode"], "remote_controller")
+        self.assertFalse(payload["online"])
+
 
 if __name__ == "__main__":
     unittest.main()
