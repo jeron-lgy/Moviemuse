@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import threading
@@ -19,6 +20,8 @@ BASE_URL = "https://www.javlibrary.com"
 DEFAULT_FLARESOLVERR_URL = "http://127.0.0.1:8281/v1"
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 522, 524}
 SESSION_TTL_SECONDS = 45 * 60
+SESSION_FAILURE_RESET_THRESHOLD = 2
+SESSION_DESTROY_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,10 @@ class RetryableFetchError(RuntimeError):
     pass
 
 
+class FlareSolverrSessionError(RetryableFetchError):
+    pass
+
+
 class JavLibraryService:
     def __init__(self) -> None:
         self._logger: Callable[[str, str, str, dict[str, Any] | None], None] | None = None
@@ -51,6 +58,14 @@ class JavLibraryService:
         self._session_created_at = 0.0
         self._session_warmed_at = 0.0
         self._session_uses = 0
+        self._session_consecutive_failures = 0
+        self._session_destroy_pending = False
+        self._last_reset_reason = ""
+        self._sessions_created = 0
+        self._sessions_destroyed = 0
+        self._session_destroy_failures = 0
+        owner = re.sub(r"[^a-z0-9-]+", "-", os.getenv("MOVIEMUSE_INSTANCE_ID", "primary").strip().lower())
+        self._session_owner = owner.strip("-")[:24] or "primary"
 
     def set_logger(self, logger: Callable[[str, str, str, dict[str, Any] | None], None]) -> None:
         self._logger = logger
@@ -69,6 +84,13 @@ class JavLibraryService:
             "session_age_seconds": max(0, int(time.time() - self._session_created_at)) if self._session_created_at else 0,
             "session_warmed_at": self._session_warmed_at,
             "session_uses": self._session_uses,
+            "session_owner": self._session_owner,
+            "session_consecutive_failures": self._session_consecutive_failures,
+            "session_destroy_pending": self._session_destroy_pending,
+            "last_reset_reason": self._last_reset_reason,
+            "sessions_created": self._sessions_created,
+            "sessions_destroyed": self._sessions_destroyed,
+            "session_destroy_failures": self._session_destroy_failures,
         }
 
     def actress_url(self, star_id: str, lang: str = "cn") -> str:
@@ -128,19 +150,50 @@ class JavLibraryService:
                         time.sleep(cooldown)
                     self._last_success_at = time.time()
                     self._session_uses += 1
+                    self._session_consecutive_failures = 0
                     return html
-                except (RetryableFetchError, JavLibraryChallenge, requests.Timeout) as exc:
+                except JavLibraryChallenge as exc:
                     last_error = exc
                     self._last_error = str(exc)
-                    self._reset_session(service_url, session, timeout_ms)
+                    self._session_consecutive_failures += 1
+                    self._reset_session(service_url, session, timeout_ms, reason="challenge")
                     if attempt > retries:
                         break
-                    self._log("warning", "JavLibrary fetch retry", {"stage": "javlibrary_retry", "attempt": attempt, "error": str(exc), "url": target_url})
+                    self._log("warning", "JavLibrary fetch retry", {
+                        "stage": "javlibrary_retry",
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "url": target_url,
+                        "session_reset": True,
+                        "reset_reason": "challenge",
+                    })
+                    self._backoff(attempt, base_delay, max_delay)
+                except (RetryableFetchError, requests.Timeout) as exc:
+                    last_error = exc
+                    self._last_error = str(exc)
+                    self._session_consecutive_failures += 1
+                    reset_session = (
+                        isinstance(exc, FlareSolverrSessionError)
+                        or self._session_consecutive_failures >= SESSION_FAILURE_RESET_THRESHOLD
+                    )
+                    reset_reason = "session_error" if isinstance(exc, FlareSolverrSessionError) else "consecutive_failures"
+                    if reset_session:
+                        self._reset_session(service_url, session, timeout_ms, reason=reset_reason)
+                    if attempt > retries:
+                        break
+                    self._log("warning", "JavLibrary fetch retry", {
+                        "stage": "javlibrary_retry",
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "url": target_url,
+                        "session_reset": reset_session,
+                        "reset_reason": reset_reason if reset_session else "",
+                        "consecutive_failures": self._session_consecutive_failures,
+                    })
                     self._backoff(attempt, base_delay, max_delay)
                 except Exception as exc:
                     last_error = exc
                     self._last_error = str(exc)
-                    self._reset_session(service_url, session, timeout_ms)
                     break
         self._requests_failed += 1
         raise RuntimeError(f"JavLibrary fetch failed: {last_error}") from last_error
@@ -222,14 +275,33 @@ class JavLibraryService:
                 return ""
         return DEFAULT_FLARESOLVERR_URL
 
-    def _command(self, service_url: str, payload: dict[str, Any], timeout_ms: int) -> dict[str, Any]:
-        response = requests.post(service_url, json=payload, timeout=(10, timeout_ms / 1000 + 20))
+    def _command(
+        self,
+        service_url: str,
+        payload: dict[str, Any],
+        timeout_ms: int,
+        *,
+        connect_timeout: float = 10,
+        timeout_overhead: float = 20,
+    ) -> dict[str, Any]:
+        response = requests.post(
+            service_url,
+            json=payload,
+            timeout=(connect_timeout, timeout_ms / 1000 + timeout_overhead),
+        )
         if response.status_code in RETRYABLE_STATUS_CODES:
             raise RetryableFetchError(f"FlareSolverr API returned HTTP {response.status_code}")
         response.raise_for_status()
         data = response.json()
         if data.get("status") != "ok":
-            raise RuntimeError(f"FlareSolverr failed: {data.get('message') or data}")
+            message = str(data.get("message") or data)
+            lower_message = message.lower()
+            if "session" in lower_message and any(
+                marker in lower_message
+                for marker in ("not found", "does not exist", "doesn't exist", "invalid", "expired")
+            ):
+                raise FlareSolverrSessionError(f"FlareSolverr session failed: {message}")
+            raise RetryableFetchError(f"FlareSolverr failed: {message}")
         return data
 
     def _create_session(self, service_url: str, session: str, timeout_ms: int) -> None:
@@ -237,6 +309,10 @@ class JavLibraryService:
 
     def _ensure_session(self, service_url: str, timeout_ms: int) -> str:
         now = time.time()
+        if self._session and self._session_destroy_pending:
+            if not self._destroy_session(self._session_service_url, self._session, timeout_ms):
+                raise RetryableFetchError("Previous JavLibrary session is pending destruction")
+            self._clear_session()
         if (
             self._session
             and self._session_service_url == service_url
@@ -244,20 +320,37 @@ class JavLibraryService:
         ):
             return self._session
         if self._session:
-            self._destroy_session(self._session_service_url, self._session, timeout_ms)
-        session = f"moviemuse-jl-{uuid.uuid4().hex[:10]}"
+            if not self._destroy_session(self._session_service_url, self._session, timeout_ms):
+                self._session_destroy_pending = True
+                self._log("warning", "JavLibrary expired session destroy deferred", {
+                    "stage": "javlibrary_session_destroy_deferred",
+                    "session": self._session,
+                    "reason": "ttl_or_service_change",
+                })
+                return self._session
+            self._clear_session()
+        session = f"moviemuse-jl-{self._session_owner}-{uuid.uuid4().hex[:10]}"
         started_at = time.time()
+        created = False
         try:
             self._create_session(service_url, session, timeout_ms)
+            created = True
+            self._sessions_created += 1
             self._request(service_url, f"{BASE_URL}/cn/", session, timeout_ms)
         except Exception:
-            self._destroy_session(service_url, session, timeout_ms)
+            if created and not self._destroy_session(service_url, session, timeout_ms):
+                self._session_service_url = service_url
+                self._session = session
+                self._session_created_at = started_at
+                self._session_destroy_pending = True
             raise
         self._session_service_url = service_url
         self._session = session
         self._session_created_at = started_at
         self._session_warmed_at = time.time()
         self._session_uses = 0
+        self._session_consecutive_failures = 0
+        self._session_destroy_pending = False
         self._log("info", "JavLibrary FlareSolverr session warmed", {
             "stage": "javlibrary_session_warmed",
             "session": session,
@@ -265,25 +358,87 @@ class JavLibraryService:
         })
         return session
 
-    def _reset_session(self, service_url: str, session: str, timeout_ms: int) -> None:
+    def _reset_session(self, service_url: str, session: str, timeout_ms: int, *, reason: str) -> None:
         target_session = session or self._session
         target_service_url = service_url or self._session_service_url
+        destroyed = True
         if target_session:
-            self._destroy_session(target_service_url, target_session, timeout_ms)
+            destroyed = self._destroy_session(target_service_url, target_session, timeout_ms)
         if not session or session == self._session:
-            self._session_service_url = ""
-            self._session = ""
-            self._session_created_at = 0.0
-            self._session_warmed_at = 0.0
-            self._session_uses = 0
+            self._last_reset_reason = reason
+            if destroyed:
+                self._clear_session()
+            else:
+                self._session_destroy_pending = True
+                self._log("warning", "JavLibrary session reset deferred", {
+                    "stage": "javlibrary_session_destroy_deferred",
+                    "session": target_session,
+                    "reason": reason,
+                })
 
-    def _destroy_session(self, service_url: str, session: str, timeout_ms: int) -> None:
+    def _destroy_session(self, service_url: str, session: str, timeout_ms: int) -> bool:
         if not service_url or not session:
-            return
-        try:
-            self._command(service_url, {"cmd": "sessions.destroy", "session": session}, timeout_ms)
-        except Exception:
-            pass
+            return True
+        last_error: Exception | None = None
+        destroy_timeout_ms = max(1000, min(int(timeout_ms or 10000), 10000))
+        for attempt in range(1, SESSION_DESTROY_ATTEMPTS + 1):
+            try:
+                self._command(
+                    service_url,
+                    {"cmd": "sessions.destroy", "session": session},
+                    destroy_timeout_ms,
+                    connect_timeout=3,
+                    timeout_overhead=2,
+                )
+                self._sessions_destroyed += 1
+                self._log("info", "JavLibrary FlareSolverr session destroyed", {
+                    "stage": "javlibrary_session_destroyed",
+                    "session": session,
+                    "attempt": attempt,
+                })
+                return True
+            except Exception as exc:
+                if isinstance(exc, FlareSolverrSessionError):
+                    self._sessions_destroyed += 1
+                    self._log("info", "JavLibrary FlareSolverr session already absent", {
+                        "stage": "javlibrary_session_destroyed",
+                        "session": session,
+                        "attempt": attempt,
+                        "already_absent": True,
+                    })
+                    return True
+                last_error = exc
+                if attempt < SESSION_DESTROY_ATTEMPTS:
+                    time.sleep(0.25 * attempt)
+        self._session_destroy_failures += 1
+        self._log("error", "JavLibrary FlareSolverr session destroy failed", {
+            "stage": "javlibrary_session_destroy_failed",
+            "session": session,
+            "attempts": SESSION_DESTROY_ATTEMPTS,
+            "error": str(last_error or ""),
+        })
+        return False
+
+    def _clear_session(self) -> None:
+        self._session_service_url = ""
+        self._session = ""
+        self._session_created_at = 0.0
+        self._session_warmed_at = 0.0
+        self._session_uses = 0
+        self._session_consecutive_failures = 0
+        self._session_destroy_pending = False
+
+    def close(self, timeout_ms: int = 10000) -> bool:
+        with self._session_lock:
+            if not self._session:
+                return True
+            session = self._session
+            destroyed = self._destroy_session(self._session_service_url, session, timeout_ms)
+            if destroyed:
+                self._clear_session()
+            else:
+                self._session_destroy_pending = True
+            return destroyed
 
     def _request(self, service_url: str, url: str, session: str, timeout_ms: int) -> str:
         data = self._command(

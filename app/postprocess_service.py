@@ -112,9 +112,11 @@ class PostprocessService:
         self.log_file = data_dir / "system_logs.jsonl"
         self._log_lock = threading.RLock()
         self._task_lock = threading.RLock()
+        self._event_lock = threading.RLock()
         self._event_write_count = 0
         data_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self.prune_events()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -725,12 +727,63 @@ class PostprocessService:
     def add_event(self, task_id: str, level: str, stage: str, message: str, data: dict[str, Any] | None = None) -> None:
         now = time.time()
         payload = data or {}
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO task_events (task_id, level, stage, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
-            )
+        with self._event_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO task_events (task_id, level, stage, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
+                )
+            self._record_event_write()
         self._mirror_event_to_system_log(task_id, level, stage, message, payload, now)
+
+    def add_event_if_due(
+        self,
+        task_id: str,
+        level: str,
+        stage: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+        *,
+        min_interval_seconds: float,
+        fingerprint: str = "",
+    ) -> bool:
+        """Insert an event only when its state changed or its heartbeat is due."""
+        now = time.time()
+        payload = dict(data or {})
+        if fingerprint:
+            payload["fingerprint"] = fingerprint
+        with self._event_lock:
+            with self._connect() as conn:
+                previous = conn.execute(
+                    """
+                    SELECT data_json, created_at
+                    FROM task_events
+                    WHERE task_id = ? AND stage = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (task_id, stage),
+                ).fetchone()
+                if previous:
+                    previous_payload: dict[str, Any] = {}
+                    try:
+                        parsed = json.loads(previous["data_json"] or "{}")
+                        if isinstance(parsed, dict):
+                            previous_payload = parsed
+                    except Exception:
+                        previous_payload = {}
+                    same_fingerprint = not fingerprint or previous_payload.get("fingerprint") == fingerprint
+                    if same_fingerprint and now - float(previous["created_at"] or 0) < max(0.0, min_interval_seconds):
+                        return False
+                conn.execute(
+                    "INSERT INTO task_events (task_id, level, stage, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
+                )
+            self._record_event_write()
+        self._mirror_event_to_system_log(task_id, level, stage, message, payload, now)
+        return True
+
+    def _record_event_write(self) -> None:
         self._event_write_count += 1
         if self._event_write_count % 250 == 0:
             self.prune_events()
@@ -745,7 +798,7 @@ class PostprocessService:
                 """
                 DELETE FROM task_events
                 WHERE id IN (
-                    SELECT id FROM task_events ORDER BY created_at DESC LIMIT -1 OFFSET ?
+                    SELECT id FROM task_events ORDER BY id DESC LIMIT -1 OFFSET ?
                 )
                 """,
                 (max_rows,),

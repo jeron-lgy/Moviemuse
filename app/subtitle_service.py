@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import gc
 import json
 import os
 import queue
@@ -391,22 +392,34 @@ class SubtitleService:
         self.jobs_path = settings.data_dir / "subtitle_jobs.json"
         self.upload_dir = settings.data_dir / "subtitle_uploads"
         self.lock = threading.Lock()
-        self.queue: queue.Queue[str] = queue.Queue()
-        self.translation_queue: queue.Queue[str] = queue.Queue()
+        self.queue: queue.Queue[str | None] = queue.Queue()
+        self.translation_queue: queue.Queue[str | None] = queue.Queue()
         self.jobs: dict[str, SubtitleJob] = {}
         self.cancelled_jobs: set[str] = set()
         self._model_cache: dict[tuple[str, str, str, str], Any] = {}
+        self._model_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._closed = False
+        self._workers: list[threading.Thread] = []
+        self._translation_workers: list[threading.Thread] = []
+        self._status_worker: threading.Thread | None = None
         self._load_jobs()
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        for _ in range(settings.max_workers):
-            worker = threading.Thread(target=self._worker_loop, daemon=True)
+        for index in range(settings.max_workers):
+            worker = threading.Thread(target=self._worker_loop, name=f"subtitle-worker-{index + 1}", daemon=True)
             worker.start()
-        for _ in range(max(1, min(4, int(settings.translation_max_workers or 1)))):
-            translation_worker = threading.Thread(target=self._translation_worker_loop, daemon=True)
+            self._workers.append(worker)
+        for index in range(max(1, min(4, int(settings.translation_max_workers or 1)))):
+            translation_worker = threading.Thread(
+                target=self._translation_worker_loop,
+                name=f"subtitle-translation-worker-{index + 1}",
+                daemon=True,
+            )
             translation_worker.start()
+            self._translation_workers.append(translation_worker)
         if os.getenv("COMPUTE_NODE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
-            status_worker = threading.Thread(target=self._status_loop, daemon=True)
-            status_worker.start()
+            self._status_worker = threading.Thread(target=self._status_loop, name="subtitle-status", daemon=True)
+            self._status_worker.start()
 
     def create_job(
         self,
@@ -418,6 +431,7 @@ class SubtitleService:
         translate: bool = True,
         translate_backend: str = "google",
     ) -> SubtitleJob:
+        self._ensure_open()
         job = self._prepare_job(video_path, output_dir, source_language, target_language, model, translate, translate_backend)
         with self.lock:
             self.jobs[job.id] = job
@@ -426,6 +440,7 @@ class SubtitleService:
         return job
 
     def create_jobs(self, payloads: list[dict[str, Any]]) -> list[SubtitleJob]:
+        self._ensure_open()
         jobs = [
             self._prepare_job(
                 str(payload.get("video_path") or ""),
@@ -583,6 +598,7 @@ class SubtitleService:
         return None
 
     def _create_translation_retry(self, source: SubtitleJob, original_srt: Path, translate_backend: str) -> SubtitleJob:
+        self._ensure_open()
         original_vtt = self._existing_original_vtt(source)
         job = SubtitleJob(
             id=uuid.uuid4().hex,
@@ -624,6 +640,8 @@ class SubtitleService:
         while True:
             job_id = self.queue.get()
             try:
+                if job_id is None:
+                    return
                 self._run_job(job_id)
             finally:
                 self.queue.task_done()
@@ -632,13 +650,14 @@ class SubtitleService:
         while True:
             job_id = self.translation_queue.get()
             try:
+                if job_id is None:
+                    return
                 self._run_translation_job(job_id)
             finally:
                 self.translation_queue.task_done()
 
     def _status_loop(self) -> None:
-        while True:
-            time.sleep(30)
+        while not self._stop_event.wait(30):
             with self.lock:
                 jobs = list(self.jobs.values())
             active = sum(1 for job in jobs if job.status in {"queued", "running", "translating"})
@@ -804,7 +823,10 @@ class SubtitleService:
     def _get_model(self, model_name: str) -> Any:
         model_dir = self.settings.model_dir
         cache_key = (model_name, self.settings.device, self.settings.compute_type, str(model_dir or ""))
-        if cache_key not in self._model_cache:
+        with self._model_lock:
+            cached = self._model_cache.get(cache_key)
+            if cached is not None:
+                return cached
             if self.settings.device == "cuda":
                 add_nvidia_dll_dirs()
             try:
@@ -813,13 +835,55 @@ class SubtitleService:
                 raise RuntimeError("缺少 faster-whisper，请先安装 requirements.txt 里的依赖") from exc
             if model_dir:
                 model_dir.mkdir(parents=True, exist_ok=True)
-            self._model_cache[cache_key] = WhisperModel(
+            loaded = WhisperModel(
                 model_name,
                 device=self.settings.device,
                 compute_type=self.settings.compute_type,
                 download_root=str(model_dir) if model_dir else None,
             )
-        return self._model_cache[cache_key]
+            # Keep only the currently selected model. Running jobs retain their
+            # own local reference until they finish, so this does not interrupt
+            # active transcription.
+            self._model_cache.clear()
+            self._model_cache[cache_key] = loaded
+            return loaded
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("字幕服务正在关闭，请稍后重试")
+
+    def close(self, timeout: float = 5.0) -> bool:
+        if self._closed:
+            threads = [*self._workers, *self._translation_workers]
+            if self._status_worker:
+                threads.append(self._status_worker)
+            stopped = not any(worker.is_alive() for worker in threads)
+            if stopped:
+                with self._model_lock:
+                    self._model_cache.clear()
+                gc.collect()
+            return stopped
+        self._closed = True
+        self._stop_event.set()
+        for _ in self._workers:
+            self.queue.put(None)
+        for _ in self._translation_workers:
+            self.translation_queue.put(None)
+        deadline = time.monotonic() + max(0.1, timeout)
+        threads = [*self._workers, *self._translation_workers]
+        if self._status_worker:
+            threads.append(self._status_worker)
+        for worker in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        stopped = not any(worker.is_alive() for worker in threads)
+        if stopped:
+            with self._model_lock:
+                self._model_cache.clear()
+            gc.collect()
+        return stopped
 
     def _translate_segments(
         self,

@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -671,6 +671,8 @@ move_jobs: dict[str, dict[str, Any]] = {}
 move_jobs_lock = threading.Lock()
 console_sessions: dict[str, dict[str, Any]] = {}
 console_sessions_lock = threading.RLock()
+IN_MEMORY_JOB_HISTORY_LIMIT = max(20, int(os.getenv("IN_MEMORY_JOB_HISTORY_LIMIT", "200")))
+CONSOLE_SESSION_MAX_ENTRIES = max(10, int(os.getenv("CONSOLE_SESSION_MAX_ENTRIES", "256")))
 CONSOLE_SESSION_COOKIE = "moviemuse_session"
 CONSOLE_SESSION_TTL = 7 * 24 * 60 * 60
 CONSOLE_AUTH_OPEN_PREFIXES = (
@@ -730,6 +732,20 @@ def frontend_app_response() -> FileResponse:
 
 transcode_jobs: dict[str, dict[str, Any]] = {}
 transcode_jobs_lock = threading.Lock()
+
+
+def prune_finished_job_registry(registry: dict[str, dict[str, Any]], *, limit: int = IN_MEMORY_JOB_HISTORY_LIMIT) -> None:
+    overflow = len(registry) - max(1, limit)
+    if overflow <= 0:
+        return
+    terminal = [
+        (job_id, job)
+        for job_id, job in registry.items()
+        if str(job.get("status") or "") in {"completed", "failed", "cancelled"}
+    ]
+    terminal.sort(key=lambda item: float(item[1].get("finished_at") or item[1].get("created_at") or 0))
+    for job_id, _ in terminal[:overflow]:
+        registry.pop(job_id, None)
 
 
 def move_result_payload(result: MoveResult) -> dict[str, object]:
@@ -794,6 +810,7 @@ def create_move_job(paths: list[str]) -> str:
     }
     with move_jobs_lock:
         move_jobs[job_id] = job
+        prune_finished_job_registry(move_jobs)
     thread = threading.Thread(target=run_move_job, args=(job_id, unique_paths), daemon=True)
     thread.start()
     return job_id
@@ -876,9 +893,11 @@ def reset_subtitle_service_if_idle() -> bool:
     active = [
         job
         for job in subtitle_service.list_jobs()
-        if job.status in {"queued", "running"}
+        if job.status in {"queued", "running", "translating"}
     ]
     if active:
+        return False
+    if not subtitle_service.close(timeout=5):
         return False
     subtitle_service = None
     return True
@@ -1259,6 +1278,70 @@ def memory_summary() -> dict[str, object]:
         }
 
     return {"total_bytes": 0, "available_bytes": 0, "used_percent": 0, "label": "未知"}
+
+
+def runtime_memory_summary() -> dict[str, object]:
+    result: dict[str, object] = {
+        "threads": threading.active_count(),
+        "process_rss_bytes": 0,
+        "process_peak_rss_bytes": 0,
+    }
+    status_path = Path("/proc/self/status")
+    if status_path.exists():
+        try:
+            values: dict[str, int] = {}
+            for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, _, raw = line.partition(":")
+                parts = raw.split()
+                if parts and parts[0].isdigit():
+                    values[key] = int(parts[0]) * (1024 if len(parts) > 1 and parts[1].lower() == "kb" else 1)
+            result["process_rss_bytes"] = values.get("VmRSS", 0)
+            result["process_peak_rss_bytes"] = values.get("VmHWM", 0)
+            result["threads"] = values.get("Threads", threading.active_count())
+        except Exception:
+            pass
+
+    cgroup_root = Path("/sys/fs/cgroup")
+
+    def read_cgroup_value(name: str) -> int | str | None:
+        path = cgroup_root / name
+        if not path.exists():
+            return None
+        try:
+            value = path.read_text(encoding="utf-8", errors="ignore").strip()
+            return int(value) if value.isdigit() else value
+        except Exception:
+            return None
+
+    cgroup: dict[str, object] = {}
+    for key, filename in (
+        ("current_bytes", "memory.current"),
+        ("peak_bytes", "memory.peak"),
+        ("limit_bytes", "memory.max"),
+        ("swap_current_bytes", "memory.swap.current"),
+        ("swap_limit_bytes", "memory.swap.max"),
+    ):
+        value = read_cgroup_value(filename)
+        if value is not None:
+            cgroup[key] = value
+    for filename, target in (("memory.events", "events"), ("memory.stat", "stat")):
+        path = cgroup_root / filename
+        if not path.exists():
+            continue
+        try:
+            parsed: dict[str, int] = {}
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, _, value = line.partition(" ")
+                if value.strip().isdigit():
+                    parsed[key] = int(value.strip())
+            if target == "stat":
+                parsed = {key: parsed.get(key, 0) for key in ("anon", "file", "shmem", "slab")}
+            cgroup[target] = parsed
+        except Exception:
+            pass
+    if cgroup:
+        result["cgroup"] = cgroup
+    return result
 
 
 def gpu_summary() -> list[dict[str, object]]:
@@ -1718,6 +1801,7 @@ def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict
     }
     with transcode_jobs_lock:
         transcode_jobs[job_id] = job
+        prune_finished_job_registry(transcode_jobs)
     if start:
         start_transcode_job(job_id)
     return transcode_job_snapshot(job_id)
@@ -3041,6 +3125,8 @@ def health() -> dict[str, str]:
 
 @app.get("/api/subtitle/node/status", dependencies=[Depends(require_subtitle_token)])
 def api_subtitle_node_status() -> dict[str, object]:
+    if backend_url() and not compute_node_only():
+        return subtitle_backend_status()
     return local_node_status()
 
 
@@ -3639,8 +3725,24 @@ def current_console_user(request: Request) -> str:
 
 def create_console_session(username: str) -> str:
     token = secrets.token_urlsafe(32)
+    now = time.time()
     with console_sessions_lock:
-        console_sessions[token] = {"username": username, "created_at": time.time(), "last_seen_at": time.time()}
+        expired = [
+            key
+            for key, session in console_sessions.items()
+            if now - float(session.get("created_at") or 0) > CONSOLE_SESSION_TTL
+        ]
+        for key in expired:
+            console_sessions.pop(key, None)
+        overflow = len(console_sessions) - CONSOLE_SESSION_MAX_ENTRIES + 1
+        if overflow > 0:
+            oldest = sorted(
+                console_sessions.items(),
+                key=lambda item: float(item[1].get("last_seen_at") or item[1].get("created_at") or 0),
+            )
+            for key, _ in oldest[:overflow]:
+                console_sessions.pop(key, None)
+        console_sessions[token] = {"username": username, "created_at": now, "last_seen_at": now}
     return token
 
 
@@ -4033,7 +4135,12 @@ def normalize_image_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 DMM_PLACEHOLDER_COVER_CACHE: dict[str, tuple[float, bool]] = {}
+DMM_PLACEHOLDER_COVER_CACHE_LOCK = threading.RLock()
 DMM_PLACEHOLDER_COVER_CACHE_TTL = int(os.getenv("DMM_PLACEHOLDER_COVER_CACHE_TTL_SECONDS", "86400"))
+DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES = max(
+    100,
+    int(os.getenv("DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES", "4096")),
+)
 
 
 def dmm_placeholder_cover_cache_key(url: str) -> str:
@@ -4046,7 +4153,21 @@ def remember_dmm_placeholder_cover(url: str, placeholder: bool = True) -> None:
         return
     now = time.time()
     value = bool(placeholder)
-    DMM_PLACEHOLDER_COVER_CACHE[target] = (now, value)
+    with DMM_PLACEHOLDER_COVER_CACHE_LOCK:
+        DMM_PLACEHOLDER_COVER_CACHE[target] = (now, value)
+        if len(DMM_PLACEHOLDER_COVER_CACHE) > DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES:
+            expired = [
+                key
+                for key, cached in DMM_PLACEHOLDER_COVER_CACHE.items()
+                if now - cached[0] >= DMM_PLACEHOLDER_COVER_CACHE_TTL
+            ]
+            for key in expired:
+                DMM_PLACEHOLDER_COVER_CACHE.pop(key, None)
+            overflow = len(DMM_PLACEHOLDER_COVER_CACHE) - DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES
+            if overflow > 0:
+                oldest = sorted(DMM_PLACEHOLDER_COVER_CACHE.items(), key=lambda item: item[1][0])
+                for key, _ in oldest[:overflow]:
+                    DMM_PLACEHOLDER_COVER_CACHE.pop(key, None)
     try:
         cache_set("dmm_cover_placeholder", dmm_placeholder_cover_cache_key(target), {"placeholder": value, "checked_at": now}, DMM_PLACEHOLDER_COVER_CACHE_TTL)
     except Exception:
@@ -4058,13 +4179,15 @@ def dmm_placeholder_cover_cached(url: str) -> bool:
     if not target or "pics.dmm.co.jp/mono/movie/adult/" not in target.lower():
         return False
     now = time.time()
-    cached = DMM_PLACEHOLDER_COVER_CACHE.get(target)
+    with DMM_PLACEHOLDER_COVER_CACHE_LOCK:
+        cached = DMM_PLACEHOLDER_COVER_CACHE.get(target)
     if cached and now - cached[0] < DMM_PLACEHOLDER_COVER_CACHE_TTL:
         return cached[1]
     payload = cache_get("dmm_cover_placeholder", dmm_placeholder_cover_cache_key(target))
     if isinstance(payload, dict):
         result = bool(payload.get("placeholder"))
-        DMM_PLACEHOLDER_COVER_CACHE[target] = (now, result)
+        with DMM_PLACEHOLDER_COVER_CACHE_LOCK:
+            DMM_PLACEHOLDER_COVER_CACHE[target] = (now, result)
         return result
     return False
 
@@ -8096,6 +8219,73 @@ def worker_is_offline() -> bool:
         return True
 
 
+def compact_worker_status(worker_status: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    jobs = worker_status.get("jobs") if isinstance(worker_status.get("jobs"), dict) else {}
+    summary = {
+        "status": str(worker_status.get("status") or "offline"),
+        "online": bool(worker_status.get("online")),
+        "mode": str(worker_status.get("mode") or ""),
+        "backend_url": str(worker_status.get("backend_url") or ""),
+        "error": str(worker_status.get("error") or "")[:500],
+        "jobs": {
+            "total": int(jobs.get("total") or 0),
+            "active": int(jobs.get("active") or 0),
+            "cached": bool(jobs.get("cached")),
+        },
+    }
+    fingerprint_source = {
+        "status": summary["status"],
+        "online": summary["online"],
+        "mode": summary["mode"],
+        "backend_url": summary["backend_url"],
+        "error": summary["error"],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_source, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return summary, fingerprint
+
+
+def record_worker_offline(
+    post: PostprocessService,
+    task: dict[str, Any],
+    worker_status: dict[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    task_id = str(task.get("id") or "")
+    transitioned = (
+        str(task.get("status") or "") != "waiting_worker"
+        or bool(task.get("error_code"))
+        or bool(task.get("error_message"))
+    )
+    updated = task
+    if transitioned:
+        updated = post.update_task(
+            task_id,
+            status="waiting_worker",
+            error_code="",
+            error_message="",
+        ) or task
+    summary, fingerprint = compact_worker_status(worker_status)
+    heartbeat_seconds = max(
+        300,
+        int(os.getenv("WORKER_OFFLINE_EVENT_HEARTBEAT_SECONDS", str(6 * 60 * 60))),
+    )
+    post.add_event_if_due(
+        task_id,
+        "info",
+        "worker_offline",
+        message,
+        {
+            "event_kind": "transition" if transitioned else "heartbeat",
+            "worker": summary,
+        },
+        min_interval_seconds=0 if transitioned else heartbeat_seconds,
+        fingerprint=fingerprint,
+    )
+    return updated
+
+
 def build_postprocess_output_path(task: dict[str, Any], settings_payload: dict[str, Any]) -> str:
     input_path = Path(str(task.get("input_path") or ""))
     av_id = canonical_av_id(task.get("av_id")) or canonical_av_id(detect_catalog_number(input_path.stem)) or str(input_path.stem or "unknown").upper()
@@ -10089,14 +10279,44 @@ def submit_jellyfin_transcode_job(resolved: dict[str, Any], target_codec: str | 
 def start_subscription_polling() -> None:
     global subscription_poll_thread
     apply_system_proxy_settings()
-    if subscription_poll_thread is None:
+    javdb.start()
+    if subscription_poll_thread is None or not subscription_poll_thread.is_alive():
+        subscription_poll_stop.clear()
         subscription_poll_thread = threading.Thread(target=subscription_poll_loop, name="subscription-poll", daemon=True)
         subscription_poll_thread.start()
 
 
 @app.on_event("shutdown")
 def stop_subscription_polling() -> None:
+    global subscription_poll_thread, subtitle_service
+    started_at = time.monotonic()
+    timeout = max(3.0, float(os.getenv("MOVIEMUSE_SHUTDOWN_TIMEOUT_SECONDS", "12")))
     subscription_poll_stop.set()
+    poll_stopped = True
+    if subscription_poll_thread and subscription_poll_thread.is_alive():
+        subscription_poll_thread.join(timeout=min(5.0, timeout))
+        poll_stopped = not subscription_poll_thread.is_alive()
+    if poll_stopped:
+        subscription_poll_thread = None
+
+    remaining = max(0.1, timeout - (time.monotonic() - started_at))
+    javlibrary_closed = javlibrary.close(timeout_ms=max(1000, min(3000, int(remaining * 1000))))
+    remaining = max(0.1, timeout - (time.monotonic() - started_at))
+    javdb_closed = javdb.close(timeout=min(5.0, remaining))
+    subtitle_closed = True
+    if subtitle_service is not None:
+        remaining = max(0.1, timeout - (time.monotonic() - started_at))
+        subtitle_closed = subtitle_service.close(timeout=min(5.0, remaining))
+        if subtitle_closed:
+            subtitle_service = None
+    app_log("info", "lifecycle", "MovieMuse shutdown cleanup completed", {
+        "stage": "application_shutdown_cleanup",
+        "elapsed": round(time.monotonic() - started_at, 3),
+        "poll_stopped": poll_stopped,
+        "javlibrary_closed": javlibrary_closed,
+        "javdb_closed": javdb_closed,
+        "subtitle_closed": subtitle_closed,
+    })
 
 
 @app.get("/subscriptions", response_class=HTMLResponse)
@@ -10254,9 +10474,14 @@ def api_run_postprocess_task(task_id: str) -> dict[str, object]:
     if status not in RUNNABLE_POSTPROCESS_STATUSES:
         return {"status": "skipped", "reason": "not_runnable", "task": task}
     settings_payload = post.get_settings()
-    if postprocess_task_needs_worker(task, settings_payload) and worker_is_offline():
-        updated = post.update_task(task_id, status="waiting_worker", error_code="", error_message="")
-        post.add_event(task_id, "info", "worker_offline", "算力端离线，单任务执行已保留在等待队列")
+    worker_status = subtitle_backend_status() if postprocess_task_needs_worker(task, settings_payload) else {}
+    if worker_status and not bool(worker_status.get("online") or worker_status.get("status") == "ok"):
+        updated = record_worker_offline(
+            post,
+            task,
+            worker_status,
+            "算力端离线，单任务执行已保留在等待队列",
+        )
         return {"status": "waiting_worker", "task": updated}
     claimed = claim_postprocess_task_for_dispatch(task)
     if not claimed:
@@ -10792,8 +11017,12 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
 
     if not online:
         for task in worker_candidates:
-            post.update_task(str(task["id"]), status="waiting_worker", error_code="", error_message="")
-            post.add_event(str(task["id"]), "info", "worker_offline", "算力端离线，批量运行已保留在等待队列", {"worker_status": worker_status})
+            record_worker_offline(
+                post,
+                task,
+                worker_status,
+                "算力端离线，批量运行已保留在等待队列",
+            )
         return {
             "status": "waiting_worker" if worker_candidates else "dispatched",
             "selected": len(unique_ids),
@@ -10929,8 +11158,12 @@ def run_postprocess_queue() -> dict[str, object]:
             updated.append({"task_id": task["id"], "status": "ready_to_run", "error": message})
     if not online:
         for task in worker_candidates:
-            post.update_task(task["id"], status="waiting_worker")
-            post.add_event(task["id"], "info", "worker_offline", "算力端离线，任务保留在等待队列", {"worker_status": worker_status})
+            record_worker_offline(
+                post,
+                task,
+                worker_status,
+                "算力端离线，任务保留在等待队列",
+            )
         return {
             "status": "waiting_worker" if worker_candidates else "dispatched",
             "updated": len(updated),
@@ -11872,6 +12105,7 @@ def api_get_javdb_status() -> dict[str, object]:
         "javlibrary": javlibrary.stats(),
         "metadata_cache": get_subscription_service().metadata_cache_stats(),
         "asset_cache": get_subscription_service().asset_cache_stats(),
+        "runtime_memory": runtime_memory_summary(),
     }
 
 
@@ -13634,24 +13868,46 @@ def dmm_cover_url_is_placeholder(url: str) -> bool:
         return False
 
 
-def fetch_media_bytes(url: str) -> tuple[bytes, str]:
-    with httpx.Client(timeout=45, follow_redirects=True) as client:
-        with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            resp.raise_for_status()
-            media_type = resp.headers.get("content-type", "video/mp4").split(";")[0].strip() or "video/mp4"
-            suffix = Path(urlparse(url).path).suffix.lower()
-            if not media_type.lower().startswith("video/") and suffix not in {".mp4", ".webm", ".ogg", ".mov"}:
-                raise HTTPException(status_code=415, detail="远端资源不是可持久化视频")
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in resp.iter_bytes():
+def validate_media_response(resp: httpx.Response, url: str) -> str:
+    resp.raise_for_status()
+    media_type = resp.headers.get("content-type", "video/mp4").split(";")[0].strip() or "video/mp4"
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if not media_type.lower().startswith("video/") and suffix not in {".mp4", ".webm", ".ogg", ".mov"}:
+        raise HTTPException(status_code=415, detail="远端资源不是可持久化视频")
+    content_length = int(resp.headers.get("content-length") or 0)
+    if content_length > ASSET_MEDIA_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
+    return media_type
+
+
+def stream_media_response(url: str) -> StreamingResponse:
+    client = httpx.Client(timeout=45, follow_redirects=True)
+    response = client.send(
+        client.build_request("GET", url, headers={"User-Agent": "Mozilla/5.0"}),
+        stream=True,
+    )
+    try:
+        media_type = validate_media_response(response, url)
+    except Exception:
+        response.close()
+        client.close()
+        raise
+
+    def iterator() -> Any:
+        total = 0
+        try:
+            for chunk in response.iter_bytes():
                 if not chunk:
                     continue
                 total += len(chunk)
                 if total > ASSET_MEDIA_MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
-                chunks.append(chunk)
-    return b"".join(chunks), media_type
+                    raise RuntimeError("预告超过本地缓存大小限制")
+                yield chunk
+        finally:
+            response.close()
+            client.close()
+
+    return StreamingResponse(iterator(), media_type=media_type, headers=asset_cache_headers(False))
 
 
 def serve_asset_record(data_dir: Path, asset: dict[str, Any]) -> FileResponse | None:
@@ -13718,14 +13974,29 @@ def persist_media_asset(url: str, entity_id: str, immutable: bool) -> FileRespon
     entity_id = canonical_av_id(entity_id) or safe_asset_stem(entity_id)
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id 参数不能为空")
-    content, media_type = fetch_media_bytes(url)
-    digest = hashlib.sha256(content).hexdigest()
     target_dir = data_dir / "subscription-assets" / asset_kind_dir("trailer")
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / f"{safe_asset_stem(entity_id)}{asset_file_extension(media_type, url)}"
-    tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
-    tmp_path.write_bytes(content)
-    tmp_path.replace(target_path)
+    with httpx.Client(timeout=45, follow_redirects=True) as client:
+        with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+            media_type = validate_media_response(response, url)
+            target_path = target_dir / f"{safe_asset_stem(entity_id)}{asset_file_extension(media_type, url)}"
+            tmp_path = target_path.with_suffix(f"{target_path.suffix}.{uuid.uuid4().hex}.tmp")
+            digest_builder = hashlib.sha256()
+            total = 0
+            try:
+                with tmp_path.open("wb") as handle:
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > ASSET_MEDIA_MAX_BYTES:
+                            raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
+                        digest_builder.update(chunk)
+                        handle.write(chunk)
+                tmp_path.replace(target_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+    digest = digest_builder.hexdigest()
     relative_path = str(target_path.relative_to(data_dir))
     asset = get_subscription_service().set_asset_cache(
         entity_id,
@@ -13734,14 +14005,14 @@ def persist_media_asset(url: str, entity_id: str, immutable: bool) -> FileRespon
         relative_path,
         media_type,
         digest,
-        len(content),
+        total,
         immutable=immutable,
     )
     app_log("info", "asset-cache", "预告资产已写入本地", {
         "stage": "asset_cache_store",
         "entity_id": entity_id,
         "kind": "trailer",
-        "bytes": len(content),
+        "bytes": total,
         "immutable": immutable,
     })
     return FileResponse(
@@ -13827,8 +14098,7 @@ def proxy_media(url: str = "", av_id: str = "", entity_id: str = "", immutable: 
     try:
         if normalized_entity_id:
             return persist_media_asset(url, normalized_entity_id, immutable)
-        content, media_type = fetch_media_bytes(url)
-        return Response(content=content, media_type=media_type, headers=asset_cache_headers(False))
+        return stream_media_response(url)
     except httpx.HTTPStatusError as exc:
         stale_asset = get_subscription_service().get_asset_cache(normalized_entity_id, "trailer") if normalized_entity_id else None
         if stale_asset:

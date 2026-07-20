@@ -14,6 +14,7 @@ class SubtitleServiceTest(unittest.TestCase):
         self.service = SubtitleService(SubtitleSettings(data_dir=self.root, max_workers=0))
 
     def tearDown(self) -> None:
+        self.service.close(timeout=2)
         shutil.rmtree(self.root, ignore_errors=True)
 
     def add_job(self, job_id: str, status: str) -> SubtitleJob:
@@ -53,6 +54,11 @@ class SubtitleServiceTest(unittest.TestCase):
         self.assertIsNotNone(current)
         self.assertEqual(current.status, "cancelled")
         self.assertEqual(current.progress, 1.0)
+
+    def test_close_stops_workers_and_rejects_new_jobs(self) -> None:
+        self.assertTrue(self.service.close(timeout=2))
+        with self.assertRaisesRegex(RuntimeError, "正在关闭"):
+            self.service.create_job(str(self.root / "missing.mp4"))
 
 
 if __name__ == "__main__":

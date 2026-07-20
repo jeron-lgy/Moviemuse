@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -1052,6 +1053,44 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertGreaterEqual(result["overflow"], 1)
         self.assertEqual(len(post.list_events(task["id"], limit=20)), 2)
 
+    def test_task_event_heartbeat_is_deduplicated_until_state_changes(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="TEST-EVENT-DEDUPE", task_type="subscription", status="waiting_worker")
+
+        first = post.add_event_if_due(
+            task["id"],
+            "info",
+            "worker_offline",
+            "worker offline",
+            {"worker": {"status": "offline"}},
+            min_interval_seconds=3600,
+            fingerprint="offline-a",
+        )
+        duplicate = post.add_event_if_due(
+            task["id"],
+            "info",
+            "worker_offline",
+            "worker offline",
+            {"worker": {"status": "offline"}},
+            min_interval_seconds=3600,
+            fingerprint="offline-a",
+        )
+        changed = post.add_event_if_due(
+            task["id"],
+            "info",
+            "worker_offline",
+            "worker offline",
+            {"worker": {"status": "offline", "error": "new"}},
+            min_interval_seconds=3600,
+            fingerprint="offline-b",
+        )
+
+        events = [event for event in post.list_events(task["id"], limit=20) if event["stage"] == "worker_offline"]
+        self.assertTrue(first)
+        self.assertFalse(duplicate)
+        self.assertTrue(changed)
+        self.assertEqual(len(events), 2)
+
     def test_qb_file_pick_failure_updates_qb_row_status(self) -> None:
         post = self.main.get_postprocess_service()
         task = post.create_task(av_id="TEST-QB", task_type="subscription", status="torrent_pushed")
@@ -1590,6 +1629,38 @@ class PostprocessFlowTest(unittest.TestCase):
         updated = post.get_task(task["id"])
         self.assertEqual(result["status"], "waiting_worker")
         self.assertEqual(updated["status"], "waiting_worker")
+
+    def test_repeated_offline_run_keeps_one_compact_worker_event(self) -> None:
+        post = self.main.get_postprocess_service()
+        post.update_settings({"auto_transcode_enabled": True})
+        task = post.create_task(
+            av_id="TEST-OFFLINE-DEDUPE",
+            task_type="subscription",
+            status="ready_to_run",
+        )
+        worker_status = {
+            "status": "offline",
+            "online": False,
+            "mode": "remote",
+            "backend_url": "http://worker",
+            "error": "connection refused",
+            "settings": {"large": "x" * 5000},
+            "jobs": {"total": 20, "active": 3, "items": [{"large": "x" * 5000}]},
+        }
+        original_status = self.main.subtitle_backend_status
+        self.main.subtitle_backend_status = lambda: worker_status
+        try:
+            self.main.api_run_postprocess_task(task["id"])
+            self.main.api_run_postprocess_task(task["id"])
+        finally:
+            self.main.subtitle_backend_status = original_status
+
+        events = [event for event in post.list_events(task["id"], limit=20) if event["stage"] == "worker_offline"]
+        self.assertEqual(len(events), 1)
+        payload = events[0]["data"]
+        self.assertNotIn("settings", payload)
+        self.assertNotIn("items", payload["worker"]["jobs"])
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False)), 1024)
 
     def test_postprocess_task_claim_only_succeeds_once(self) -> None:
         post = self.main.get_postprocess_service()
