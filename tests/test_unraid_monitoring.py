@@ -46,6 +46,15 @@ class UnraidMonitoringLayoutTests(unittest.TestCase):
         self.assertIn("PRAGMA query_only=ON", source)
         self.assertIn("flock -n", source)
         self.assertIn('--probe', source)
+        self.assertIn('readonly SCHEMA_VERSION="2"', source)
+        self.assertIn("docker_inventory_json", source)
+        self.assertIn("virtual_machines_json", source)
+        self.assertIn("virsh domstats --state --balloon --list-active --raw", source)
+        self.assertIn("/proc/sys/kernel/random/boot_id", source)
+        self.assertIn('event("sample_gap"', source)
+        self.assertIn('event("host_reboot"', source)
+        self.assertIn("docker events", source)
+        self.assertIn("host_top_processes_json", source)
 
         forbidden = [
             "docker restart",
@@ -54,6 +63,9 @@ class UnraidMonitoringLayoutTests(unittest.TestCase):
             "sessions.destroy",
             "VACUUM",
             "rm -rf",
+            "virsh destroy",
+            "virsh shutdown",
+            "virsh setmem",
         ]
         for value in forbidden:
             with self.subTest(value=value):
@@ -81,6 +93,18 @@ class UnraidMonitoringLayoutTests(unittest.TestCase):
         for value in forbidden:
             with self.subTest(value=value):
                 self.assertNotIn(value, source)
+
+        self.assertIn("Unraid host:", source)
+        self.assertIn("Virtual machines / all Docker:", source)
+        self.assertIn("max_rss_by_domain", source)
+
+    def test_documentation_explains_host_vm_and_hard_hang_boundaries(self) -> None:
+        readme = (MONITORING / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Unraid MemAvailable", readme)
+        self.assertIn("QEMU RSS", readme)
+        self.assertIn("boot_id", readme)
+        self.assertIn("另一台物理设备", readme)
+        self.assertIn("同机 Docker/VM 不能充当独立见证者", readme)
 
 
 if __name__ == "__main__":

@@ -123,6 +123,16 @@ reduce inputs as $line (
         first_timestamp:null,
         last_timestamp:null,
         duration_ms:{max:null,total:0},
+        host:{
+            first_memory_available_bytes:null,last_memory_available_bytes:null,
+            min_memory_available_bytes:null,min_memory_available_percent:null,
+            max_iowait_percent:null,max_procs_blocked:null,vmstat_oom_kills:0,
+            reboot_events:0,sample_gap_events:0,kernel_anomaly_alerts:0
+        },
+        docker_containers:{max_total_memory_bytes:null,latest_top_by_memory:[],oom_kill_alerts:0},
+        virtual_machines:{max_active_count:null,max_total_configured_bytes:null,
+            max_total_rss_bytes:null,max_guest_stats_age_seconds:null,
+            latest_domains:[],max_rss_by_domain:{}},
         moviemuse:{
             first_memory_current_bytes:null,
             last_memory_current_bytes:null,
@@ -168,11 +178,15 @@ reduce inputs as $line (
         .last_epoch = maximum(.last_epoch; $sample.epoch) |
         if .first_epoch == $sample.epoch then
             .first_timestamp = $sample.timestamp |
+            .host.first_memory_available_bytes = $sample.host.memory_available_bytes |
             .moviemuse.first_memory_current_bytes = $sample.moviemuse.cgroup.memory_current_bytes |
             .database.first_main_bytes = $sample.database.files.main.bytes
         else . end |
         if .last_epoch == $sample.epoch then
             .last_timestamp = $sample.timestamp |
+            .host.last_memory_available_bytes = $sample.host.memory_available_bytes |
+            .docker_containers.latest_top_by_memory = ($sample.docker_containers.top_by_memory // []) |
+            .virtual_machines.latest_domains = ($sample.virtual_machines.domains // []) |
             .moviemuse.last_memory_current_bytes = $sample.moviemuse.cgroup.memory_current_bytes |
             .database.last_main_bytes = $sample.database.files.main.bytes |
             if ($sample.database.event_count | type) == "number" then
@@ -181,6 +195,43 @@ reduce inputs as $line (
         else . end |
         .duration_ms.max = maximum(.duration_ms.max; $sample.sample.duration_ms) |
         .duration_ms.total += ($sample.sample.duration_ms // 0) |
+        .host.min_memory_available_bytes =
+            minimum(.host.min_memory_available_bytes; $sample.host.memory_available_bytes) |
+        .host.min_memory_available_percent = minimum(.host.min_memory_available_percent;
+            (if ($sample.host.memory_total_bytes | type) == "number" and $sample.host.memory_total_bytes > 0
+                and ($sample.host.memory_available_bytes | type) == "number"
+             then ($sample.host.memory_available_bytes * 100 / $sample.host.memory_total_bytes)
+             else null end)) |
+        .host.max_iowait_percent =
+            maximum(.host.max_iowait_percent; $sample.host.cpu.iowait_percent_since_previous) |
+        .host.max_procs_blocked = maximum(.host.max_procs_blocked; $sample.host.load.procs_blocked) |
+        .host.vmstat_oom_kills += ($sample.host.vmstat_delta.oom_kill // 0) |
+        .host.reboot_events += ([$sample.events[]? | select(.kind == "host_reboot")] | length) |
+        .host.sample_gap_events += ([$sample.events[]? | select(.kind == "sample_gap")] | length) |
+        .host.kernel_anomaly_alerts +=
+            ([$sample.alerts[]? | select(.code == "host_kernel_anomaly")] | length) |
+        .docker_containers.max_total_memory_bytes = maximum(
+            .docker_containers.max_total_memory_bytes;
+            $sample.docker_containers.total_memory_current_bytes) |
+        .docker_containers.oom_kill_alerts +=
+            ([$sample.alerts[]? | select(.code == "docker_container_oom_kill_increment"
+                or .code == "docker_daemon_oom_event")] | length) |
+        .virtual_machines.max_active_count = maximum(
+            .virtual_machines.max_active_count; $sample.virtual_machines.active_count) |
+        .virtual_machines.max_total_configured_bytes = maximum(
+            .virtual_machines.max_total_configured_bytes;
+            $sample.virtual_machines.total_configured_bytes) |
+        .virtual_machines.max_total_rss_bytes = maximum(
+            .virtual_machines.max_total_rss_bytes; $sample.virtual_machines.total_rss_bytes) |
+        .virtual_machines.max_guest_stats_age_seconds = maximum(
+            .virtual_machines.max_guest_stats_age_seconds;
+            ([$sample.virtual_machines.domains[]?.stats_age_seconds | numbers] | max // null)) |
+        reduce ($sample.virtual_machines.domains // [])[] as $domain (.;
+            if ($domain.name | type) == "string" then
+                .virtual_machines.max_rss_by_domain[$domain.name] = maximum(
+                    .virtual_machines.max_rss_by_domain[$domain.name]; $domain.rss_bytes)
+            else . end
+        ) |
         .moviemuse.max_memory_current_bytes =
             maximum(.moviemuse.max_memory_current_bytes; $sample.moviemuse.cgroup.memory_current_bytes) |
         .moviemuse.max_anon_bytes =
@@ -297,10 +348,31 @@ jq -r '
         if ($value | length) == 0 then "none"
         else ($value | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(", "))
         end;
+    def percent($value):
+        if ($value | type) != "number" then "unknown"
+        else (((($value * 10) | round) / 10) | tostring) + "%" end;
+    def named_memory($value):
+        if ($value | type) != "object" or ($value | length) == 0 then "none"
+        else ($value | to_entries | sort_by(-(.value // 0)) |
+            map("\(.key)=\(mib(.value))") | join(", ")) end;
+    def top_containers($value):
+        if ($value | type) != "array" or ($value | length) == 0 then "none"
+        else ($value | map("\(.name)=\(mib(.memory_current_bytes))") | join(", ")) end;
     [
         "MovieMuse monitoring summary (\(.requested_hours)h)",
         "Window: \(.first_timestamp // "no samples") -> \(.last_timestamp // "no samples")",
         "Samples: valid=\(.valid_samples), invalid=\(.invalid_lines), collector avg=\(.duration_ms.average // "unknown")ms, max=\(.duration_ms.max // "unknown")ms",
+        "",
+        "Unraid host:",
+        "  memory available first/last/min: \(mib(.host.first_memory_available_bytes)) / \(mib(.host.last_memory_available_bytes)) / \(mib(.host.min_memory_available_bytes)) (min \(percent(.host.min_memory_available_percent)))",
+        "  max iowait=\(percent(.host.max_iowait_percent)), max blocked processes=\(.host.max_procs_blocked // "unknown"), vmstat OOM kills=\(.host.vmstat_oom_kills)",
+        "  host reboots=\(.host.reboot_events), sample gaps=\(.host.sample_gap_events), kernel anomaly alerts=\(.host.kernel_anomaly_alerts)",
+        "",
+        "Virtual machines / all Docker:",
+        "  VM max active=\(.virtual_machines.max_active_count // "unknown"), max configured=\(mib(.virtual_machines.max_total_configured_bytes)), max RSS=\(mib(.virtual_machines.max_total_rss_bytes)), max guest-stat age=\(.virtual_machines.max_guest_stats_age_seconds // "unknown")s",
+        "  VM max RSS by name: \(named_memory(.virtual_machines.max_rss_by_domain))",
+        "  all Docker max memory=\(mib(.docker_containers.max_total_memory_bytes)), container OOM alerts=\(.docker_containers.oom_kill_alerts)",
+        "  latest Docker top: \(top_containers(.docker_containers.latest_top_by_memory))",
         "",
         "MovieMuse:",
         "  memory first/last/max: \(mib(.moviemuse.first_memory_current_bytes)) / \(mib(.moviemuse.last_memory_current_bytes)) / \(mib(.moviemuse.max_memory_current_bytes))",

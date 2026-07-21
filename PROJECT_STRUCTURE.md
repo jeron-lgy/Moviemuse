@@ -72,6 +72,10 @@ deploy/unraid-frontend/monitoring/
 - 本地 Git 文件始终是唯一最新源；禁止直接编辑 Unraid 副本。
 - 部署脚本副本和创建 User Scripts/cron 是两个独立授权动作。
 - 第一版只告警和留证，不执行 restart、destroy、VACUUM、移动或删除。
+- 它会观察宿主机、全部 Docker cgroup 和 libvirt VM，但不拥有这些容器/VM 的配置或
+  生命周期；采样这些运行单元不表示把它们的代码并入 MovieMuse 仓库。
+- `schema_version=2` 样本加入宿主内存压力、全容器排名、VM QEMU RSS、boot ID、
+  采样断档和持久 syslog incident，用于区分容器 memcg OOM、宿主 global OOM 与硬重启。
 
 详细字段、阈值、验证和回滚见 `deploy/unraid-frontend/monitoring/README.md`。
 

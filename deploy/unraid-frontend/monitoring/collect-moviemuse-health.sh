@@ -2,14 +2,14 @@
 #
 # MovieMuse temporary Unraid host monitor.
 #
-# This script observes MovieMuse, FlareSolverr, cgroup v2 and the subscription
-# SQLite database. It never restarts containers, destroys sessions or writes to
-# the application data directory.
+# This script observes the Unraid host, libvirt VMs, Docker cgroups, MovieMuse,
+# FlareSolverr and the subscription SQLite database. It never restarts workloads,
+# destroys sessions or writes to the application data directory.
 
 set -u
 umask 077
 
-readonly SCHEMA_VERSION="1"
+readonly SCHEMA_VERSION="2"
 readonly DEFAULT_DATA_DIR="/mnt/user/appdata/moviemuse/monitoring-data"
 readonly DEFAULT_APP_DATA_DIR="/mnt/user/appdata/moviemuse/data"
 readonly DEFAULT_MOVIEMUSE_CONTAINER="moviemuse"
@@ -57,8 +57,8 @@ EOF
 esac
 
 required_commands=(
-    awk basename cat cksum curl date df docker find flock grep hostname jq mkdir mv
-    readlink rm sed sort sqlite3 stat tail tr wc
+    awk basename cat cksum curl date df docker find flock grep head hostname jq mkdir mv
+    ps readlink rm sed sort sqlite3 stat tail tr wc
 )
 
 missing_commands=()
@@ -81,6 +81,13 @@ if [[ "$MODE" == "capabilities" ]]; then
     else
         printf 'python3=not-required\n'
     fi
+    if command -v virsh >/dev/null 2>&1; then
+        printf 'virsh=optional-available:%s\n' "$(command -v virsh)"
+    else
+        printf 'virsh=optional-unavailable\n'
+    fi
+    [[ -r /proc/pressure/memory ]] && printf 'memory_psi=available\n' || printf 'memory_psi=unavailable\n'
+    [[ -r /boot/logs/syslog ]] && printf 'persistent_syslog=available:/boot/logs/syslog\n' || printf 'persistent_syslog=unavailable\n'
     ((${#missing_commands[@]} == 0))
     exit $?
 fi
@@ -816,35 +823,216 @@ sqlite_json() {
         }'
 }
 
+host_top_processes_json() {
+    local rows
+    rows="$(
+        ps -eo pid=,rss=,comm= --sort=-rss 2>/dev/null |
+            awk '
+                NF >= 3 && count < 10 {
+                    pid=$1; rss=$2; $1=""; $2="";
+                    sub(/^[[:space:]]+/, "", $0);
+                    gsub(/[\t\r\n]/, " ", $0);
+                    printf "%s\t%s\t%s\n", pid, rss * 1024, $0;
+                    count++
+                }
+            '
+    )"
+    jq -Rn --arg rows "$rows" '
+        def number_or_null($value):
+            if ($value | test("^[0-9]+$")) then ($value | tonumber) else null end;
+        if $rows == "" then [] else
+            [$rows | split("\n")[] | split("\t") |
+                {pid:number_or_null(.[0]),rss_bytes:number_or_null(.[1]),process_type:.[2]}]
+        end
+    '
+}
+
+docker_inventory_json() {
+    local since_epoch="$1"
+    local rows="" id name cgroup_dir current peak maximum oom oom_kill
+    while IFS=$'\t' read -r id name; do
+        [[ "$id" =~ ^[a-f0-9]{64}$ && -n "$name" ]] || continue
+        cgroup_dir="/sys/fs/cgroup/docker/$id"
+        if [[ ! -d "$cgroup_dir" && -d "/sys/fs/cgroup/system.slice/docker-$id.scope" ]]; then
+            cgroup_dir="/sys/fs/cgroup/system.slice/docker-$id.scope"
+        fi
+        current=""; peak=""; maximum=""; oom=""; oom_kill=""
+        if [[ -d "$cgroup_dir" ]]; then
+            [[ -r "$cgroup_dir/memory.current" ]] && current="$(<"$cgroup_dir/memory.current")"
+            [[ -r "$cgroup_dir/memory.peak" ]] && peak="$(<"$cgroup_dir/memory.peak")"
+            [[ -r "$cgroup_dir/memory.max" ]] && maximum="$(<"$cgroup_dir/memory.max")"
+            if [[ -r "$cgroup_dir/memory.events" ]]; then
+                oom="$(awk '$1 == "oom" {print $2}' "$cgroup_dir/memory.events")"
+                oom_kill="$(awk '$1 == "oom_kill" {print $2}' "$cgroup_dir/memory.events")"
+            fi
+        fi
+        rows+="${rows:+$'\n'}$id"$'\t'"$name"$'\t'"$current"$'\t'"$peak"$'\t'"$maximum"$'\t'"$oom"$'\t'"$oom_kill"
+    done < <(docker ps --no-trunc --format '{{.ID}}\t{{.Names}}' 2>/dev/null)
+
+    local recent_oom_events
+    recent_oom_events="$(
+        docker events --since "$since_epoch" --until "$NOW_EPOCH" --filter event=oom \
+            --format '{{json .}}' 2>/dev/null |
+            jq -sc '[.[] | {id:((.id // "")[0:12]),name:(.Actor.Attributes.name // null),
+                epoch:(.time // null)}]' 2>/dev/null || printf '[]'
+    )"
+
+    jq -Rn --arg rows "$rows" --argjson recent_oom_events "$recent_oom_events" '
+        def metric($value):
+            if $value == "" then null
+            elif $value == "max" then "max"
+            elif ($value | test("^[0-9]+$")) then ($value | tonumber)
+            else null end;
+        (if $rows == "" then [] else
+            [$rows | split("\n")[] | split("\t") |
+                {id:(.[0][0:12]),name:.[1],memory_current_bytes:metric(.[2]),
+                 memory_peak_bytes:metric(.[3]),memory_max_bytes:metric(.[4]),
+                 oom:metric(.[5]),oom_kill:metric(.[6])}]
+         end) as $all |
+        {
+            status:(if ($all | length) == 0 then "unknown" else "ok" end),
+            running_count:($all | length),
+            total_memory_current_bytes:([$all[].memory_current_bytes | numbers] | add // null),
+            recent_oom_events:$recent_oom_events,
+            containers:($all | map({id,name,memory_current_bytes,oom,oom_kill})),
+            top_by_memory:($all | sort_by(.memory_current_bytes // -1) | reverse | .[:10])
+        }
+    '
+}
+
+virtual_machines_json() {
+    if ! command -v virsh >/dev/null 2>&1; then
+        jq -nc '{available:false,status:"virsh_unavailable",active_count:null,total_configured_bytes:null,total_rss_bytes:null,domains:null}'
+        return
+    fi
+
+    local raw rc rows
+    raw="$(virsh domstats --state --balloon --list-active --raw 2>/dev/null)"
+    rc=$?
+    if [[ "$rc" != "0" ]]; then
+        jq -nc '{available:true,status:"query_failed",active_count:null,total_configured_bytes:null,total_rss_bytes:null,domains:null}'
+        return
+    fi
+    rows="$(
+        awk '
+            function emit() {
+                if (name != "") {
+                    gsub(/[\t\r\n]/, " ", name)
+                    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                        name, state, maximum, current, rss, unused, available, usable,
+                        swap_in, swap_out, last_update
+                }
+            }
+            /^Domain: / {
+                emit(); name=$0; sub(/^Domain: /, "", name);
+                sub(/^\047/, "", name); sub(/\047$/, "", name);
+                state=maximum=current=rss=unused=available=usable=swap_in=swap_out=last_update="";
+                next
+            }
+            /^  state.state=/ {split($0,a,"="); state=a[2]; next}
+            /^  balloon.maximum=/ {split($0,a,"="); maximum=a[2]; next}
+            /^  balloon.current=/ {split($0,a,"="); current=a[2]; next}
+            /^  balloon.rss=/ {split($0,a,"="); rss=a[2]; next}
+            /^  balloon.unused=/ {split($0,a,"="); unused=a[2]; next}
+            /^  balloon.available=/ {split($0,a,"="); available=a[2]; next}
+            /^  balloon.usable=/ {split($0,a,"="); usable=a[2]; next}
+            /^  balloon.swap_in=/ {split($0,a,"="); swap_in=a[2]; next}
+            /^  balloon.swap_out=/ {split($0,a,"="); swap_out=a[2]; next}
+            /^  balloon.last-update=/ {split($0,a,"="); last_update=a[2]; next}
+            END {emit()}
+        ' <<<"$raw"
+    )"
+
+    jq -Rn --arg rows "$rows" '
+        def integer($value):
+            if ($value | test("^[0-9]+$")) then ($value | tonumber) else null end;
+        def kib($value): (integer($value) | if type == "number" then . * 1024 else null end);
+        (if $rows == "" then [] else
+            [$rows | split("\n")[] | split("\t") |
+                {name:.[0],state_code:integer(.[1]),configured_bytes:kib(.[2]),
+                 current_balloon_bytes:kib(.[3]),rss_bytes:kib(.[4]),
+                 guest_unused_bytes:kib(.[5]),guest_available_bytes:kib(.[6]),
+                 guest_usable_bytes:kib(.[7]),swap_in_bytes:kib(.[8]),
+                 swap_out_bytes:kib(.[9]),last_update_epoch:integer(.[10])}]
+         end) as $domains |
+        {
+            available:true,status:"ok",active_count:($domains | length),
+            total_configured_bytes:([$domains[].configured_bytes | numbers] | add // null),
+            total_rss_bytes:([$domains[].rss_bytes | numbers] | add // null),
+            domains:$domains
+        }
+    '
+}
+
 host_json() {
     local run_deep="$1"
-    local mem_total="" mem_available="" swap_total="" swap_free="" vmstat_oom=""
-    [[ -r /proc/meminfo ]] && {
-        mem_total="$(awk '/^MemTotal:/ {print $2 * 1024; exit}' /proc/meminfo)"
-        mem_available="$(awk '/^MemAvailable:/ {print $2 * 1024; exit}' /proc/meminfo)"
-        swap_total="$(awk '/^SwapTotal:/ {print $2 * 1024; exit}' /proc/meminfo)"
-        swap_free="$(awk '/^SwapFree:/ {print $2 * 1024; exit}' /proc/meminfo)"
-    }
-    [[ -r /proc/vmstat ]] && vmstat_oom="$(awk '$1 == "oom_kill" {print $2; exit}' /proc/vmstat)"
+    local meminfo vmstat cpu_stat boot_id="" uptime_seconds="" load1="" load5="" load15=""
+    meminfo="$(
+        awk '
+            BEGIN {OFS="\t"}
+            /^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SReclaimable|SUnreclaim|Shmem|SwapTotal|SwapFree|Dirty|Writeback|PageTables|KernelStack|Committed_AS|CommitLimit):/ {
+                key=$1; sub(/:$/, "", key); values[key]=$2 * 1024
+            }
+            END {
+                keys="MemTotal MemFree MemAvailable Buffers Cached SReclaimable SUnreclaim Shmem SwapTotal SwapFree Dirty Writeback PageTables KernelStack Committed_AS CommitLimit"
+                count=split(keys,a," "); for(i=1;i<=count;i++) printf "%s%s", values[a[i]], (i<count?OFS:ORS)
+            }
+        ' /proc/meminfo 2>/dev/null
+    )"
+    vmstat="$(
+        awk '
+            $1 == "oom_kill" {oom=$2}
+            $1 == "pgmajfault" {major=$2}
+            $1 == "pswpin" {swapin=$2}
+            $1 == "pswpout" {swapout=$2}
+            $1 ~ /^pgscan_/ {scan += $2}
+            $1 ~ /^pgsteal_/ {steal += $2}
+            $1 ~ /^allocstall_/ {stall += $2}
+            $1 == "compact_stall" {compact_stall=$2}
+            $1 == "compact_fail" {compact_fail=$2}
+            END {printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", oom,major,swapin,swapout,scan,steal,stall,compact_stall,compact_fail}
+        ' /proc/vmstat 2>/dev/null
+    )"
+    cpu_stat="$(awk '/^cpu / {total=0; for(i=2;i<=NF;i++) total+=$i; print total "\t" $6; exit}' /proc/stat 2>/dev/null)"
+    [[ -r /proc/sys/kernel/random/boot_id ]] && boot_id="$(</proc/sys/kernel/random/boot_id)"
+    [[ -r /proc/uptime ]] && uptime_seconds="$(awk '{printf "%d", $1}' /proc/uptime)"
+    if [[ -r /proc/loadavg ]]; then
+        read -r load1 load5 load15 _ </proc/loadavg
+    fi
+    local procs_blocked=""
+    [[ -r /proc/stat ]] && procs_blocked="$(awk '$1 == "procs_blocked" {print $2; exit}' /proc/stat)"
 
-    local kernel_available=false kernel_memcg_count="" kernel_global_count=""
+    local pressure_available=false pressure_memory="" pressure_io=""
+    if [[ -r /proc/pressure/memory ]]; then pressure_available=true; pressure_memory="$(tr '\n' ';' </proc/pressure/memory)"; fi
+    if [[ -r /proc/pressure/io ]]; then pressure_io="$(tr '\n' ';' </proc/pressure/io)"; fi
+
+    local arc_available=false arc_size="" arc_target="" arc_max="" arc_throttle=""
+    if [[ -r /proc/spl/kstat/zfs/arcstats ]]; then
+        arc_available=true
+        read -r arc_size arc_target arc_max arc_throttle < <(
+            awk '$1=="size"{size=$3} $1=="c"{target=$3} $1=="c_max"{max=$3} $1=="memory_throttle_count"{throttle=$3} END{print size,target,max,throttle}' /proc/spl/kstat/zfs/arcstats
+        )
+    fi
+
+    local kernel_available=false kernel_memcg_count="" kernel_global_count="" kernel_anomaly_count=""
     local kernel_signature="" kernel_kind="unknown" matches="" latest=""
     if [[ -r /var/log/syslog ]]; then
         kernel_available=true
         matches="$(
-            tail -n 500 /var/log/syslog 2>/dev/null |
-                grep -Ei 'invoked oom-killer|Out of memory: Killed process|Memory cgroup out of memory|oom-kill:' || true
+            tail -n 1000 /var/log/syslog 2>/dev/null |
+                grep -Ei 'invoked oom-killer|Out of memory: Killed process|Memory cgroup out of memory|oom-kill:|blocked for more than|soft lockup|hard lockup|watchdog:|I/O error|Buffer I/O|blk_update_request|machine check|hardware error|EDAC' || true
         )"
         kernel_memcg_count="$(grep -Eic 'memory cgroup|CONSTRAINT_MEMCG|task_memcg=' <<<"$matches" || true)"
         kernel_global_count="$(grep -Eic 'invoked oom-killer|Out of memory: Killed process' <<<"$matches" || true)"
+        kernel_anomaly_count="$(grep -Eic 'blocked for more than|soft lockup|hard lockup|watchdog:|I/O error|Buffer I/O|blk_update_request|machine check|hardware error|EDAC' <<<"$matches" || true)"
         latest="$(tail -n 1 <<<"$matches")"
         if [[ -n "$latest" ]]; then
             kernel_signature="$(cksum <<<"$latest" | awk '{print $1 ":" $2}')"
-            if grep -Eiq 'memory cgroup|CONSTRAINT_MEMCG|task_memcg=' <<<"$latest"; then
-                kernel_kind="memcg"
-            elif grep -Eiq 'invoked oom-killer|Out of memory: Killed process' <<<"$latest"; then
-                kernel_kind="global_candidate"
-            fi
+            if grep -Eiq 'memory cgroup|CONSTRAINT_MEMCG|task_memcg=' <<<"$latest"; then kernel_kind="memcg"
+            elif grep -Eiq 'invoked oom-killer|Out of memory: Killed process' <<<"$latest"; then kernel_kind="global_candidate"
+            elif grep -Eiq 'blocked for more than|soft lockup|hard lockup|watchdog:' <<<"$latest"; then kernel_kind="hang_or_lockup"
+            elif grep -Eiq 'I/O error|Buffer I/O|blk_update_request' <<<"$latest"; then kernel_kind="io_error"
+            else kernel_kind="hardware_error"; fi
         fi
     fi
 
@@ -852,58 +1040,55 @@ host_json() {
     if [[ "$run_deep" == "1" ]]; then
         docker_checked=true
         local docker_info_result docker_info_rc
-        docker_info_result="$(
-            docker info --format '{{.CgroupVersion}}|{{json .Warnings}}' 2>&1
-        )"
+        docker_info_result="$(docker info --format '{{.CgroupVersion}}|{{json .Warnings}}' 2>&1)"
         docker_info_rc=$?
         if [[ "$docker_info_rc" == "0" ]]; then
-            docker_cgroup_version="${docker_info_result%%|*}"
-            docker_no_swap_limit=false
-            if grep -Fqi 'no swap limit support' <<<"$docker_info_result"; then
-                docker_no_swap_limit=true
-            fi
+            docker_cgroup_version="${docker_info_result%%|*}"; docker_no_swap_limit=false
+            grep -Fqi 'no swap limit support' <<<"$docker_info_result" && docker_no_swap_limit=true
         fi
     fi
 
-    jq -nc --arg hostname "$(hostname)" \
-        --arg mem_total "$mem_total" --arg mem_available "$mem_available" \
-        --arg swap_total "$swap_total" --arg swap_free "$swap_free" \
-        --arg vmstat_oom "$vmstat_oom" --argjson kernel_available "$kernel_available" \
-        --arg kernel_memcg_count "$kernel_memcg_count" \
-        --arg kernel_global_count "$kernel_global_count" \
+    local persistent_syslog=false
+    if [[ -r /boot/config/rsyslog.conf ]] && grep -Eq '^\*\.debug[[:space:]]+\?flash' /boot/config/rsyslog.conf; then
+        persistent_syslog=true
+    fi
+    local top_processes
+    top_processes="$(host_top_processes_json)"
+
+    jq -nc --arg hostname "$(hostname)" --arg boot_id "$boot_id" --arg uptime "$uptime_seconds" \
+        --arg meminfo "$meminfo" --arg vmstat "$vmstat" --arg cpu_stat "$cpu_stat" \
+        --arg load1 "$load1" --arg load5 "$load5" --arg load15 "$load15" --arg blocked "$procs_blocked" \
+        --argjson pressure_available "$pressure_available" --arg pressure_memory "$pressure_memory" --arg pressure_io "$pressure_io" \
+        --argjson arc_available "$arc_available" --arg arc_size "$arc_size" --arg arc_target "$arc_target" --arg arc_max "$arc_max" --arg arc_throttle "$arc_throttle" \
+        --argjson kernel_available "$kernel_available" --arg kernel_memcg_count "$kernel_memcg_count" \
+        --arg kernel_global_count "$kernel_global_count" --arg kernel_anomaly_count "$kernel_anomaly_count" \
         --arg kernel_signature "$kernel_signature" --arg kernel_kind "$kernel_kind" \
-        --argjson docker_checked "$docker_checked" \
-        --arg docker_cgroup_version "$docker_cgroup_version" \
-        --arg docker_no_swap_limit "$docker_no_swap_limit" '
-        def number_or_null($value):
-            if ($value | test("^[0-9]+$")) then ($value | tonumber) else null end;
+        --argjson persistent_syslog "$persistent_syslog" --argjson docker_checked "$docker_checked" \
+        --arg docker_cgroup_version "$docker_cgroup_version" --arg docker_no_swap_limit "$docker_no_swap_limit" \
+        --argjson top_processes "$top_processes" '
+        def number_or_null($value): if ($value | test("^[0-9]+$")) then ($value | tonumber) else null end;
+        def decimal_or_null($value): if ($value | test("^[0-9]+([.][0-9]+)?$")) then ($value | tonumber) else null end;
+        ($meminfo | split("\t")) as $m | ($vmstat | split("\t")) as $v | ($cpu_stat | split("\t")) as $cpu |
         {
-            hostname:$hostname,
-            memory_total_bytes:number_or_null($mem_total),
-            memory_available_bytes:number_or_null($mem_available),
-            swap_total_bytes:number_or_null($swap_total),
-            swap_free_bytes:number_or_null($swap_free),
-            vmstat_oom_kill:number_or_null($vmstat_oom),
-            docker:{
-                checked:$docker_checked,
-                cgroup_version:(
-                    if $docker_cgroup_version == "" then null else $docker_cgroup_version end
-                ),
-                no_swap_limit_support:(
-                    if $docker_no_swap_limit == "true" then true
-                    elif $docker_no_swap_limit == "false" then false
-                    else null
-                    end
-                )
-            },
-            kernel_oom_signal:{
-                source:(if $kernel_available then "/var/log/syslog-tail" else null end),
-                available:$kernel_available,
-                memcg_pattern_count:number_or_null($kernel_memcg_count),
-                global_candidate_pattern_count:number_or_null($kernel_global_count),
-                latest_signature:(if $kernel_signature == "" then null else $kernel_signature end),
-                latest_kind:(if $kernel_signature == "" then null else $kernel_kind end)
-            }
+            hostname:$hostname,boot_id:(if $boot_id=="" then null else $boot_id end),uptime_seconds:number_or_null($uptime),
+            memory_total_bytes:number_or_null($m[0]),memory_free_bytes:number_or_null($m[1]),memory_available_bytes:number_or_null($m[2]),
+            buffers_bytes:number_or_null($m[3]),cached_bytes:number_or_null($m[4]),sreclaimable_bytes:number_or_null($m[5]),
+            sunreclaim_bytes:number_or_null($m[6]),shmem_bytes:number_or_null($m[7]),swap_total_bytes:number_or_null($m[8]),
+            swap_free_bytes:number_or_null($m[9]),dirty_bytes:number_or_null($m[10]),writeback_bytes:number_or_null($m[11]),
+            page_tables_bytes:number_or_null($m[12]),kernel_stack_bytes:number_or_null($m[13]),committed_as_bytes:number_or_null($m[14]),commit_limit_bytes:number_or_null($m[15]),
+            load:{one:decimal_or_null($load1),five:decimal_or_null($load5),fifteen:decimal_or_null($load15),procs_blocked:number_or_null($blocked)},
+            cpu:{total_jiffies:number_or_null($cpu[0]),iowait_jiffies:number_or_null($cpu[1]),iowait_percent_since_previous:null},
+            vmstat:{oom_kill:number_or_null($v[0]),pgmajfault:number_or_null($v[1]),pswpin:number_or_null($v[2]),pswpout:number_or_null($v[3]),
+                pgscan:number_or_null($v[4]),pgsteal:number_or_null($v[5]),allocstall:number_or_null($v[6]),compact_stall:number_or_null($v[7]),compact_fail:number_or_null($v[8])},
+            pressure:{available:$pressure_available,memory_raw:(if $pressure_memory=="" then null else $pressure_memory end),io_raw:(if $pressure_io=="" then null else $pressure_io end)},
+            zfs_arc:{available:$arc_available,size_bytes:number_or_null($arc_size),target_bytes:number_or_null($arc_target),max_bytes:number_or_null($arc_max),memory_throttle_count:number_or_null($arc_throttle)},
+            top_processes:$top_processes,
+            docker:{checked:$docker_checked,cgroup_version:(if $docker_cgroup_version=="" then null else $docker_cgroup_version end),
+                no_swap_limit_support:(if $docker_no_swap_limit=="true" then true elif $docker_no_swap_limit=="false" then false else null end)},
+            kernel_oom_signal:{source:(if $kernel_available then "/var/log/syslog-tail" else null end),available:$kernel_available,
+                persistent_local_mirror:$persistent_syslog,memcg_pattern_count:number_or_null($kernel_memcg_count),
+                global_candidate_pattern_count:number_or_null($kernel_global_count),anomaly_pattern_count:number_or_null($kernel_anomaly_count),
+                latest_signature:(if $kernel_signature=="" then null else $kernel_signature end),latest_kind:(if $kernel_signature=="" then null else $kernel_kind end)}
         }
     '
 }
@@ -950,6 +1135,26 @@ log_summary_json() {
             },
             raw_lines_stored:false
         }
+    '
+}
+
+kernel_incident_evidence_json() {
+    local source="/var/log/syslog"
+    if [[ -r /boot/logs/syslog ]]; then
+        source="/boot/logs/syslog"
+    elif [[ ! -r "$source" ]]; then
+        jq -nc '{available:false,source:null,lines:[]}'
+        return
+    fi
+    local lines
+    lines="$(
+        tail -n 4000 "$source" 2>/dev/null |
+            grep -Ei 'invoked oom-killer|Out of memory: Killed process|Memory cgroup out of memory|oom-kill:|Mem-Info|active_anon|inactive_anon|blocked for more than|soft lockup|hard lockup|watchdog:|I/O error|Buffer I/O|blk_update_request|machine check|hardware error|EDAC' |
+            tail -n 80 || true
+    )"
+    jq -Rn --arg lines "$lines" --arg source "$source" '
+        {available:true,source:($source + "-relevant-tail"),line_limit:80,
+         lines:(if $lines == "" then [] else ($lines | split("\n")) end)}
     '
 }
 
@@ -1045,8 +1250,8 @@ if [[ "$MODE" == "collect" ]]; then
         exit 1
     fi
     sample_file="$SAMPLES_DIR/health-$TODAY_UTC.jsonl"
-    if [[ -f "$sample_file" ]] && (( $(stat -c '%s' "$sample_file" 2>/dev/null || printf 0) > 16777216 )); then
-        write_error "daily sample file exceeded 16 MiB; sample skipped"
+    if [[ -f "$sample_file" ]] && (( $(stat -c '%s' "$sample_file" 2>/dev/null || printf 0) > 20971520 )); then
+        write_error "daily sample file exceeded 20 MiB; sample skipped"
         exit 1
     fi
     if [[ -r "$STATE_DIR/previous-sample.json" ]] &&
@@ -1070,6 +1275,12 @@ if [[ "$MODE" == "collect" && "$RUN_DEEP" == "1" && "$LAST_QUICK_DATE" != "$TODA
 fi
 
 HOST_JSON="$(host_json "$RUN_DEEP")"
+DOCKER_EVENT_SINCE="$(jq -r '.epoch // empty' <<<"$PREVIOUS_SAMPLE" 2>/dev/null)"
+if [[ ! "$DOCKER_EVENT_SINCE" =~ ^[0-9]+$ ]] || ((DOCKER_EVENT_SINCE < NOW_EPOCH - 86400)); then
+    DOCKER_EVENT_SINCE=$((NOW_EPOCH - 120))
+fi
+DOCKER_INVENTORY_JSON="$(docker_inventory_json "$DOCKER_EVENT_SINCE")"
+VIRTUAL_MACHINES_JSON="$(virtual_machines_json)"
 MOVIEMUSE_JSON="$(container_json "$MOVIEMUSE_CONTAINER")"
 FLARE_CONTAINER_JSON="$(container_json "$FLARE_CONTAINER")"
 HEALTH_JSON="$(health_json)"
@@ -1107,6 +1318,8 @@ BASE_SAMPLE="$(
         --argjson deep_sample "$([[ "$RUN_DEEP" == "1" ]] && printf true || printf false)" \
         --argjson host_metrics "$HOST_JSON" --argjson moviemuse "$MOVIEMUSE_JSON" \
         --argjson health "$HEALTH_JSON" --argjson flaresolverr "$FLARE_JSON" \
+        --argjson docker_inventory "$DOCKER_INVENTORY_JSON" \
+        --argjson virtual_machines "$VIRTUAL_MACHINES_JSON" \
         --argjson database "$DB_JSON" --argjson worker "$WORKER_JSON" '
         {
             schema_version:($schema_version | tonumber),
@@ -1115,11 +1328,60 @@ BASE_SAMPLE="$(
             epoch:$epoch,
             host:$host_metrics,
             sample:{deep:$deep_sample,duration_ms:null},
+            docker_containers:$docker_inventory,
+            virtual_machines:$virtual_machines,
             moviemuse:($moviemuse + {health:$health}),
             flaresolverr:$flaresolverr,
             database:$database,
             compute_worker:$worker
         }
+    '
+)"
+
+BASE_SAMPLE="$(
+    jq -nc --argjson current "$BASE_SAMPLE" --argjson now "$NOW_EPOCH" '
+        $current |
+        if (.virtual_machines.domains | type) == "array" then
+            .virtual_machines.domains |= map(
+                .stats_age_seconds =
+                    (if (.last_update_epoch | type) == "number" and $now >= .last_update_epoch
+                     then $now - .last_update_epoch else null end)
+            )
+        else . end
+    '
+)"
+
+BASE_SAMPLE="$(
+    jq -nc --argjson previous "$PREVIOUS_SAMPLE" --argjson current "$BASE_SAMPLE" '
+        def delta($old; $new):
+            if ($old | type) == "number" and ($new | type) == "number" and $new >= $old
+            then $new - $old else null end;
+        ($previous.host.boot_id // null) as $old_boot |
+        ($current.host.boot_id // null) as $new_boot |
+        if $old_boot != null and $old_boot == $new_boot then
+            (delta($previous.host.cpu.total_jiffies; $current.host.cpu.total_jiffies)) as $cpu_delta |
+            (delta($previous.host.cpu.iowait_jiffies; $current.host.cpu.iowait_jiffies)) as $iowait_delta |
+            $current |
+            .host.cpu.iowait_percent_since_previous =
+                (if ($cpu_delta | type) == "number" and $cpu_delta > 0 and ($iowait_delta | type) == "number"
+                 then (($iowait_delta * 10000 / $cpu_delta | round) / 100) else null end) |
+            .host.vmstat_delta = {
+                oom_kill:delta($previous.host.vmstat.oom_kill; .host.vmstat.oom_kill),
+                pgmajfault:delta($previous.host.vmstat.pgmajfault; .host.vmstat.pgmajfault),
+                pswpin:delta($previous.host.vmstat.pswpin; .host.vmstat.pswpin),
+                pswpout:delta($previous.host.vmstat.pswpout; .host.vmstat.pswpout),
+                pgscan:delta($previous.host.vmstat.pgscan; .host.vmstat.pgscan),
+                pgsteal:delta($previous.host.vmstat.pgsteal; .host.vmstat.pgsteal),
+                allocstall:delta($previous.host.vmstat.allocstall; .host.vmstat.allocstall),
+                compact_stall:delta($previous.host.vmstat.compact_stall; .host.vmstat.compact_stall),
+                compact_fail:delta($previous.host.vmstat.compact_fail; .host.vmstat.compact_fail)
+            }
+        else
+            $current | .host.vmstat_delta = {
+                oom_kill:null,pgmajfault:null,pswpin:null,pswpout:null,pgscan:null,
+                pgsteal:null,allocstall:null,compact_stall:null,compact_fail:null
+            }
+        end
     '
 )"
 
@@ -1139,6 +1401,10 @@ MONITOR_STATE="$(
         ($current.database.files.main.bytes) as $db_bytes |
         ($current.database.files.wal.bytes) as $wal_bytes |
         ($previous.database.files.wal.bytes) as $old_wal_bytes |
+        ($current.host.memory_total_bytes) as $host_total |
+        ($current.host.memory_available_bytes) as $host_available |
+        ($current.host.cpu.iowait_percent_since_previous) as $host_iowait |
+        ($current.host.load.procs_blocked) as $host_blocked |
         {
             health_failure_streak:(
                 if $health_ok then 0 else (($old.health_failure_streak // 0) + 1) end
@@ -1160,6 +1426,23 @@ MONITOR_STATE="$(
                     (($old.wal_growth_streak // 0) + 1)
                 else 0
                 end
+            ),
+            host_low_memory_streak:(
+                if ($host_total | type) == "number" and $host_total > 0
+                    and ($host_available | type) == "number"
+                    and ($host_available / $host_total) < 0.20 then
+                    (($old.host_low_memory_streak // 0) + 1)
+                else 0 end
+            ),
+            host_iowait_streak:(
+                if ($host_iowait | type) == "number" and $host_iowait >= 25 then
+                    (($old.host_iowait_streak // 0) + 1)
+                else 0 end
+            ),
+            host_blocked_streak:(
+                if ($host_blocked | type) == "number" and $host_blocked >= 8 then
+                    (($old.host_blocked_streak // 0) + 1)
+                else 0 end
             ),
             session_transition_epochs:(
                 (($old.session_transition_epochs // []) | map(select(. >= ($now - 3600)))) +
@@ -1191,6 +1474,38 @@ EVENTS_JSON="$(
         def event($kind; $details):
             {kind:$kind,timestamp:$timestamp,epoch:$epoch,details:$details};
         [
+            $current.docker_containers.containers[]? as $container |
+            ($previous.docker_containers.containers // [] |
+                map(select(.id == $container.id)) | first // null) as $old |
+            select($old != null and ($old.oom_kill | type) == "number"
+                and ($container.oom_kill | type) == "number"
+                and $container.oom_kill > $old.oom_kill) |
+            {id:$container.id,name:$container.name,previous:$old.oom_kill,current:$container.oom_kill}
+        ] as $container_oom_increments |
+        (($previous.virtual_machines.domains // []) | map(.name) | sort) as $old_vms |
+        (($current.virtual_machines.domains // []) | map(.name) | sort) as $new_vms |
+        [
+            if (($previous.epoch // null) | type) == "number"
+                and ($current.epoch - $previous.epoch) > 150 then
+                event("sample_gap"; {previous_epoch:$previous.epoch,current_epoch:$current.epoch,
+                    gap_seconds:($current.epoch - $previous.epoch)})
+            else empty end,
+            if (($previous.host.boot_id // "") != "")
+                and (($current.host.boot_id // "") != "")
+                and $previous.host.boot_id != $current.host.boot_id then
+                event("host_reboot"; {previous_boot_id:$previous.host.boot_id,
+                    current_boot_id:$current.host.boot_id,current_uptime_seconds:$current.host.uptime_seconds})
+            else empty end,
+            if ($old_vms | length) > 0 and $old_vms != $new_vms then
+                event("virtual_machine_set_changed"; {previous:$old_vms,current:$new_vms})
+            else empty end,
+            if ($container_oom_increments | length) > 0 then
+                event("docker_container_oom_kill"; {containers:$container_oom_increments})
+            else empty end,
+            if ($current.docker_containers.recent_oom_events // [] | length) > 0 then
+                event("docker_daemon_oom_event"; {
+                    containers:$current.docker_containers.recent_oom_events})
+            else empty end,
             if (($previous.moviemuse.id // "") != "")
                 and $previous.moviemuse.id != $current.moviemuse.id then
                 event("moviemuse_identity_change"; {
@@ -1249,7 +1564,7 @@ EVENTS_JSON="$(
                 and ($current.host.kernel_oom_signal.latest_signature // "") != ""
                 and $previous.host.kernel_oom_signal.latest_signature
                     != $current.host.kernel_oom_signal.latest_signature then
-                event("kernel_oom_signal_changed"; {
+                event("kernel_signal_changed"; {
                     kind:$current.host.kernel_oom_signal.latest_kind,
                     signature:$current.host.kernel_oom_signal.latest_signature
                 })
@@ -1264,6 +1579,45 @@ ALERTS_JSON="$(
         def alert($code; $severity; $value; $threshold):
             {code:$code,severity:$severity,value:$value,threshold:$threshold};
         [
+            $current.docker_containers.containers[]? as $container |
+            ($previous.docker_containers.containers // [] |
+                map(select(.id == $container.id)) | first // null) as $old |
+            select($old != null and ($old.oom_kill | type) == "number"
+                and ($container.oom_kill | type) == "number"
+                and $container.oom_kill > $old.oom_kill) |
+            {name:$container.name,increment:($container.oom_kill - $old.oom_kill)}
+        ] as $container_oom_increments |
+        [
+            if ($current.host.memory_total_bytes | type) == "number"
+                and $current.host.memory_total_bytes > 0
+                and ($current.host.memory_available_bytes | type) == "number"
+                and ($current.host.memory_available_bytes / $current.host.memory_total_bytes) < 0.10 then
+                alert("host_memory_available_low";"critical";$current.host.memory_available_bytes;
+                    ($current.host.memory_total_bytes * 0.10 | floor))
+            elif $state.host_low_memory_streak >= 3 then
+                alert("host_memory_available_low";"warning";$current.host.memory_available_bytes;
+                    ($current.host.memory_total_bytes * 0.20 | floor))
+            else empty end,
+            if ($current.host.vmstat_delta.oom_kill | type) == "number"
+                and $current.host.vmstat_delta.oom_kill > 0 then
+                alert("host_vmstat_oom_kill_increment";"critical";$current.host.vmstat_delta.oom_kill;0)
+            else empty end,
+            if ($container_oom_increments | length) > 0 then
+                alert("docker_container_oom_kill_increment";"critical";$container_oom_increments;[])
+            else empty end,
+            if ($current.docker_containers.recent_oom_events // [] | length) > 0 then
+                alert("docker_daemon_oom_event";"critical";
+                    $current.docker_containers.recent_oom_events;[])
+            else empty end,
+            if $state.host_iowait_streak >= 3 then
+                alert("host_iowait_sustained";"warning";$current.host.cpu.iowait_percent_since_previous;25)
+            else empty end,
+            if ($current.host.load.procs_blocked | type) == "number"
+                and $current.host.load.procs_blocked >= 32 then
+                alert("host_many_blocked_processes";"critical";$current.host.load.procs_blocked;32)
+            elif $state.host_blocked_streak >= 3 then
+                alert("host_many_blocked_processes";"warning";$current.host.load.procs_blocked;8)
+            else empty end,
             if $current.moviemuse.running != true then
                 alert("moviemuse_not_running";"critical";$current.moviemuse.running;true)
             else empty end,
@@ -1421,13 +1775,23 @@ ALERTS_JSON="$(
                 alert("sqlite_quick_check_failed";"critical";
                     $current.database.quick_check.status;"ok")
             else empty end,
-            if ($previous.host.kernel_oom_signal.latest_signature // "") != ""
-                and ($current.host.kernel_oom_signal.latest_signature // "") != ""
-                and $previous.host.kernel_oom_signal.latest_signature
-                    != $current.host.kernel_oom_signal.latest_signature
-                and $current.host.kernel_oom_signal.latest_kind == "global_candidate" then
+            if ((($previous.host.kernel_oom_signal.global_candidate_pattern_count | type) == "number"
+                    and ($current.host.kernel_oom_signal.global_candidate_pattern_count | type) == "number"
+                    and $current.host.kernel_oom_signal.global_candidate_pattern_count
+                        > $previous.host.kernel_oom_signal.global_candidate_pattern_count)
+                or (($previous.host.kernel_oom_signal.latest_signature // "") != ""
+                    and ($current.host.kernel_oom_signal.latest_signature // "") != ""
+                    and $previous.host.kernel_oom_signal.latest_signature
+                        != $current.host.kernel_oom_signal.latest_signature
+                    and $current.host.kernel_oom_signal.latest_kind == "global_candidate")) then
                 alert("host_global_oom_candidate";"critical";
                     $current.host.kernel_oom_signal.latest_signature;"unchanged")
+            elif ($previous.host.kernel_oom_signal.anomaly_pattern_count | type) == "number"
+                and ($current.host.kernel_oom_signal.anomaly_pattern_count | type) == "number"
+                and $current.host.kernel_oom_signal.anomaly_pattern_count
+                    > $previous.host.kernel_oom_signal.anomaly_pattern_count then
+                alert("host_kernel_anomaly";"critical";
+                    $current.host.kernel_oom_signal.latest_kind;"unchanged")
             else empty end
         ]
     '
@@ -1451,11 +1815,13 @@ FINAL_SAMPLE="$(
 
 if ! jq -e '
     type == "object"
-    and .schema_version == 1
+    and .schema_version == 2
     and .record_type == "health_sample"
     and (.epoch | type) == "number"
     and (.moviemuse | type) == "object"
     and (.flaresolverr | type) == "object"
+    and (.docker_containers | type) == "object"
+    and (.virtual_machines | type) == "object"
     and (.database | type) == "object"
     and (.alerts | type) == "array"
     and (.events | type) == "array"
@@ -1475,7 +1841,14 @@ NEW_ALERTS="$(
         [$current.alerts[] | select(.code as $code | ($old_codes | index($code) | not))]
     '
 )"
-IDENTITY_EVENT_COUNT="$(jq '[.events[] | select(.kind | endswith("_identity_change"))] | length' <<<"$FINAL_SAMPLE")"
+SIGNIFICANT_EVENT_COUNT="$(
+    jq '[.events[] | select(
+        (.kind | endswith("_identity_change")) or
+        (.kind == "sample_gap") or (.kind == "host_reboot") or
+        (.kind == "virtual_machine_set_changed") or
+        (.kind == "docker_container_oom_kill") or (.kind == "docker_daemon_oom_event")
+    )] | length' <<<"$FINAL_SAMPLE"
+)"
 NEW_ALERT_COUNT="$(jq 'length' <<<"$NEW_ALERTS")"
 
 if ! printf '%s\n' "$FINAL_SAMPLE" >>"$SAMPLES_DIR/health-$TODAY_UTC.jsonl"; then
@@ -1490,7 +1863,7 @@ if [[ "$(jq '.events | length' <<<"$FINAL_SAMPLE")" != "0" ]]; then
     fi
 fi
 
-if ((NEW_ALERT_COUNT > 0 || IDENTITY_EVENT_COUNT > 0)); then
+if ((NEW_ALERT_COUNT > 0 || SIGNIFICANT_EVENT_COUNT > 0)); then
     severity="$(
         jq -r '
             if any(.[]; .severity == "critical") then "critical"
@@ -1499,19 +1872,23 @@ if ((NEW_ALERT_COUNT > 0 || IDENTITY_EVENT_COUNT > 0)); then
             end
         ' <<<"$NEW_ALERTS"
     )"
-    primary_code="$(jq -r '.[0].code // "identity-change"' <<<"$NEW_ALERTS")"
+    primary_code="$(jq -r '.[0].code // empty' <<<"$NEW_ALERTS")"
+    if [[ -z "$primary_code" ]]; then
+        primary_code="$(jq -r '.events[0].kind // "monitor-event"' <<<"$FINAL_SAMPLE")"
+    fi
     primary_code="$(tr -cd 'A-Za-z0-9_.-' <<<"$primary_code")"
     [[ -n "$primary_code" ]] || primary_code="monitor-event"
     compact_timestamp="$(date -u +'%Y%m%dT%H%M%SZ')"
     incident_file="$INCIDENTS_DIR/incident-$compact_timestamp-$severity-$primary_code.json"
     [[ ! -e "$incident_file" ]] || incident_file="$INCIDENTS_DIR/incident-$compact_timestamp-$severity-$primary_code-$$.json"
     LOG_SUMMARY="$(log_summary_json)"
+    KERNEL_EVIDENCE="$(kernel_incident_evidence_json)"
     if jq -nc --arg schema_version "$SCHEMA_VERSION" \
         --arg incident_id "$(basename "$incident_file" .json)" \
         --arg timestamp "$NOW_ISO" --argjson epoch "$NOW_EPOCH" \
         --arg severity "$severity" --argjson triggers "$NEW_ALERTS" \
         --argjson current "$FINAL_SAMPLE" --argjson previous "$PREVIOUS_SAMPLE" \
-        --argjson log_summary "$LOG_SUMMARY" '
+        --argjson log_summary "$LOG_SUMMARY" --argjson kernel_evidence "$KERNEL_EVIDENCE" '
         {
             schema_version:($schema_version | tonumber),
             record_type:"incident",
@@ -1526,7 +1903,8 @@ if ((NEW_ALERT_COUNT > 0 || IDENTITY_EVENT_COUNT > 0)); then
                 if ($previous | type) == "object" and ($previous.timestamp // "") != ""
                 then $previous else null end
             ),
-            log_summary:$log_summary
+            log_summary:$log_summary,
+            kernel_evidence:$kernel_evidence
         }
     ' >"$STATE_DIR/.incident.$$.tmp"; then
         mv -f "$STATE_DIR/.incident.$$.tmp" "$incident_file" ||

@@ -45,6 +45,15 @@ monitoring-data/
 - SQLite/WAL/SHM 大小、事件数量、`worker_offline` 速率和 payload 大小。
 - `waiting_worker`、JavDB 开关、远程 worker 可用性。
 - `/proc/vmstat` 与 syslog 尾部的宿主 OOM 候选信号。
+- Unraid 宿主的 MemAvailable、cache/shmem/slab、dirty/writeback、页表、内核栈、
+  commit、负载、blocked process、CPU iowait 和内存回收/碎片整理计数。
+- boot ID、uptime、超过 150 秒的采样断档，以及重启前后独立 incident。
+- 宿主 RSS 前十进程，仅保存 PID、RSS 和进程类型，不保存完整命令行。
+- 所有运行中 Docker 容器的轻量 cgroup 内存/OOM 计数、Docker daemon OOM 事件，
+  以及内存前十容器。
+- 活动 libvirt VM 的配置内存、QEMU RSS、guest balloon 空闲/可用/swap 指标和
+  指标年龄；QEMU RSS 是宿主实时视角，过期 balloon 数据不会伪装成实时数据。
+- ZFS ARC（若存在）和 kernel hung task/lockup/I/O/hardware error 候选信号。
 - Docker cgroup 版本和 `no swap limit support` 能力提示；该能力检查只在 5 分钟深采样执行。
 
 进程命令行只在内存里用于分类，不写入样本；远程 worker token 通过 curl 标准输入提供，不出现在 curl 进程参数、样本或日志中。incident 只保存关键字计数，不复制原始 Docker 日志。
@@ -54,10 +63,12 @@ monitoring-data/
 必需命令：
 
 ```text
-bash docker sqlite3 curl flock jq awk grep sed stat find readlink
+bash docker sqlite3 curl flock jq awk grep sed stat find readlink ps head
 ```
 
-不依赖 Python。缺少必需命令时 collector 会明确退出，且不写伪造样本。
+不依赖 Python。`virsh` 是可选能力：缺少时 VM 字段明确输出
+`available=false`，其余采集继续执行。缺少必需命令时 collector 会明确退出，
+且不写伪造样本。
 
 当前现场默认值：
 
@@ -134,6 +145,11 @@ collector 使用 `flock -n`；上一轮未结束时直接跳过，并把跳过�
 | MovieMuse memory.current | `>1.2 GiB` | `>1.6 GiB` |
 | MovieMuse anon | `>800 MiB` | `>1.2 GiB` |
 | MovieMuse/Flare OOM 增量 | — | 任意增量 |
+| Unraid MemAvailable | `<20%` 持续 3 个样本 | `<10%` 任一样本 |
+| 宿主 `/proc/vmstat` OOM kill 增量 | — | 任意增量 |
+| 任意 Docker cgroup/daemon OOM | — | 任意增量/事件 |
+| 宿主 CPU iowait | `>=25%` 持续 3 个样本 | — |
+| blocked process | `>=8` 持续 3 个样本 | `>=32` 任一样本 |
 | `/health` | 单次只记录 | 连续 3 次失败 |
 | Flare session | `2` | `>=3` |
 | session=0 且 Chromium 存在 | 持续 10 个有效样本 | 持续 30 个有效样本 |
@@ -146,7 +162,13 @@ collector 使用 `flock -n`；上一轮未结束时直接跳过，并把跳过�
 
 远程 worker 离线本身是 warning；若同时发现 MovieMuse 本地重模型信号则升级为 critical。`javdb_source_enabled=false` 时发现 JavDB Chromium 也是 critical。
 
-宿主 syslog 的 `global_candidate` 只代表“发现新的宿主 OOM 模式行”，不能单独证明根因。复盘时必须与容器 ID、cgroup OOM 增量和 Unraid 完整系统日志交叉判断。
+宿主 syslog 的 `global_candidate` 只代表“发现新的宿主 OOM 模式行”，不能单独证明根因。复盘时必须与容器 ID、cgroup OOM 增量、VM RSS、全容器排名和 Unraid 完整系统日志交叉判断。
+
+当前现场把 syslog 镜像到 `/boot/logs/syslog`。重启或采样断档 incident 会优先从该
+持久文件保存最多 80 条相关 OOM/lockup/I/O/hardware error 行，不复制完整 syslog。
+如果 Unraid 物理机完全失去响应，本机 collector 也会停止；`sample_gap` 和 `boot_id`
+只能在恢复后证明断档/重启。要证明硬死机期间的不可达状态，需要另一台物理设备做
+ping/HTTP 探测或接收远程 syslog。同机 Docker/VM 不能充当独立见证者。
 
 ## 数据格式
 
@@ -154,10 +176,13 @@ collector 使用 `flock -n`；上一轮未结束时直接跳过，并把跳过�
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "record_type": "health_sample",
   "timestamp": "2026-07-21T01:23:00Z",
   "sample": {"deep": false, "duration_ms": 180},
+  "host": {},
+  "docker_containers": {},
+  "virtual_machines": {},
   "moviemuse": {},
   "flaresolverr": {},
   "database": {},
@@ -172,7 +197,8 @@ collector 使用 `flock -n`；上一轮未结束时直接跳过，并把跳过�
 
 ## 资源与安全限制
 
-- 单日普通样本达到 16 MiB 时停止继续写该日文件。
+- 单日普通样本达到 20 MiB 时停止继续写该日文件；按当前约 31 个容器、2 台 VM
+  估算约 16 MiB/天，14 天普通样本约 225 MiB。
 - 可用空间低于 128 MiB 时停止详细采样，只写有限错误记录。
 - 样本 14 天、事件和 incident 30 天；incident 最多 500 个。
 - 清理只使用已经校验且非 symlink 的固定子目录和严格文件名。
