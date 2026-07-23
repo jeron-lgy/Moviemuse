@@ -6,12 +6,15 @@
 - Unraid/Docker 部署：`deploy/unraid-frontend/`。
 - Windows 算力端：`run_worker.py` 与 `deploy/windows-backend/`。
 - Unraid 主机稳定性监控：`deploy/unraid-frontend/monitoring/`。它是独立的临时诊断工具，不进入 MovieMuse 容器；运行数据只能写入 `/mnt/user/appdata/moviemuse/monitoring-data/`。
+- Unraid 宿主机运维脚本：`ops/unraid/`。它不是第四个应用，也不属于 MovieMuse 或监控；目前用于管理 User Scripts 等宿主机自动化。
 - 新会话先读 `PROJECT_STRUCTURE.md`，用其中三个运行单元的表格判断代码和数据归属。
 
 ## 应用边界
 - MovieMuse Web 控制台、Windows 算力端、Unraid 主机监控是三个独立运行单元，业务改动和监控改动不要混在同一提交。
-- 本地仓库文件是三个运行单元的唯一开发源；禁止直接在 Unraid 上编辑监控或业务脚本。
+- `ops/unraid/` 只存放宿主机维护源码和说明，不把 Unraid 系统服务算作 MovieMuse 运行单元。
+- 本地仓库文件是所有业务、监控和运维脚本的唯一开发源；禁止直接在 Unraid 上编辑现场副本。
 - 同步监控脚本到 Unraid 与创建 User Scripts/cron 调度是两项独立外部变更，都需要用户明确授权。
+- 同步 `ops/unraid/` 脚本、修改 User Scripts 调度和清理宿主机文件同样是独立外部变更，必须分别核对授权和现场路径。
 - 监控第一版只观测和留证，不得 restart/stop/remove 容器、destroy FlareSolverr session、修改/VACUUM SQLite 或触碰媒体文件。
 
 ## 前端

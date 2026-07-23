@@ -15,6 +15,7 @@
 辅助集成：
 
 - `browser-extension/moviemuse_jellyfin/`：Jellyfin 浏览器扩展，不属于上述三个常驻运行单元。
+- `ops/unraid/`：Unraid 宿主机维护源码，例如 User Scripts。它不是第四个应用，也不属于 MovieMuse 监控；部署和调度属于独立的主机运维变更。
 - `tests/`：跨运行单元的本地自动化测试。
 - `assets/`：仓库文档图片等静态资料。
 - `Ref/`：参考资料，不是运行时代码入口。
@@ -79,10 +80,31 @@ deploy/unraid-frontend/monitoring/
 
 详细字段、阈值、验证和回滚见 `deploy/unraid-frontend/monitoring/README.md`。
 
+## Unraid 宿主机运维脚本
+
+```text
+ops/unraid/
+  README.md
+  user-scripts/
+    u_backup/
+      u_backup.sh
+      README.md
+      tests/
+```
+
+这类文件负责 Unraid 自身的维护动作，不是 MovieMuse 的第四个应用：
+
+- `ops/unraid/` 是唯一开发源，现场 User Scripts 目录只是部署副本。
+- 每个脚本独占一个目录，README 必须标明源码、现场路径、数据目录、调度、验证和回滚方法。
+- 运维脚本可以修改其明确拥有的宿主机目标，但不得顺带修改 MovieMuse、Windows worker 或稳定性监控。
+- 同步脚本、启停调度、执行清理是不同的外部状态变更；实施前分别核对授权。
+- 运维脚本与业务、Windows worker、监控改动使用独立提交。
+
 ## Git 边界
 
-- 业务修复、Windows worker、监控工具应尽量使用不同提交。
+- 业务修复、Windows worker、监控工具和宿主机运维脚本应尽量使用不同提交。
 - 监控专项提交只包含 `monitoring/`、本结构导航和必要说明/测试。
+- 宿主机运维提交只包含 `ops/unraid/`、必要的结构导航和对应测试。
 - `data/`、`docker-data/`、`monitoring-data/`、模型、媒体、SQLite、日志和构建产物都不提交。
 - 开始修改前检查 `git status --short --branch`；不得覆盖用户已有改动。
 - Unraid 现场副本不是开发分支，不允许从现场反向形成未记录源码。
