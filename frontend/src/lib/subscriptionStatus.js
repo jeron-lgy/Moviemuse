@@ -49,8 +49,8 @@ export function subscriptionStatus(item) {
   const status = String(item?.status || '').toLowerCase()
   const libraryStatus = String(item?.library_status || '').toLowerCase()
   if (washActive(item)) return 'wash_active'
-  if (status === 'in_library' || libraryStatus === 'in_library') return 'in_library'
   if (status === 'done') return 'done'
+  if (status === 'in_library' || libraryStatus === 'in_library') return 'in_library'
   return 'subscribed'
 }
 

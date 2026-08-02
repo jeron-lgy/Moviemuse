@@ -58,7 +58,7 @@
           </template>
 
           <template #actions>
-            <template v-if="item.status === 'in_library'">
+            <template v-if="item.status === 'in_library' || item.status === 'done'">
               <BaseButton variant="primary" type="button" :disabled="busyId === item.id" @click.stop="openWashDialog(item)">洗版</BaseButton>
               <BaseButton variant="danger" type="button" :disabled="busyId === item.id" @click.stop="removeAv(item)">取消</BaseButton>
             </template>

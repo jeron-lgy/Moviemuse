@@ -144,7 +144,7 @@
       <div class="panel-head">
         <div>
           <h2>Jellyfin</h2>
-          <p>订阅前查重，已入库的番号会自动切到已入库。读取媒体库前会先保存当前 Jellyfin 配置。</p>
+          <p>订阅前查重，媒体库已存在的番号会自动完成订阅。读取媒体库前会先保存当前 Jellyfin 配置。</p>
         </div>
         <div class="panel-actions">
           <BaseButton type="button" :disabled="loadingLibraries" @click="loadJellyfinLibraries">

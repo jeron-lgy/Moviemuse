@@ -2216,7 +2216,7 @@ def dashboard_payload() -> dict[str, Any]:
 
     pending = sum(1 for item in avs if item.get("status", "pending") == "pending")
     done = sum(1 for item in avs if item.get("status") == "done")
-    in_library = sum(1 for item in avs if item.get("status") == "in_library" or item.get("library_status") == "in_library")
+    in_library = sum(1 for item in avs if item.get("status") == "in_library")
     active_actresses = sum(1 for item in actresses if item.get("poll_enabled", True))
     duplicate_groups = len(result.groups)
     total_files = int(result.total_files or len(result.files))
@@ -6144,7 +6144,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                 "release_date": release_date,
                 "cover": saved.get("cover") or saved.get("cover_url") or "",
             })
-            if download and saved.get("status") != "in_library":
+            if download and not subscription_is_complete(saved):
                 download_av_from_mteam(saved)
         except Exception as exc:
             errors.append(f"{av_id}: {exc}")
@@ -6167,25 +6167,57 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
 
 
 def refresh_library_status_for_subscriptions(limit: int = 80) -> int:
-    service = get_subscription_service()
     changed = 0
-    items = [item for item in subscribed_avs_with_global_filter("library_refresh") if item.get("status") != "in_library"][:limit]
+    items = [item for item in subscribed_avs_with_global_filter("library_refresh") if str(item.get("status") or "") != "done"][:limit]
     for item in items:
         updated = refresh_subscription_library_status(item)
-        if updated.get("status") == "in_library":
+        if str(updated.get("status") or "") == "done" and str(item.get("status") or "") != "done":
             changed += 1
     if changed:
-        app_log("info", "jellyfin", "刷新订阅入库状态完成", {"stage": "jellyfin_refresh_done", "changed": changed})
+        app_log("info", "jellyfin", "刷新订阅完成状态完成", {"stage": "jellyfin_refresh_done", "changed": changed})
+    return changed
+
+
+def reconcile_local_subscription_states(limit: int = 500) -> int:
+    changed = 0
+    items = [
+        item for item in get_subscription_service().get_subscribed_av()
+        if str(item.get("status") or "pending") in {"pending", "in_library"}
+    ][:limit]
+    for item in items:
+        before = (
+            str(item.get("status") or ""),
+            str(item.get("download_status") or ""),
+            str(item.get("download_message") or ""),
+        )
+        updated, handled = reconcile_subscription_existing_media(item)
+        after = (
+            str(updated.get("status") or ""),
+            str(updated.get("download_status") or ""),
+            str(updated.get("download_message") or ""),
+        )
+        if handled and after != before:
+            changed += 1
     return changed
 
 
 def download_pending_subscriptions() -> dict[str, Any]:
     items = [
         item for item in subscribed_avs_with_global_filter("bulk_download")
-        if item.get("status", "pending") == "pending"
-        and str(item.get("download_status") or "") not in {"completed", "downloaded", "waiting_worker", "processing"}
+        if str(item.get("status") or "pending") in {"pending", "in_library"}
     ]
-    priority = {"error": 0, "not_found": 1, "": 2, "searching": 3, "downloading": 4}
+    priority = {
+        "error": 0,
+        "dedupe_error": 1,
+        "not_found": 2,
+        "": 3,
+        "queued": 4,
+        "searching": 5,
+        "downloading": 6,
+        "downloaded": 7,
+        "waiting_worker": 8,
+        "processing": 9,
+    }
     items.sort(key=lambda item: (priority.get(str(item.get("download_status") or ""), 5), float(item.get("subscribed_at") or 0)))
     app_log("info", "download", "开始一键下载订阅中番号", {"stage": "bulk_download_start", "count": len(items)})
     results: list[dict[str, Any]] = []
@@ -6214,7 +6246,7 @@ def download_pending_subscriptions() -> dict[str, Any]:
         })
     sent = len([item for item in results if item.get("status") in {"ok", "exists", "sent"}])
     not_found = len([item for item in results if item.get("status") == "not_found"])
-    failed = len([item for item in results if item.get("status") in {"error", "failed", "conflict"}])
+    failed = len([item for item in results if item.get("status") in {"error", "failed", "conflict", "dedupe_error", "existing_failed"}])
     active = len([item for item in results if item.get("status") == "active"])
     app_log("info", "download", "一键下载完成", {
         "stage": "bulk_download_done",
@@ -6746,44 +6778,351 @@ def cron_part_matches(part: str, value: int) -> bool:
         return False
 
 
-def apply_jellyfin_status(av: dict[str, Any]) -> None:
+def subscription_is_complete(av: dict[str, Any]) -> bool:
+    return str(av.get("status") or "") in {"done", "in_library"}
+
+
+def inferred_record_av_id(record: dict[str, Any]) -> str:
+    direct_value = record.get("av_id") if "av_id" in record else record.get("id")
+    direct = canonical_av_id(direct_value)
+    if direct:
+        return direct
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    candidates = [
+        record.get("path"),
+        record.get("input_path"),
+        record.get("output_path"),
+        record.get("content_path"),
+        data.get("mteam_keyword"),
+        data.get("selected_torrent_title"),
+        data.get("qb_name"),
+        data.get("title"),
+    ]
+    for candidate in candidates:
+        detected = detect_catalog_number(str(candidate or ""))
+        if detected:
+            return canonical_av_id(detected)
+    return ""
+
+
+def record_matches_av_id(record: dict[str, Any], av_id: str) -> bool:
+    target = canonical_av_id(av_id)
+    if not target:
+        return False
+    if inferred_record_av_id(record) == target:
+        return True
+    compact_target = re.sub(r"[^A-Z0-9]", "", target)
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    candidates = [
+        record.get("path"),
+        record.get("input_path"),
+        record.get("output_path"),
+        record.get("content_path"),
+        data.get("mteam_keyword"),
+        data.get("selected_torrent_title"),
+        data.get("qb_name"),
+    ]
+    for candidate in candidates:
+        compact_candidate = re.sub(r"[^A-Z0-9]", "", str(candidate or "").upper())
+        if compact_target and compact_target in compact_candidate:
+            return True
+    return False
+
+
+def active_media_version_for_av(av_id: str) -> dict[str, Any] | None:
+    target = canonical_av_id(av_id)
+    if not target:
+        return None
+    post = get_postprocess_service()
+    direct = post.active_version(target)
+    if direct and Path(str(direct.get("path") or "")).is_file():
+        return direct
+    for version in post.list_versions(limit=500):
+        if str(version.get("status") or "") != "active":
+            continue
+        if not record_matches_av_id(version, target):
+            continue
+        if Path(str(version.get("path") or "")).is_file():
+            return version
+    return None
+
+
+def managed_output_file_for_av(av_id: str) -> str:
+    target = canonical_av_id(av_id)
+    if not target:
+        return ""
+    output_root = Path(str(get_postprocess_service().get_settings().get("output_dir") or "/media/压制"))
+    movie_dir = output_root / target
+    if not movie_dir.is_dir():
+        return ""
+    candidates: list[Path] = []
+    try:
+        for path in movie_dir.iterdir():
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                candidates.append(path)
+    except OSError:
+        return ""
+    if not candidates:
+        return ""
+    matching = [path for path in candidates if record_matches_av_id({"path": str(path)}, target)]
+    choices = matching or candidates
+    try:
+        return str(max(choices, key=lambda path: path.stat().st_size))
+    except OSError:
+        return ""
+
+
+def related_postprocess_task_for_av(av_id: str) -> dict[str, Any] | None:
+    target = canonical_av_id(av_id)
+    if not target:
+        return None
+    terminal = {"completed", "failed", "ignored", "expired", "conflict"}
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for task in get_postprocess_service().list_tasks(limit=500):
+        if not record_matches_av_id(task, target):
+            continue
+        status = str(task.get("status") or "")
+        has_acquisition = bool(task.get("torrent_hash") or task.get("input_path") or task.get("output_path"))
+        if status not in terminal and has_acquisition:
+            candidates.append((0, task))
+        elif status == "completed":
+            candidates.append((1, task))
+        elif status in {"failed", "conflict"} and has_acquisition:
+            candidates.append((2, task))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], -float(item[1].get("updated_at") or 0)))
+    return candidates[0][1]
+
+
+SUBSCRIPTION_MEDIA_AVAILABLE_TASK_STATUSES = {
+    "waiting_worker",
+    "ready_to_run",
+    "dispatching",
+    "sent_to_worker",
+    "transcoding",
+    "worker_done",
+    "transcode_validating",
+    "transcode_done",
+    "subtitle_processing",
+    "subtitle_validating",
+    "jellyfin_refreshing",
+}
+
+
+def task_owned_input_media_path(task: dict[str, Any] | None) -> str:
+    if not task or str(task.get("task_type") or "") not in {"subscription", "external_qb"}:
+        return ""
+    input_path = str(task.get("input_path") or "").strip()
+    if not input_path or not record_matches_av_id(task, str(task.get("av_id") or "")):
+        return ""
+    return input_path if Path(input_path).is_file() else ""
+
+
+def subscription_task_media_path(task: dict[str, Any] | None) -> str:
+    if str((task or {}).get("status") or "") not in SUBSCRIPTION_MEDIA_AVAILABLE_TASK_STATUSES:
+        return ""
+    return task_owned_input_media_path(task)
+
+
+def update_subscription_record(av: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if all(av.get(key) == value for key, value in payload.items()):
+        return {**av, **payload}
+    av_id = str(av.get("id") or "")
+    saved = get_subscription_service().update_av_download(av_id, payload)
+    if saved:
+        return saved
+    return {**av, **payload}
+
+
+def mark_subscription_completed(
+    av: dict[str, Any],
+    *,
+    path: str = "",
+    message: str,
+    jellyfin_item_id: str = "",
+    jellyfin_item_name: str = "",
+    download_status: str = "completed",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "done",
+        "library_status": "in_library",
+        "download_status": download_status,
+        "download_message": message,
+        "downloaded_at": float(av.get("downloaded_at") or time.time()),
+    }
+    if path:
+        payload["jellyfin_path"] = path
+    if jellyfin_item_id:
+        payload["jellyfin_item_id"] = jellyfin_item_id
+    if jellyfin_item_name:
+        payload["jellyfin_item_name"] = jellyfin_item_name
+    return update_subscription_record(av, payload)
+
+
+def reconcile_subscription_existing_media(av: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    av_id = str(av.get("id") or "")
+    if str(av.get("status") or "") == "in_library":
+        updated = mark_subscription_completed(
+            av,
+            path=str(av.get("jellyfin_path") or ""),
+            message=str(av.get("download_message") or "媒体库已存在，订阅已完成"),
+            jellyfin_item_id=str(av.get("jellyfin_item_id") or ""),
+            jellyfin_item_name=str(av.get("jellyfin_item_name") or ""),
+        )
+        return updated, {"av_id": av_id, "status": "completed", "message": updated.get("download_message", "")}
+
+    version = active_media_version_for_av(av_id)
+    if version:
+        path = str(version.get("path") or "")
+        updated = mark_subscription_completed(av, path=path, message="MovieMuse 已有可用媒体版本，订阅已完成")
+        return updated, {
+            "av_id": av_id,
+            "status": "completed",
+            "message": updated.get("download_message", ""),
+            "version_id": version.get("id", ""),
+            "path": path,
+        }
+
+    managed_path = managed_output_file_for_av(av_id)
+    if managed_path:
+        updated = mark_subscription_completed(av, path=managed_path, message="MovieMuse 托管目录已存在媒体文件，订阅已完成")
+        return updated, {
+            "av_id": av_id,
+            "status": "completed",
+            "message": updated.get("download_message", ""),
+            "path": managed_path,
+        }
+
+    task = related_postprocess_task_for_av(av_id)
+    if not task:
+        return av, None
+    task_status = str(task.get("status") or "")
+    acquired_path = subscription_task_media_path(task)
+    if acquired_path:
+        download_status, task_message = subscription_task_download_state(task_status) or (
+            "downloaded",
+            "媒体文件已下载，等待后处理",
+        )
+        updated = mark_subscription_completed(
+            av,
+            path=acquired_path,
+            message=f"媒体文件已可用；{task_message}",
+            download_status=download_status,
+        )
+        return updated, {
+            "av_id": av_id,
+            "status": "completed",
+            "message": updated.get("download_message", ""),
+            "task_id": task.get("id", ""),
+            "path": acquired_path,
+            "postprocess_status": task_status,
+        }
+    if task_status == "completed":
+        output_path = str(task.get("output_path") or "")
+        if output_path and Path(output_path).is_file():
+            updated = mark_subscription_completed(av, path=output_path, message="同番号后处理任务已完成，订阅已完成")
+            return updated, {
+                "av_id": av_id,
+                "status": "completed",
+                "message": updated.get("download_message", ""),
+                "task_id": task.get("id", ""),
+                "path": output_path,
+            }
+        message = "同番号后处理任务标记完成，但成品文件不存在，请先检查后处理记录"
+        updated = update_subscription_record(av, {"download_status": "error", "download_message": message})
+        return updated, {"av_id": av_id, "status": "existing_failed", "message": message, "task_id": task.get("id", "")}
+    if task_status not in {"failed", "ignored", "expired", "conflict"}:
+        updated = sync_subscription_task_state(task) or av
+        return updated, {
+            "av_id": av_id,
+            "status": "active",
+            "message": str(updated.get("download_message") or "同番号已有下载或后处理任务"),
+            "task_id": task.get("id", ""),
+        }
+    message = str(task.get("error_message") or "同番号已有失败的后处理任务，请从后处理任务重试")
+    updated = update_subscription_record(av, {
+        "download_status": "error",
+        "download_message": f"已有同番号后处理任务失败：{message}",
+        "qb_hash": str(task.get("torrent_hash") or av.get("qb_hash") or ""),
+    })
+    return updated, {
+        "av_id": av_id,
+        "status": "existing_failed",
+        "message": updated.get("download_message", ""),
+        "task_id": task.get("id", ""),
+        "error_code": task.get("error_code", ""),
+    }
+
+
+def apply_jellyfin_status(av: dict[str, Any]) -> dict[str, Any]:
     jellyfin = get_system_settings_service().get().get("jellyfin", {})
     if not jellyfin.get("dedupe_enabled", True):
         app_log("info", "jellyfin", "跳过 Jellyfin 查重：未启用", {"stage": "jellyfin_skip", "av_id": av.get("id", "")})
-        return
+        return {"status": "disabled"}
     app_log("info", "jellyfin", "开始 Jellyfin 查重", {
         "stage": "jellyfin_start",
         "av_id": av.get("id", ""),
         "library": jellyfin.get("library_name") or jellyfin.get("library_id") or "全部媒体库",
     })
-    match = find_jellyfin_match(str(av.get("id") or ""), str(av.get("title") or ""), jellyfin)
+    try:
+        match = find_jellyfin_match(
+            str(av.get("id") or ""),
+            str(av.get("title") or ""),
+            jellyfin,
+            raise_errors=True,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        app_log("error", "jellyfin", "Jellyfin 查重失败，暂停 MTeam 下载", {
+            "stage": "jellyfin_lookup_error",
+            "av_id": av.get("id", ""),
+            "error": message,
+        })
+        return {"status": "error", "message": message}
     if not match:
         app_log("info", "jellyfin", "Jellyfin 未入库", {"stage": "jellyfin_miss", "av_id": av.get("id", "")})
-        return
-    av["status"] = "in_library"
+        return {"status": "not_found"}
+    av["status"] = "done"
     av["library_status"] = "in_library"
+    av["download_status"] = "completed"
+    av["download_message"] = "Jellyfin 已存在，订阅已完成"
+    av["downloaded_at"] = float(av.get("downloaded_at") or time.time())
     av["jellyfin_item_id"] = match.get("id", "")
     av["jellyfin_item_name"] = match.get("name", "")
     av["jellyfin_path"] = match.get("path", "")
-    app_log("info", "jellyfin", "Jellyfin 查重命中，标记已入库", {"av_id": av.get("id", ""), "item": match.get("name", ""), "path": match.get("path", "")})
+    app_log("info", "jellyfin", "Jellyfin 查重命中，订阅标记已完成", {"av_id": av.get("id", ""), "item": match.get("name", ""), "path": match.get("path", "")})
+    return {"status": "found", "match": match}
 
 
-def refresh_subscription_library_status(av: dict[str, Any]) -> dict[str, Any]:
+def refresh_subscription_library_status(av: dict[str, Any], *, include_existing: bool = True) -> dict[str, Any]:
+    if include_existing:
+        reconciled, handled = reconcile_subscription_existing_media(av)
+        if handled:
+            return reconciled
     probe = dict(av)
-    apply_jellyfin_status(probe)
-    if probe.get("status") == "in_library":
-        saved = get_subscription_service().update_av_download(str(probe.get("id") or ""), {
-            "status": "in_library",
+    lookup = apply_jellyfin_status(probe)
+    if lookup.get("status") == "error":
+        return update_subscription_record(av, {
+            "download_status": "dedupe_error",
+            "download_message": f"Jellyfin 查重失败，已暂停下载：{lookup.get('message') or '连接异常'}",
+        })
+    if probe.get("status") == "done" and probe.get("library_status") == "in_library":
+        saved = update_subscription_record(av, {
+            "status": "done",
             "library_status": "in_library",
+            "download_status": "completed",
+            "download_message": probe.get("download_message", "Jellyfin 已存在，订阅已完成"),
+            "downloaded_at": probe.get("downloaded_at", time.time()),
             "jellyfin_item_id": probe.get("jellyfin_item_id", ""),
             "jellyfin_item_name": probe.get("jellyfin_item_name", ""),
             "jellyfin_path": probe.get("jellyfin_path", ""),
         })
-        if str(av.get("status") or "") != "in_library":
+        if not subscription_is_complete(av):
             send_notification_event("jellyfin_in_library", {
-                "status": "in_library",
+                "status": "completed",
                 "title": str(probe.get("title") or probe.get("id") or ""),
-                "detail": f"{probe.get('id', '')} 已在 Jellyfin 媒体库中",
+                "detail": f"{probe.get('id', '')} 已在 Jellyfin 媒体库中，订阅已完成",
                 "av_id": probe.get("id", ""),
                 "path": probe.get("jellyfin_path", ""),
                 "file_name": notification_filename(probe.get("jellyfin_path"), str(probe.get("id") or "")),
@@ -6798,6 +7137,66 @@ def wash_task_type(mode: str) -> str:
     return "wash_4k" if mode == "4k" else "wash_chinese"
 
 
+def ensure_wash_supersede_version(av: dict[str, Any]) -> dict[str, Any]:
+    post = get_postprocess_service()
+    av_id = canonical_av_id(av.get("id"))
+    active = active_media_version_for_av(av_id)
+    if active and canonical_av_id(active.get("av_id")) == av_id:
+        return active
+
+    acquisition_task = related_postprocess_task_for_av(av_id)
+    acquired_input_path = task_owned_input_media_path(acquisition_task)
+    source_path = str(
+        (active or {}).get("path")
+        or av.get("jellyfin_path")
+        or managed_output_file_for_av(av_id)
+        or acquired_input_path
+        or ""
+    ).strip()
+    if not source_path:
+        raise HTTPException(status_code=409, detail="未定位到当前媒体文件，无法创建洗版任务")
+    source = Path(source_path)
+    output_root = Path(str(post.get_settings().get("output_dir") or "/media/压制"))
+    if not source.is_file():
+        raise HTTPException(status_code=409, detail="当前媒体文件不存在，无法创建洗版任务")
+    task_owns_source = bool(
+        acquired_input_path
+        and source.resolve() == Path(acquired_input_path).resolve()
+    )
+    if not path_under(source, output_root) and not task_owns_source:
+        raise HTTPException(status_code=409, detail="当前媒体文件不在 MovieMuse 托管输出目录，拒绝自动替换")
+    if active and str(active.get("generated_by") or "") != "moviemuse":
+        raise HTTPException(status_code=409, detail="当前媒体版本不是 MovieMuse 托管版本，拒绝自动替换")
+
+    stat = source.stat()
+    registered = post.add_version(
+        av_id=av_id,
+        path=str(source),
+        source_type=str((active or {}).get("source_type") or (acquisition_task or {}).get("task_type") or "jellyfin"),
+        codec=str((active or {}).get("codec") or ""),
+        has_chinese_subtitle=bool((active or {}).get("has_chinese_subtitle")),
+        status="active",
+        generated_by="moviemuse",
+        file_size=int((active or {}).get("file_size") or stat.st_size),
+        file_hash=str((active or {}).get("file_hash") or ""),
+        mtime=float((active or {}).get("mtime") or stat.st_mtime),
+        metadata={
+            "registered_from": "wash_request",
+            "legacy_version_id": str((active or {}).get("id") or ""),
+            "jellyfin_item_id": str(av.get("jellyfin_item_id") or ""),
+            "acquisition_task_id": str((acquisition_task or {}).get("id") or ""),
+        },
+    )
+    app_log("info", "postprocess", "洗版旧文件已登记到版本链", {
+        "stage": "wash_supersede_registered",
+        "av_id": av_id,
+        "version_id": registered.get("id", ""),
+        "path": str(source),
+        "legacy_version_id": str((active or {}).get("id") or ""),
+    })
+    return registered
+
+
 def ensure_wash_postprocess_task(av: dict[str, Any], mode: str) -> dict[str, Any]:
     service = get_subscription_service()
     post = get_postprocess_service()
@@ -6805,9 +7204,32 @@ def ensure_wash_postprocess_task(av: dict[str, Any], mode: str) -> dict[str, Any
     wash = av.get("wash") if isinstance(av.get("wash"), dict) else {}
     task_id = str(wash.get("task_id") or "")
     existing = post.get_task(task_id) if task_id else None
+    if existing and str(existing.get("task_type") or "") != wash_task_type(mode):
+        if not postprocess_task_is_terminal(existing):
+            post.update_task(
+                task_id,
+                status="ignored",
+                error_code="wash_mode_changed",
+                error_message="洗版目标已变更，旧任务停止跟踪",
+            )
+        existing = None
     if existing and existing.get("status") not in {"completed", "expired", "ignored"}:
-        return existing
-    active = post.active_version(av_id)
+        if existing.get("supersede_version_id") and existing.get("supersede_path"):
+            return existing
+        active = ensure_wash_supersede_version(av)
+        updated = post.update_task(
+            task_id,
+            supersede_version_id=str(active.get("id") or ""),
+            supersede_path=str(active.get("path") or ""),
+        )
+        service.update_av_wash(av_id, {
+            "mode": mode,
+            "status": str(wash.get("status") or "requested"),
+            "task_id": task_id,
+            "old_path": str(active.get("path") or ""),
+        })
+        return updated or existing
+    active = ensure_wash_supersede_version(av)
     task = post.create_task(
         av_id=av_id,
         task_type=wash_task_type(mode),
@@ -6822,6 +7244,7 @@ def ensure_wash_postprocess_task(av: dict[str, Any], mode: str) -> dict[str, Any
         "mode": mode,
         "status": str(wash.get("status") or "requested"),
         "task_id": task["id"],
+        "old_path": str(active.get("path") or ""),
     })
     app_log("info", "postprocess", "洗版后处理任务已创建", {
         "stage": "postprocess_wash_task_created",
@@ -6877,29 +7300,35 @@ def subscription_download_lock(av_id: str) -> threading.RLock:
         return lock
 
 
+SUBSCRIPTION_TASK_DOWNLOAD_STATES = {
+    "mteam_searching": ("searching", "正在搜索 MTeam 资源"),
+    "torrent_pushed": ("downloading", "已推送 qBittorrent，等待下载"),
+    "downloading": ("downloading", "qBittorrent 正在下载"),
+    "waiting_worker": ("waiting_worker", "下载完成，等待算力端"),
+    "waiting_input": ("downloaded", "qBittorrent 已完成，等待确认输入文件"),
+    "ready_to_run": ("downloaded", "下载完成，等待后处理"),
+    "dispatching": ("processing", "正在派发后处理任务"),
+    "sent_to_worker": ("processing", "算力端正在处理"),
+    "transcoding": ("processing", "正在转码"),
+    "worker_done": ("processing", "算力端处理完成，正在校验"),
+    "transcode_validating": ("processing", "正在校验转码结果"),
+    "transcode_done": ("processing", "转码完成，正在处理字幕"),
+    "subtitle_processing": ("processing", "正在生成字幕"),
+    "subtitle_validating": ("processing", "正在校验字幕"),
+    "jellyfin_refreshing": ("processing", "正在刷新 Jellyfin"),
+    "completed": ("completed", "后处理完成"),
+}
+
+
+def subscription_task_download_state(task_status: str) -> tuple[str, str] | None:
+    return SUBSCRIPTION_TASK_DOWNLOAD_STATES.get(str(task_status or ""))
+
+
 def sync_subscription_task_state(task: dict[str, Any]) -> dict[str, Any] | None:
-    if str(task.get("task_type") or "") != "subscription":
+    if str(task.get("task_type") or "") not in {"subscription", "external_qb"}:
         return None
     task_status = str(task.get("status") or "")
-    status_map = {
-        "mteam_searching": ("searching", "正在搜索 MTeam 资源"),
-        "torrent_pushed": ("downloading", "已推送 qBittorrent，等待下载"),
-        "downloading": ("downloading", "qBittorrent 正在下载"),
-        "waiting_worker": ("waiting_worker", "下载完成，等待算力端"),
-        "waiting_input": ("downloaded", "qBittorrent 已完成，等待确认输入文件"),
-        "ready_to_run": ("downloaded", "下载完成，等待后处理"),
-        "dispatching": ("processing", "正在派发后处理任务"),
-        "sent_to_worker": ("processing", "算力端正在处理"),
-        "transcoding": ("processing", "正在转码"),
-        "worker_done": ("processing", "算力端处理完成，正在校验"),
-        "transcode_validating": ("processing", "正在校验转码结果"),
-        "transcode_done": ("processing", "转码完成，正在处理字幕"),
-        "subtitle_processing": ("processing", "正在生成字幕"),
-        "subtitle_validating": ("processing", "正在校验字幕"),
-        "jellyfin_refreshing": ("processing", "正在刷新 Jellyfin"),
-        "completed": ("completed", "后处理完成"),
-    }
-    mapped = status_map.get(task_status)
+    mapped = subscription_task_download_state(task_status)
     if not mapped:
         if task_status in {"failed", "conflict"}:
             mapped = ("error", str(task.get("error_message") or "下载或后处理失败"))
@@ -6917,8 +7346,26 @@ def sync_subscription_task_state(task: dict[str, Any]) -> dict[str, Any] | None:
     if task.get("torrent_hash"):
         if str(current.get("qb_hash") or "") != str(task.get("torrent_hash") or ""):
             payload["qb_hash"] = task.get("torrent_hash")
-    if task_status == "completed" and str(current.get("status") or "") != "done":
-        payload.update({"status": "done", "downloaded_at": time.time()})
+    acquired_path = subscription_task_media_path(task)
+    if acquired_path:
+        if str(current.get("status") or "") != "done":
+            payload["status"] = "done"
+        if str(current.get("library_status") or "") != "in_library":
+            payload["library_status"] = "in_library"
+        if str(current.get("jellyfin_path") or "") != acquired_path:
+            payload["jellyfin_path"] = acquired_path
+        if not current.get("downloaded_at"):
+            payload["downloaded_at"] = time.time()
+    if task_status == "completed":
+        payload.update({
+            "status": "done",
+            "library_status": "in_library",
+            "download_status": "completed",
+            "download_message": "后处理完成",
+            "downloaded_at": time.time(),
+        })
+        if task.get("output_path"):
+            payload["jellyfin_path"] = task.get("output_path")
     if not payload:
         return None
     return service.update_av_download(av_id, payload)
@@ -6947,6 +7394,30 @@ def bind_qb_to_postprocess_task(task: dict[str, Any], qb_result: dict[str, Any],
     task_id = str(task.get("id") or "")
     existing_qb = post.get_qb_torrent(torrent_hash)
     if existing_qb and str(existing_qb.get("task_id") or "") != task_id:
+        existing_task = post.get_task(str(existing_qb.get("task_id") or ""))
+        current_av_id = inferred_record_av_id(task)
+        existing_av_id = inferred_record_av_id(existing_task or existing_qb)
+        if current_av_id and current_av_id == existing_av_id:
+            message = "同番号种子已由现有后处理任务接管，复用现有任务状态"
+            post.update_task(
+                task_id,
+                status="ignored",
+                error_code="same_av_qb_reused",
+                error_message=message,
+            )
+            post.add_event(task_id, "info", "same_av_qb_reused", message, {
+                "torrent_hash": torrent_hash,
+                "existing_task_id": existing_qb.get("task_id", ""),
+                "existing_av_id": existing_av_id,
+                "current_task_id": task_id,
+                "current_av_id": current_av_id,
+            })
+            return {
+                "status": "reused",
+                "reason": "same_av_qb_reused",
+                "existing": existing_qb,
+                "existing_task": existing_task or {},
+            }
         post.update_task(
             task_id,
             status="conflict",
@@ -7037,10 +7508,24 @@ def _download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = 
         result["message"] = "缺少番号"
         return result
     if save_to_subscription:
-        av = refresh_subscription_library_status(av)
-    if str(av.get("status") or "") == "in_library":
-        result.update({"status": "skipped", "message": "Jellyfin 已入库，跳过下载"})
-        app_log("info", "download", "跳过下载：Jellyfin 已入库", {"stage": "download_skip_library", "av_id": av_id})
+        av, existing_result = reconcile_subscription_existing_media(av)
+        if existing_result:
+            app_log("info", "download", "复用同番号现有媒体或后处理状态，跳过重复下载", {
+                "stage": "download_reuse_existing",
+                "av_id": av_id,
+                "status": existing_result.get("status", ""),
+                "task_id": existing_result.get("task_id", ""),
+                "version_id": existing_result.get("version_id", ""),
+            })
+            return existing_result
+        av = refresh_subscription_library_status(av, include_existing=False)
+        if str(av.get("download_status") or "") == "dedupe_error":
+            message = str(av.get("download_message") or "Jellyfin 查重失败，已暂停下载")
+            result.update({"status": "dedupe_error", "message": message})
+            return result
+    if subscription_is_complete(av):
+        result.update({"status": "completed", "message": "媒体库已存在，跳过下载"})
+        app_log("info", "download", "跳过下载：订阅已完成", {"stage": "download_skip_library", "av_id": av_id})
         return result
     verification = actor_limit_verification(av, context="mteam_download")
     if not verification["ok"]:
@@ -7166,6 +7651,22 @@ def _download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = 
         if post_task:
             bind_result = bind_qb_to_postprocess_task(post_task, qb_result, qb_config)
         qb_status = str(qb_result.get("status") or "ok")
+        if bind_result.get("status") == "reused":
+            updated, existing_result = reconcile_subscription_existing_media(av)
+            existing_result = existing_result or {
+                "av_id": av_id,
+                "status": "active",
+                "message": "同番号种子已由现有后处理任务接管",
+            }
+            app_log("info", "download", "同番号 qB 种子已存在，复用现有后处理任务", {
+                "stage": "download_qb_same_av_reused",
+                "av_id": av_id,
+                "torrent_id": torrent_id,
+                "hash": qb_result.get("hash", ""),
+                "existing_task_id": bind_result.get("existing", {}).get("task_id", ""),
+                "status": existing_result.get("status", ""),
+            })
+            return {**existing_result, "subscription": updated, "torrent": torrent}
         if bind_result.get("status") == "conflict":
             message = "qB torrent_hash 已绑定到其他后处理任务"
             if save_to_subscription:
@@ -7400,6 +7901,32 @@ def download_wash_from_mteam(av: dict[str, Any], mode: str) -> dict[str, Any]:
         if post_task:
             bind_result = bind_qb_to_postprocess_task(post_task, qb_result, qb_config)
         qb_status = str(qb_result.get("status") or "ok")
+        if bind_result.get("status") == "reused":
+            message = "匹配到的洗版种子已由同番号现有任务使用，等待新的洗版资源"
+            saved = service.update_av_wash(av_id, {
+                "mode": mode,
+                "status": "requested",
+                "download_status": "waiting",
+                "download_message": message,
+                "mteam_torrent_id": torrent_id,
+                "mteam_torrent_title": torrent_title,
+                "qb_hash": qb_result.get("hash", ""),
+                "task_id": post_task["id"],
+                "last_checked_at": time.time(),
+            })
+            get_postprocess_service().update_task(
+                post_task["id"],
+                status="mteam_not_found",
+                error_code="same_av_qb_reused",
+                error_message=message,
+            )
+            return {
+                "av_id": av_id,
+                "status": "not_found",
+                "message": message,
+                "torrent": torrent,
+                "subscription": saved,
+            }
         if bind_result.get("status") == "conflict":
             message = "qB torrent_hash 已绑定到其他后处理任务"
             saved = service.update_av_wash(av_id, {
@@ -9666,8 +10193,10 @@ def validate_and_activate_postprocess_task(
     elif source_type == "subscription":
         get_subscription_service().update_av_download(str(task.get("av_id") or ""), {
             "status": "done",
+            "library_status": "in_library",
             "download_status": "completed",
             "download_message": user_message,
+            "jellyfin_path": product_path,
             "downloaded_at": time.time(),
         })
     av_id_for_notice = str(task.get("av_id") or "")
@@ -9949,8 +10478,14 @@ def normalized_media_path_is_under(path_value: str, root_value: str) -> bool:
     return path_norm == root_norm or path_norm.startswith(root_norm + "/")
 
 
-def find_jellyfin_match(av_id: str, title: str, config: dict[str, Any]) -> dict[str, str] | None:
-    matches = find_jellyfin_matches(av_id, title, config)
+def find_jellyfin_match(
+    av_id: str,
+    title: str,
+    config: dict[str, Any],
+    *,
+    raise_errors: bool = False,
+) -> dict[str, str] | None:
+    matches = find_jellyfin_matches(av_id, title, config, raise_errors=raise_errors)
     return matches[0] if matches else None
 
 
@@ -9969,7 +10504,23 @@ def refresh_jellyfin_library(config: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
-def find_jellyfin_matches(av_id: str, title: str, config: dict[str, Any]) -> list[dict[str, str]]:
+def jellyfin_lookup_error_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"Jellyfin API 返回 HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "Jellyfin API 请求超时"
+    if isinstance(exc, httpx.HTTPError):
+        return f"Jellyfin API 连接失败：{type(exc).__name__}"
+    return f"Jellyfin API 响应异常：{type(exc).__name__}"
+
+
+def find_jellyfin_matches(
+    av_id: str,
+    title: str,
+    config: dict[str, Any],
+    *,
+    raise_errors: bool = False,
+) -> list[dict[str, str]]:
     base_url = str(config.get("url") or "").strip().rstrip("/")
     api_key = str(config.get("api_key") or "").strip()
     if not base_url or not api_key or not av_id:
@@ -10011,7 +10562,9 @@ def find_jellyfin_matches(av_id: str, title: str, config: dict[str, Any]) -> lis
                         if key and key not in seen:
                             seen.add(key)
                             matches.append({"id": item_id, "name": name, "path": path_value})
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as exc:
+        if raise_errors:
+            raise RuntimeError(jellyfin_lookup_error_message(exc)) from exc
         return []
     return matches
 
@@ -11439,7 +11992,7 @@ async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) 
     service = get_subscription_service()
     result = service.subscribe_av(payload)
     download_result = {"status": "queued", "message": "后台检查 Jellyfin 与 MTeam"}
-    if result.get("status") != "in_library":
+    if not subscription_is_complete(result):
         background_tasks.add_task(background_download_subscription_av, str(result.get("id") or ""))
     send_notification_event("av_subscribed", {
         "status": result.get("status") or "subscribed",
@@ -11449,9 +12002,9 @@ async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) 
         "cover": result.get("cover") or result.get("cover_url") or "",
         "release_date": result.get("date") or result.get("release_date") or "",
     })
-    if result.get("status") == "in_library":
+    if result.get("library_status") == "in_library":
         send_notification_event("jellyfin_in_library", {
-            "status": "in_library",
+            "status": "completed",
             "title": str(result.get("title") or result.get("id") or ""),
             "detail": f"{result.get('id', '')} 已在 Jellyfin 媒体库中",
             "av_id": result.get("id", ""),
@@ -11476,8 +12029,8 @@ def api_unsubscribe_av(av_id: str) -> dict[str, object]:
 @app.get("/api/subscriptions/av")
 def api_get_subscribed_av() -> dict[str, object]:
     """获取已订阅番号列表"""
-    service = get_subscription_service()
     expire_wash_requests_with_postprocess()
+    reconcile_local_subscription_states()
     return {"subscriptions": subscribed_avs_with_global_filter("subscription_list")}
 
 
@@ -13154,7 +13707,7 @@ def wechat_subscribe_av_result(query: str) -> dict[str, Any]:
     apply_jellyfin_status(av)
     saved = get_subscription_service().subscribe_av(av)
     download_result = {"status": "skipped", "message": ""}
-    if saved.get("status") != "in_library":
+    if not subscription_is_complete(saved):
         download_result = download_av_from_mteam(saved)
     stats = wechat_download_stats(download_result, saved)
     return {
@@ -13198,7 +13751,7 @@ def wechat_refresh_actress_result(query: str) -> dict[str, Any]:
         av_id = str(item.get("id") or "")
         latest = next((row for row in service.get_subscribed_av() if row.get("id") == av_id), item)
         download_result = {
-            "status": latest.get("download_status") or ("skipped" if latest.get("status") == "in_library" else ""),
+            "status": latest.get("download_status") or ("skipped" if subscription_is_complete(latest) else ""),
             "message": latest.get("download_message") or "",
         }
         stats_items.append(wechat_download_stats(download_result, latest))
@@ -13272,7 +13825,7 @@ def wechat_refresh_all_actresses_result() -> dict[str, Any]:
                 av_id = str(item.get("id") or "")
                 latest = next((row for row in service.get_subscribed_av() if row.get("id") == av_id), item)
                 download_result = {
-                    "status": latest.get("download_status") or ("skipped" if latest.get("status") == "in_library" else ""),
+                    "status": latest.get("download_status") or ("skipped" if subscription_is_complete(latest) else ""),
                     "message": latest.get("download_message") or "",
                 }
                 stats_items.append(wechat_download_stats(download_result, latest))

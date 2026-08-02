@@ -991,6 +991,237 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(len(tasks), 1)
 
+    def test_active_media_version_completes_pending_subscription_without_mteam(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-390"
+        output_path = self.root / "out" / av_id / f"{av_id}.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"managed-media")
+        stat = output_path.stat()
+        service.subscribe_av({"id": av_id, "title": "existing", "status": "pending", "download_status": "error"})
+        post.add_version(
+            av_id=av_id,
+            path=str(output_path),
+            source_type="external_qb",
+            status="active",
+            generated_by="moviemuse",
+            file_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+
+        with patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "existing"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(subscription["status"], "done")
+        self.assertEqual(subscription["library_status"], "in_library")
+        self.assertEqual(subscription["download_status"], "completed")
+        self.assertEqual(subscription["jellyfin_path"], str(output_path))
+
+    def test_managed_output_file_completes_subscription_without_version_record(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-395"
+        output_root = self.root / "out"
+        output_path = output_root / av_id / f"{av_id}.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"legacy-output")
+        post.update_settings({"output_dir": str(output_root)})
+        service.subscribe_av({"id": av_id, "title": "legacy output", "status": "pending"})
+
+        with patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "legacy output"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(subscription["status"], "done")
+        self.assertEqual(subscription["jellyfin_path"], str(output_path))
+
+    def test_local_subscription_reconciliation_counts_in_place_updates(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-396"
+        output_path = self.root / "out" / av_id / f"{av_id}.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"managed-media")
+        stat = output_path.stat()
+        service.subscribe_av({"id": av_id, "title": "existing", "status": "pending"})
+        post.add_version(
+            av_id=av_id,
+            path=str(output_path),
+            source_type="subscription",
+            status="active",
+            generated_by="moviemuse",
+            file_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+
+        changed = self.main.reconcile_local_subscription_states()
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(changed, 1)
+        self.assertEqual(subscription["status"], "done")
+
+    def test_downloaded_media_completes_subscription_while_worker_waits(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-397"
+        input_path = self.root / "downloads" / f"{av_id}.mp4"
+        input_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"downloaded-media")
+        service.subscribe_av({"id": av_id, "title": "downloaded", "status": "pending"})
+        task = post.create_task(av_id=av_id, task_type="subscription", status="waiting_worker")
+        post.update_task(task["id"], input_path=str(input_path), torrent_hash="downloaded-hash")
+
+        changed = self.main.reconcile_local_subscription_states()
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(changed, 1)
+        self.assertEqual(subscription["status"], "done")
+        self.assertEqual(subscription["library_status"], "in_library")
+        self.assertEqual(subscription["download_status"], "waiting_worker")
+        self.assertEqual(subscription["jellyfin_path"], str(input_path))
+        self.assertEqual(post.get_task(task["id"])["status"], "waiting_worker")
+
+    def test_existing_failed_postprocess_task_blocks_duplicate_torrent_download(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "IPZZ-862"
+        input_path = self.root / "downloads" / f"{av_id}.mp4"
+        input_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"downloaded")
+        service.subscribe_av({"id": av_id, "title": "failed existing", "status": "pending"})
+        task = post.create_task(av_id=av_id, task_type="external_qb", status="failed")
+        post.update_task(
+            task["id"],
+            torrent_hash="existing-hash",
+            input_path=str(input_path),
+            error_code="transcode_validation_failed",
+            error_message="ffprobe timeout",
+        )
+
+        with patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "failed existing"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "existing_failed")
+        self.assertEqual(result["task_id"], task["id"])
+        self.assertEqual(subscription["status"], "pending")
+        self.assertIn("ffprobe timeout", subscription["download_message"])
+
+    def test_jellyfin_lookup_error_pauses_mteam_download(self) -> None:
+        service = self.main.get_subscription_service()
+        av_id = "ABF-391"
+        service.subscribe_av({"id": av_id, "title": "dedupe unavailable", "status": "pending"})
+
+        class Settings:
+            def get(self) -> dict[str, object]:
+                return {"jellyfin": {"dedupe_enabled": True, "url": "http://jellyfin", "api_key": "secret"}}
+
+        with patch.object(self.main, "get_system_settings_service", return_value=Settings()), \
+            patch.object(self.main, "find_jellyfin_match", side_effect=RuntimeError("Jellyfin API 返回 HTTP 404")), \
+            patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "dedupe unavailable"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "dedupe_error")
+        self.assertEqual(subscription["download_status"], "dedupe_error")
+        self.assertIn("HTTP 404", subscription["download_message"])
+
+    def test_jellyfin_match_marks_subscription_completed(self) -> None:
+        service = self.main.get_subscription_service()
+        av_id = "ABF-394"
+        av = service.subscribe_av({"id": av_id, "title": "already in Jellyfin", "status": "pending"})
+
+        class Settings:
+            def get(self) -> dict[str, object]:
+                return {"jellyfin": {"dedupe_enabled": True, "url": "http://jellyfin", "api_key": "secret"}}
+
+        with patch.object(self.main, "get_system_settings_service", return_value=Settings()), \
+            patch.object(
+                self.main,
+                "find_jellyfin_match",
+                return_value={"id": "jf-item", "name": av_id, "path": f"/media/study_h265/{av_id}/{av_id}.mp4"},
+            ), \
+            patch.object(self.main, "send_notification_event"):
+            updated = self.main.refresh_subscription_library_status(av)
+
+        self.assertEqual(updated["status"], "done")
+        self.assertEqual(updated["library_status"], "in_library")
+        self.assertEqual(updated["download_status"], "completed")
+        self.assertEqual(updated["jellyfin_item_id"], "jf-item")
+
+    def test_same_av_qb_hash_reuses_existing_task(self) -> None:
+        post = self.main.get_postprocess_service()
+        first = post.create_task(av_id="ABF-392", task_type="external_qb", status="created")
+        second = post.create_task(av_id="ABF-392", task_type="subscription", status="created")
+        qb_config = {"category": "study3", "tags": "moviemuse", "save_path": "/study3"}
+
+        first_bind = self.main.bind_qb_to_postprocess_task(first, {"status": "ok", "hash": "same-av-hash"}, qb_config)
+        second_bind = self.main.bind_qb_to_postprocess_task(second, {"status": "exists", "hash": "same-av-hash"}, qb_config)
+
+        self.assertEqual(first_bind["status"], "bound")
+        self.assertEqual(second_bind["status"], "reused")
+        self.assertEqual(post.get_task(second["id"])["status"], "ignored")
+        self.assertEqual(post.get_qb_torrent("same-av-hash")["task_id"], first["id"])
+
+    def test_wash_task_registers_legacy_managed_version_and_binds_old_path(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-393"
+        output_root = self.root / "out"
+        old_path = output_root / av_id / f"{av_id}.mp4"
+        old_path.parent.mkdir(parents=True)
+        old_path.write_bytes(b"legacy-managed")
+        stat = old_path.stat()
+        post.update_settings({"output_dir": str(output_root)})
+        post.add_version(
+            av_id="",
+            path=str(old_path),
+            source_type="subscription",
+            status="active",
+            generated_by="moviemuse",
+            file_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+        av = service.subscribe_av({"id": av_id, "title": "legacy", "status": "done"})
+
+        task = self.main.ensure_wash_postprocess_task(av, "chinese")
+
+        registered = post.get_version(task["supersede_version_id"])
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(registered["av_id"], av_id)
+        self.assertEqual(task["supersede_path"], str(old_path))
+        self.assertEqual(subscription["wash"]["old_path"], str(old_path))
+
+    def test_wash_task_can_bind_subscription_owned_download(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-398"
+        input_path = self.root / "downloads" / f"{av_id}.mp4"
+        input_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"downloaded-media")
+        av = service.subscribe_av({
+            "id": av_id,
+            "title": "downloaded",
+            "status": "done",
+            "library_status": "in_library",
+            "jellyfin_path": str(input_path),
+        })
+        acquisition = post.create_task(av_id=av_id, task_type="subscription", status="waiting_worker")
+        post.update_task(acquisition["id"], input_path=str(input_path), torrent_hash="downloaded-hash")
+
+        task = self.main.ensure_wash_postprocess_task(av, "chinese")
+
+        registered = post.get_version(task["supersede_version_id"])
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(registered["path"], str(input_path))
+        self.assertEqual(registered["source_type"], "subscription")
+        self.assertEqual(task["supersede_path"], str(input_path))
+        self.assertEqual(subscription["wash"]["old_path"], str(input_path))
+
     def test_acquisition_failure_retry_runs_mteam_download_again(self) -> None:
         service = self.main.get_subscription_service()
         post = self.main.get_postprocess_service()
