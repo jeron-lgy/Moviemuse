@@ -1,0 +1,4 @@
+# Existing public-history false positive: the value is a frontend settings field name, not a credential.
+f0b84f177a05dd7ef39f56ae1fdcf5a781589ac8:frontend/src/views/TaskCenterView.vue:generic-api-key:497
+# Current-tree form of the same frontend settings field name.
+frontend/src/views/TaskCenterView.vue:generic-api-key:526
