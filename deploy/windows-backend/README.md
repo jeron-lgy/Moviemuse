@@ -41,7 +41,7 @@ $env:SUBTITLE_PATH_MAP=''
 
 The release contains no Whisper model weights. Models can be downloaded and verified from the desktop model page after the Worker starts.
 
-Starting with v2.3.0, the default release is a lightweight online package. It also leaves the large NVIDIA cuBLAS and cuDNN runtime libraries out of the zip. The model page detects compatible CUDA 12 / cuDNN 9 DLLs already available to Windows and reuses them. If they are missing, click **安装运行环境** once; the Worker downloads about 1.2 GB into `%LOCALAPPDATA%\MovieMuse Worker\gpu-runtime` and asks you to restart the desktop app. Models, GPU libraries, logs, and settings now live outside the release folder and survive upgrades. Existing `data\local-backend` content is copied into the fixed location once on first launch.
+Starting with the v3.0.0 public release, the default release is a lightweight online package. It also leaves the large NVIDIA cuBLAS and cuDNN runtime libraries out of the zip. The model page detects compatible CUDA 12 / cuDNN 9 DLLs already available to Windows and reuses them. If they are missing, click **安装运行环境** once; the Worker downloads about 1.2 GB into `%LOCALAPPDATA%\MovieMuse Worker\gpu-runtime` and asks you to restart the desktop app. Models, GPU libraries, logs, and settings now live outside the release folder and survive upgrades. Existing `data\local-backend` content is copied into the fixed location once on first launch.
 
 The recommended path mapping is controlled by the Unraid console through `SUBTITLE_PROXY_PATH_MAP`, for example:
 
@@ -109,7 +109,7 @@ Uploaded videos are limited to 8 GiB by default. Override `SUBTITLE_UPLOAD_MAX_B
 From the repository root on Windows with Python 3.13 available for the desktop-shell build:
 
 ```powershell
-.\deploy\windows-backend\build_release.ps1 -Version v2.2.1
+.\deploy\windows-backend\build_release.ps1 -Version v3.0.0
 ```
 
 The script creates `MovieMuseWorker.exe`, a clean portable Python runtime, and a zip under `dist/`. It copies only tracked application files and rejects SQLite databases, settings, logs, credentials, and Whisper model files.
