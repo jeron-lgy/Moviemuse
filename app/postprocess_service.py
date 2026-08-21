@@ -13,6 +13,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .log_service import append_json_log
+
+
+DEFAULT_POSTPROCESS_DOWNLOAD_DIR = "/media/downloads"
+DEFAULT_POSTPROCESS_OUTPUT_DIR = "/media/processed"
+
 
 DEFAULT_POSTPROCESS_SETTINGS: dict[str, Any] = {
     "auto_transcode_enabled": False,
@@ -20,8 +26,8 @@ DEFAULT_POSTPROCESS_SETTINGS: dict[str, Any] = {
     "worker_auto_run": False,
     "external_qb_adopt_enabled": False,
     "external_qb_trash_source_enabled": False,
-    "download_dir": str(Path(os.getenv("POSTPROCESS_DOWNLOAD_DIR", "/media/study3"))),
-    "output_dir": str(Path(os.getenv("POSTPROCESS_OUTPUT_DIR", "/media/压制"))),
+    "download_dir": str(Path(os.getenv("POSTPROCESS_DOWNLOAD_DIR", DEFAULT_POSTPROCESS_DOWNLOAD_DIR))),
+    "output_dir": str(Path(os.getenv("POSTPROCESS_OUTPUT_DIR", DEFAULT_POSTPROCESS_OUTPUT_DIR))),
     "target_codec": "av1",
     "target_encoder": "av1_nvenc",
     "crf": 36,
@@ -32,7 +38,7 @@ DEFAULT_POSTPROCESS_SETTINGS: dict[str, Any] = {
     "ffmpeg_custom_enabled": False,
     "ffmpeg_custom_template": "",
     "custom_encoding_presets": [],
-    "allowed_categories": ["study3"],
+    "allowed_categories": ["moviemuse"],
     "required_tags": ["moviemuse", "auto-postprocess", "jav"],
     "max_concurrency": 1,
 }
@@ -109,8 +115,12 @@ class PostprocessService:
         self.db_file = data_dir / "subscriptions.sqlite3"
         self.log_file = data_dir / "system_logs.jsonl"
         self._log_lock = threading.RLock()
+        self._task_lock = threading.RLock()
+        self._event_lock = threading.RLock()
+        self._event_write_count = 0
         data_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self.prune_events()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -338,7 +348,14 @@ class PostprocessService:
             row = conn.execute("SELECT * FROM postprocess_tasks WHERE id = ?", (task_id,)).fetchone()
         return row_to_task(row) if row else None
 
-    def list_tasks(self, *, limit: int = 100, statuses: list[str] | None = None, order: str = "desc") -> list[dict[str, Any]]:
+    def list_tasks(
+        self,
+        *,
+        limit: int | None = 100,
+        offset: int = 0,
+        statuses: list[str] | None = None,
+        order: str = "desc",
+    ) -> list[dict[str, Any]]:
         params: list[Any] = []
         where = ""
         if statuses:
@@ -346,13 +363,95 @@ class PostprocessService:
             where = f"WHERE status IN ({placeholders})"
             params.extend(statuses)
         direction = "ASC" if str(order or "").lower() == "asc" else "DESC"
-        params.append(max(1, min(500, int(limit or 100))))
+        pagination = ""
+        if limit is not None:
+            pagination = "LIMIT ? OFFSET ?"
+            params.extend((max(1, min(500, int(limit or 100))), max(0, int(offset or 0))))
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM postprocess_tasks {where} ORDER BY created_at {direction} LIMIT ?",
+                f"SELECT * FROM postprocess_tasks {where} ORDER BY created_at {direction} {pagination}",
                 params,
             ).fetchall()
         return [row_to_task(row) for row in rows]
+
+    def find_latest_task(self, av_id: str, task_type: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM postprocess_tasks WHERE av_id = ? AND task_type = ? ORDER BY created_at DESC LIMIT 1",
+                (av_id, task_type),
+            ).fetchone()
+        return row_to_task(row) if row else None
+
+    def find_active_task(self, av_id: str, task_type: str) -> dict[str, Any] | None:
+        terminal = sorted(TERMINAL_TASK_STATUSES)
+        placeholders = ",".join("?" for _ in terminal)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT * FROM postprocess_tasks
+                WHERE av_id = ? AND task_type = ? AND status NOT IN ({placeholders})
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (av_id, task_type, *terminal),
+            ).fetchone()
+        return row_to_task(row) if row else None
+
+    def ensure_task(
+        self,
+        *,
+        av_id: str,
+        task_type: str,
+        status: str,
+        target_codec: str = "",
+        needs_subtitle: bool = False,
+        data: dict[str, Any] | None = None,
+        reusable_error_codes: set[str] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        terminal = sorted(TERMINAL_TASK_STATUSES)
+        placeholders = ",".join("?" for _ in terminal)
+        with self._task_lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT * FROM postprocess_tasks
+                    WHERE av_id = ? AND task_type = ? AND status NOT IN ({placeholders})
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (av_id, task_type, *terminal),
+                ).fetchone()
+                if not row and reusable_error_codes:
+                    codes = sorted(reusable_error_codes)
+                    code_placeholders = ",".join("?" for _ in codes)
+                    row = conn.execute(
+                        f"""
+                        SELECT * FROM postprocess_tasks
+                        WHERE av_id = ? AND task_type = ? AND error_code IN ({code_placeholders})
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (av_id, task_type, *codes),
+                    ).fetchone()
+            if row:
+                task = row_to_task(row)
+                if str(task.get("status") or "") in TERMINAL_TASK_STATUSES:
+                    task = self.update_task(
+                        str(task["id"]),
+                        status=status,
+                        torrent_hash="",
+                        input_path="",
+                        output_path="",
+                        error_code="",
+                        error_message="",
+                        data=data or {},
+                    ) or task
+                return task, False
+            return self.create_task(
+                av_id=av_id,
+                task_type=task_type,
+                status=status,
+                target_codec=target_codec,
+                needs_subtitle=needs_subtitle,
+                data=data,
+            ), True
 
     def update_task(self, task_id: str, **fields: Any) -> dict[str, Any] | None:
         allowed = {
@@ -642,12 +741,83 @@ class PostprocessService:
     def add_event(self, task_id: str, level: str, stage: str, message: str, data: dict[str, Any] | None = None) -> None:
         now = time.time()
         payload = data or {}
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO task_events (task_id, level, stage, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
-            )
+        with self._event_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO task_events (task_id, level, stage, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
+                )
+            self._record_event_write()
         self._mirror_event_to_system_log(task_id, level, stage, message, payload, now)
+
+    def add_event_if_due(
+        self,
+        task_id: str,
+        level: str,
+        stage: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+        *,
+        min_interval_seconds: float,
+        fingerprint: str = "",
+    ) -> bool:
+        """Insert an event only when its state changed or its heartbeat is due."""
+        now = time.time()
+        payload = dict(data or {})
+        if fingerprint:
+            payload["fingerprint"] = fingerprint
+        with self._event_lock:
+            with self._connect() as conn:
+                previous = conn.execute(
+                    """
+                    SELECT data_json, created_at
+                    FROM task_events
+                    WHERE task_id = ? AND stage = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (task_id, stage),
+                ).fetchone()
+                if previous:
+                    previous_payload: dict[str, Any] = {}
+                    try:
+                        parsed = json.loads(previous["data_json"] or "{}")
+                        if isinstance(parsed, dict):
+                            previous_payload = parsed
+                    except Exception:
+                        previous_payload = {}
+                    same_fingerprint = not fingerprint or previous_payload.get("fingerprint") == fingerprint
+                    if same_fingerprint and now - float(previous["created_at"] or 0) < max(0.0, min_interval_seconds):
+                        return False
+                conn.execute(
+                    "INSERT INTO task_events (task_id, level, stage, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, level, stage, message, json.dumps(payload, ensure_ascii=False), now),
+                )
+            self._record_event_write()
+        self._mirror_event_to_system_log(task_id, level, stage, message, payload, now)
+        return True
+
+    def _record_event_write(self) -> None:
+        self._event_write_count += 1
+        if self._event_write_count % 250 == 0:
+            self.prune_events()
+
+    def prune_events(self) -> dict[str, int]:
+        retention_days = max(1, int(os.getenv("TASK_EVENT_RETENTION_DAYS", "30")))
+        max_rows = max(1, int(os.getenv("TASK_EVENT_MAX_ROWS", "50000")))
+        cutoff = time.time() - retention_days * 86400
+        with self._connect() as conn:
+            expired = conn.execute("DELETE FROM task_events WHERE created_at < ?", (cutoff,)).rowcount
+            overflow = conn.execute(
+                """
+                DELETE FROM task_events
+                WHERE id IN (
+                    SELECT id FROM task_events ORDER BY id DESC LIMIT -1 OFFSET ?
+                )
+                """,
+                (max_rows,),
+            ).rowcount
+        return {"expired": max(0, expired), "overflow": max(0, overflow)}
 
     def _mirror_event_to_system_log(
         self,
@@ -669,8 +839,7 @@ class PostprocessService:
         }
         try:
             with self._log_lock:
-                with self.log_file.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                append_json_log(self.log_file, entry)
         except Exception:
             pass
 

@@ -99,7 +99,7 @@ exit /b 0
 :prepare_portable_target
 for /f %%D in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMddHHmmss"') do set "DEPS_STAMP=%%D"
 if "%DEPS_STAMP%"=="" set "DEPS_STAMP=new"
-set "EMBEDDED_SITE_PACKAGES_REL=Lib\media-toolbox-packages-%DEPS_STAMP%"
+set "EMBEDDED_SITE_PACKAGES_REL=Lib\moviemuse-packages-%DEPS_STAMP%"
 set "EMBEDDED_SITE_PACKAGES=%CD%\python\%EMBEDDED_SITE_PACKAGES_REL%"
 echo Installing into %EMBEDDED_SITE_PACKAGES_REL%
 exit /b 0

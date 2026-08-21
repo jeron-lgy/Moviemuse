@@ -6,7 +6,7 @@ if not %errorlevel%==0 (
   exit /b
 )
 
-netsh advfirewall firewall add rule name="Media Toolbox Backend 18181" dir=in action=allow protocol=TCP localport=18181
+netsh advfirewall firewall add rule name="MovieMuse Backend 18181" dir=in action=allow protocol=TCP localport=18181
 echo.
 echo Firewall rule added for TCP 18181.
 pause

@@ -213,8 +213,18 @@ class SubscriptionService:
             item["filters"] = normalize_filters(item.get("filters", {}))
             item.setdefault("subscription_mode", "strict")
             item["wash"] = normalize_wash_request(item.get("wash", {}))
-            if item.get("status", "pending") == "pending" and item.get("download_status") in {"ok", "exists", "sent"}:
-                item["status"] = "done"
+            item["library_notification_armed"] = bool(item.get("library_notification_armed", item.get("completion_notification_armed", False)))
+            item["library_notification_key"] = str(item.get("library_notification_key", item.get("completion_notification_key", "")) or "")
+            item["library_notified_at"] = float(item.get("library_notified_at", item.get("completion_notified_at", 0)) or 0)
+            item.pop("completion_notification_armed", None)
+            item.pop("completion_notification_key", None)
+            item.pop("completion_notified_at", None)
+            has_library_confirmation = bool(item.get("library_confirmed_at") or item.get("jellyfin_item_id"))
+            status = str(item.get("status") or "pending")
+            if has_library_confirmation and status == "done":
+                item["status"] = "in_library"
+            elif not has_library_confirmation and status in {"done", "in_library"}:
+                item["status"] = "pending"
         for item in data.get("actress", {}).values():
             if not isinstance(item, dict):
                 continue
@@ -609,6 +619,21 @@ class SubscriptionService:
                 "label": av.get("label", existing.get("label", "")),
                 "status": av.get("status", existing.get("status", "pending")),
                 "library_status": av.get("library_status", existing.get("library_status", "")),
+                "library_checked_at": av.get("library_checked_at", existing.get("library_checked_at", 0)),
+                "library_confirmed_at": av.get("library_confirmed_at", existing.get("library_confirmed_at", 0)),
+                "library_confirmation_source": av.get("library_confirmation_source", existing.get("library_confirmation_source", "")),
+                "library_notification_armed": bool(av.get(
+                    "library_notification_armed",
+                    av.get("completion_notification_armed", existing.get("library_notification_armed", existing.get("completion_notification_armed", False))),
+                )),
+                "library_notification_key": av.get(
+                    "library_notification_key",
+                    av.get("completion_notification_key", existing.get("library_notification_key", existing.get("completion_notification_key", ""))),
+                ),
+                "library_notified_at": av.get(
+                    "library_notified_at",
+                    av.get("completion_notified_at", existing.get("library_notified_at", existing.get("completion_notified_at", 0))),
+                ),
                 "jellyfin_item_id": av.get("jellyfin_item_id", existing.get("jellyfin_item_id", "")),
                 "jellyfin_item_name": av.get("jellyfin_item_name", existing.get("jellyfin_item_name", "")),
                 "jellyfin_path": av.get("jellyfin_path", existing.get("jellyfin_path", "")),
@@ -626,8 +651,12 @@ class SubscriptionService:
                 "source_actress_id": av.get("source_actress_id", existing.get("source_actress_id", "")),
                 "source_actress_name": av.get("source_actress_name", existing.get("source_actress_name", "")),
             }
+            saved = self.data["av"][av_id]
+            has_library_confirmation = bool(saved.get("library_confirmed_at") or saved.get("jellyfin_item_id"))
+            if has_library_confirmation and str(saved.get("status") or "") == "done":
+                saved["status"] = "in_library"
             self._save()
-            return dict(self.data["av"][av_id])
+            return dict(saved)
 
     def update_av_wash(self, av_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         with self._lock:
@@ -668,6 +697,8 @@ class SubscriptionService:
                 "replace_message",
                 "last_checked_at",
                 "task_id",
+                "completion_notification_key",
+                "completion_notified_at",
             ):
                 if key in payload:
                     merged[key] = payload[key]
@@ -720,6 +751,12 @@ class SubscriptionService:
             for key in (
                 "status",
                 "library_status",
+                "library_checked_at",
+                "library_confirmed_at",
+                "library_confirmation_source",
+                "library_notification_armed",
+                "library_notification_key",
+                "library_notified_at",
                 "jellyfin_item_id",
                 "jellyfin_item_name",
                 "jellyfin_path",
@@ -1032,6 +1069,8 @@ def normalize_wash_request(value: Any) -> dict[str, Any]:
         "trash_path": str(raw.get("trash_path") or ""),
         "replace_status": str(raw.get("replace_status") or ""),
         "replace_message": str(raw.get("replace_message") or ""),
+        "completion_notification_key": str(raw.get("completion_notification_key") or ""),
+        "completion_notified_at": float(raw.get("completion_notified_at") or 0),
     }
     if not mode:
         result["status"] = ""

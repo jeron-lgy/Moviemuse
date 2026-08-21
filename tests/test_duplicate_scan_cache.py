@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.scan_state import SCAN_STALE_SECONDS, ScanCache, ScanSnapshot
 from app.scanner import ScanResult
@@ -54,6 +55,12 @@ class DuplicateScanCacheTest(unittest.TestCase):
             files = {file.path.name: file for file in incremental_snapshot.result.files}
             self.assertEqual(files["ABF-336.mp4"].subtitle_kind, "chinese")
             self.assertEqual(files["ABF-336-1080p.mp4"].subtitle_kind, "none")
+
+    def test_empty_root_queries_do_not_open_sqlite_connection(self) -> None:
+        cache = ScanCache()
+        with patch.object(cache, "_connect", side_effect=AssertionError("connection should stay closed")):
+            self.assertEqual(cache._cached_files_for_roots([]), {})
+            self.assertEqual(cache._mark_missing([], set()), 0)
 
     def test_start_rejects_second_scan_while_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

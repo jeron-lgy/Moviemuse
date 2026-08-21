@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 
 class SubtitleJobCacheTest(unittest.TestCase):
@@ -28,14 +29,14 @@ class SubtitleJobCacheTest(unittest.TestCase):
             {
                 "id": "job-1",
                 "status": "completed",
-                "video_path": "/media/study_h265/MIDA-001.mp4",
+                "video_path": "/media/processed/MIDA-001.mp4",
                 "created_at": 1,
                 "updated_at": 2,
             },
             {
                 "id": "job-2",
                 "status": "translating",
-                "video_path": "/media/study_h265/MIDA-002.mp4",
+                "video_path": "/media/processed/MIDA-002.mp4",
                 "created_at": 3,
                 "updated_at": 4,
             },
@@ -86,6 +87,67 @@ class SubtitleJobCacheTest(unittest.TestCase):
         )
         self.assertNotIn("openai_api_key", without_existing)
         self.assertEqual(without_existing["openai_model"], "deepseek-chat")
+
+    def test_controller_node_status_does_not_start_local_compute_service(self) -> None:
+        with patch.object(self.main, "backend_url", return_value="http://worker"), \
+            patch.object(self.main, "compute_node_only", return_value=False), \
+            patch.object(self.main, "local_node_status", side_effect=AssertionError("must stay lazy")):
+            payload = self.main.api_subtitle_node_status()
+
+        self.assertEqual(payload["status"], "controller")
+        self.assertEqual(payload["mode"], "remote_controller")
+        self.assertFalse(payload["online"])
+
+    def test_remote_compute_settings_include_path_map_for_worker_boundary(self) -> None:
+        payload = self.main.remote_compute_settings_payload(
+            {
+                "whisper_model": "large-v3-turbo",
+                "subtitle_path_map": r"/media=\\NAS\media",
+                "subtitle_backend_url": "http://worker",
+            }
+        )
+
+        self.assertEqual(payload["subtitle_path_map"], r"/media=\\NAS\media")
+        self.assertNotIn("subtitle_backend_url", payload)
+
+    def test_connection_sync_uses_saved_controller_path_map(self) -> None:
+        self.main.save_console_compute_config(
+            {
+                "subtitle_backend_url": "http://worker:18181",
+                "subtitle_backend_token": "worker-token",
+                "subtitle_path_map": r"/media=\\NAS\media",
+                "whisper_model": "large-v3-turbo",
+            }
+        )
+        captured: dict[str, object] = {}
+
+        def fake_remote_post(path: str, payload: dict[str, object], timeout: float = 30) -> dict[str, object]:
+            captured.update({"path": path, "payload": payload, "timeout": timeout})
+            return {"status": "ok"}
+
+        with patch.object(self.main, "backend_url", return_value="http://worker:18181"), \
+            patch.object(self.main, "remote_post_json", side_effect=fake_remote_post):
+            result = self.main.sync_remote_compute_settings()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(captured["path"], "/api/compute/settings")
+        payload = captured["payload"]
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["subtitle_path_map"], r"/media=\\NAS\media")
+        self.assertEqual(payload["whisper_model"], "large-v3-turbo")
+        self.assertNotIn("subtitle_backend_url", payload)
+        self.assertNotIn("subtitle_backend_token", payload)
+
+    def test_subtitle_upload_rejects_file_over_configured_limit(self) -> None:
+        with patch.dict(os.environ, {"SUBTITLE_UPLOAD_MAX_BYTES": str(1024 ** 2)}), \
+            patch.object(self.main, "backend_url", return_value=""), \
+            TestClient(self.main.app) as client:
+            response = client.post(
+                "/api/subtitle/upload",
+                files={"file": ("large.mp4", b"x" * (1024 ** 2 + 1), "video/mp4")},
+            )
+
+        self.assertEqual(response.status_code, 413)
 
 
 if __name__ == "__main__":

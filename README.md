@@ -2,7 +2,9 @@
 
 MovieMuse 是一个面向 NAS / Unraid 媒体库的整理控制台，重点解决重复视频清理、洗版后处理、字幕生成和字幕翻译这些日常维护问题。
 
-它由两部分组成：Unraid 上运行的 Web 控制台，以及可选的 Windows GPU 算力端。控制台负责扫描媒体库、管理任务和保存配置；Windows 算力端负责使用 `faster-whisper` 生成字幕、执行转码/后处理任务，并把结果回写到媒体目录。
+仓库维护三个边界清晰的运行单元：Unraid 上的 Web 控制台、可选的 Windows GPU 算力端，以及按需启用的 Unraid 主机稳定性监控工具。控制台负责扫描媒体库、管理任务和保存配置；Windows 算力端负责使用 `faster-whisper` 生成字幕、执行转码/后处理任务；监控工具只采集运行证据，不参与业务和自动处置。
+
+新会话或维护者请先读 [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md)，其中列出了三个运行单元的目录、数据和 Git 边界。
 
 ## 实现功能
 - [x] 扫描 NAS 媒体目录，按番号/标题识别重复视频和不同版本。
@@ -36,15 +38,15 @@ MovieMuse 是一个面向 NAS / Unraid 媒体库的整理控制台，重点解�
 
 ```text
 /mnt/user/media/
-  study3/
-  study3_h265/
+  downloads/
+  processed/
   trash/
 
 /mnt/user/appdata/moviemuse/
   data/
 ```
 
-如果 `study3`、`study3_h265`、`trash` 都在同一个媒体根目录下，只需要在正式 yml 里挂载媒体根目录即可：
+`downloads`、`processed`、`trash` 都在同一个媒体根目录下，正式 yml 只需要挂载媒体根目录：
 
 ```yaml
 MOVIEMUSE_MEDIA_DIR: /mnt/user/media
@@ -53,10 +55,12 @@ MOVIEMUSE_MEDIA_DIR: /mnt/user/media
 容器内会自动对应为：
 
 ```text
-/media/study3
-/media/study3_h265
+/media/downloads
+/media/processed
 /media/trash
 ```
+
+这些是新安装的推荐默认值。升级时不会自动移动文件，也不会覆盖 WebUI 中已经保存的旧目录；确认新目录准备好后，再在转码设置中切换。
 
 ## 部署结构
 
@@ -205,9 +209,11 @@ Windows Worker 只负责提供算力；地址、模型、翻译后端和路径�
 算力端必须能够通过 Windows 可访问路径读取 Unraid 视频。例如：
 
 ```text
-控制台路径：/media/study3/movie.mp4
-Windows 路径：\\NAS\media\study3\movie.mp4
+控制台路径：/media/downloads/movie.mp4
+Windows 路径：\\NAS\media\downloads\movie.mp4
 ```
+
+算力端只允许访问路径映射目标下的文件。需要在 Windows 本机进一步锁定范围时，可在启动前设置 `COMPUTE_ALLOWED_MEDIA_DIRS=\\NAS\media`；多个根目录使用分号分隔。直接上传的视频默认限制为 8 GiB。
 
 在控制台的路径映射设置中填写：
 
@@ -220,7 +226,7 @@ Windows 路径：\\NAS\media\study3\movie.mp4
 Windows 算力端的模型目录：
 
 ```text
-data\local-backend\whisper-models
+%LOCALAPPDATA%\MovieMuse Worker\whisper-models
 ```
 
 推荐先使用：
@@ -261,7 +267,7 @@ cd C:\MoviemuseModels
 $root = "whisper-models"
 mkdir $root -Force
 
-hf download h2oai/faster-whisper-large-v3-turbo `
+hf download dropbox-dash/faster-whisper-large-v3-turbo `
   --local-dir "$root\large-v3-turbo"
 ```
 
@@ -274,7 +280,7 @@ cd C:\MoviemuseModels
 $root = "whisper-models"
 mkdir $root -Force
 
-hf download h2oai/faster-whisper-large-v3-turbo `
+hf download dropbox-dash/faster-whisper-large-v3-turbo `
   --local-dir "$root\large-v3-turbo"
 
 hf download Systran/faster-whisper-large-v3 `
@@ -318,19 +324,14 @@ whisper-models\
 把整个 `whisper-models` 文件夹复制到 Windows 算力端的：
 
 ```text
-data\local-backend\whisper-models
+%LOCALAPPDATA%\MovieMuse Worker\whisper-models
 ```
 
-然后在控制台“字幕任务”页面填写：
-
-```text
-模型目录：data\local-backend\whisper-models
-模型名：large-v3-turbo
-```
+然后重启 Worker。在 Worker 模型页完成验证，再在 MovieMuse 控制端选择已经安装的模型；控制端不再填写 Windows 模型目录、设备或计算精度。
 
 模型链接参考：
 
 - [faster-whisper 项目](https://github.com/SYSTRAN/faster-whisper)
 - [faster-whisper-large-v3 模型](https://huggingface.co/Systran/faster-whisper-large-v3)
-- [faster-whisper-large-v3-turbo 模型](https://huggingface.co/h2oai/faster-whisper-large-v3-turbo)
+- [faster-whisper-large-v3-turbo 模型](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo)
 - [faster-whisper-medium 模型](https://huggingface.co/Systran/faster-whisper-medium)

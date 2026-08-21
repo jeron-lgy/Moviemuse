@@ -59,9 +59,15 @@ class JavDBService:
         self._cache_hits = 0
         self._cache_misses = 0
         self._disk_cache_hits = 0
-        self._tasks: queue.Queue[tuple[Callable[[], Any], Future[Any]] | None] = queue.Queue()
-        self._worker = threading.Thread(target=self._worker_loop, name="javdb-worker", daemon=True)
-        self._worker.start()
+        self._cache_max_entries = max(1, int(os.getenv("JAVDB_MEMORY_CACHE_MAX_ENTRIES", "256")))
+        self._queue_capacity = max(1, int(os.getenv("JAVDB_QUEUE_MAX_SIZE", "16")))
+        self._queue_submit_timeout = max(0.1, float(os.getenv("JAVDB_QUEUE_SUBMIT_TIMEOUT_SECONDS", "2")))
+        self._tasks: queue.Queue[tuple[Callable[[], Any], Future[Any]] | None] = queue.Queue(
+            maxsize=self._queue_capacity
+        )
+        self._worker_lock = threading.RLock()
+        self._worker: threading.Thread | None = None
+        self._accepting = True
 
     def set_logger(self, logger: Callable[[str, str, str, dict[str, Any] | None], None]) -> None:
         self._logger = logger
@@ -89,24 +95,50 @@ class JavDBService:
         print(f"[JavDB] {level}: {message} {payload}", flush=True)
 
     def _worker_loop(self) -> None:
-        while True:
-            task = self._tasks.get()
-            if task is None:
-                break
-            fn, future = task
-            if future.set_running_or_notify_cancel():
+        try:
+            while True:
+                task = self._tasks.get()
                 try:
-                    future.set_result(fn())
-                except Exception as exc:
-                    future.set_exception(exc)
-        self._close_browser()
+                    if task is None:
+                        break
+                    fn, future = task
+                    if future.set_running_or_notify_cancel():
+                        try:
+                            future.set_result(fn())
+                        except Exception as exc:
+                            future.set_exception(exc)
+                finally:
+                    self._tasks.task_done()
+        finally:
+            self._close_browser()
+
+    def _ensure_worker(self) -> None:
+        with self._worker_lock:
+            if not self._accepting:
+                raise RuntimeError("JavDB service is shutting down")
+            if self._worker and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=self._worker_loop, name="javdb-worker", daemon=True)
+            self._worker.start()
 
     def _run(self, fn: Callable[[], Any], timeout: int | None = None) -> Any:
         future: Future[Any] = Future()
-        self._tasks.put((fn, future))
+        with self._worker_lock:
+            self._ensure_worker()
+            try:
+                self._tasks.put((fn, future), timeout=self._queue_submit_timeout)
+            except queue.Full as exc:
+                self._last_error = "worker queue full"
+                self._log("warning", "JavDB 抓取队列已满", {
+                    "stage": "javdb_queue_full",
+                    "queue_size": self._tasks.qsize(),
+                    "queue_capacity": self._queue_capacity,
+                })
+                raise RuntimeError("JavDB 抓取队列繁忙，请稍后重试") from exc
         try:
             return future.result(timeout=timeout or self._run_timeout)
         except FutureTimeoutError:
+            future.cancel()
             self._rebuild_requested = True
             self._last_error = "worker timeout"
             self._log("error", "JavDB 抓取任务超时，已标记重建浏览器", {
@@ -374,6 +406,7 @@ class JavDBService:
         if disk_cached and disk_cached[0] > now:
             with self._cache_lock:
                 self._cache[key] = disk_cached
+                self._prune_memory_cache_locked(now)
             return disk_cached[1]
 
         self._cache_misses += 1
@@ -383,6 +416,7 @@ class JavDBService:
             expires_at = now + (ttl or self._default_cache_ttl)
             with self._cache_lock:
                 self._cache[key] = (expires_at, result)
+                self._prune_memory_cache_locked(now)
             self._write_disk_cache(key, expires_at, result)
             self._log("info", "JavDB 写入缓存", {"stage": "javdb_cache_store", "key": key, "ttl": ttl or self._default_cache_ttl})
             return result
@@ -393,6 +427,16 @@ class JavDBService:
             self._log("warning", "JavDB 抓取失败，返回过期磁盘缓存", {"stage": "javdb_disk_cache_stale", "key": key})
             return disk_cached[1]
         return result
+
+    def _prune_memory_cache_locked(self, now: float | None = None) -> None:
+        current = now if now is not None else time.time()
+        expired = [key for key, value in self._cache.items() if value[0] <= current]
+        for key in expired:
+            self._cache.pop(key, None)
+        overflow = len(self._cache) - self._cache_max_entries
+        if overflow > 0:
+            for key, _ in sorted(self._cache.items(), key=lambda item: item[1][0])[:overflow]:
+                self._cache.pop(key, None)
 
     def stats(self) -> dict[str, Any]:
         with self._cache_lock:
@@ -413,6 +457,9 @@ class JavDBService:
             "context_uses": self._ctx_uses,
             "last_error": self._last_error,
             "rebuild_requested": self._rebuild_requested,
+            "queue_capacity": self._queue_capacity,
+            "worker_running": bool(self._worker and self._worker.is_alive()),
+            "accepting": self._accepting,
         }
 
     @staticmethod
@@ -830,9 +877,38 @@ class JavDBService:
         result = self._run(lambda: self._fetch_list_resilient(key, page_url, js, self._listing_cache_ttl, force_refresh=force_refresh))
         return (result or [])[:limit]
 
-    def close(self) -> None:
-        self._tasks.put(None)
-        self._worker.join(timeout=5)
+    def start(self) -> None:
+        with self._worker_lock:
+            self._accepting = True
+
+    def close(self, timeout: float = 5.0) -> bool:
+        with self._worker_lock:
+            self._accepting = False
+            worker = self._worker
+            if not worker or not worker.is_alive():
+                self._close_browser()
+                return True
+            while True:
+                try:
+                    queued = self._tasks.get_nowait()
+                except queue.Empty:
+                    break
+                if queued is not None:
+                    _, future = queued
+                    future.cancel()
+                self._tasks.task_done()
+            try:
+                self._tasks.put_nowait(None)
+            except queue.Full:
+                pass
+        worker.join(timeout=max(0.1, timeout))
+        stopped = not worker.is_alive()
+        if not stopped:
+            self._log("warning", "JavDB worker did not stop before shutdown timeout", {
+                "stage": "javdb_shutdown_timeout",
+                "timeout": timeout,
+            })
+        return stopped
 
 
 def is_access_ban_error(exc: object) -> bool:

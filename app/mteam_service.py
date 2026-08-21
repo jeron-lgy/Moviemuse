@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import quote_plus, urljoin
@@ -106,25 +108,44 @@ def download_mteam_torrent(torrent_id: str, settings: dict[str, Any]) -> tuple[b
     if api_key:
         token_headers["x-api-key"] = api_key
     errors: list[str] = []
-    with httpx.Client(timeout=30, follow_redirects=True) as client:
+    attempts = max(1, min(5, int(os.getenv("MTEAM_DOWNLOAD_ATTEMPTS", "2"))))
+    timeout = max(5, min(60, int(os.getenv("MTEAM_DOWNLOAD_TIMEOUT", "20"))))
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         for token_url in download_token_candidates(mteam):
-            try:
-                resp = client.post(token_url, headers=token_headers, data={"id": torrent_id})
-                resp.raise_for_status()
-                payload = resp.json()
-                if str(payload.get("message") or "").upper() != "SUCCESS" or not payload.get("data"):
-                    errors.append(str(payload.get("message") or payload))
-                    continue
-                download_url = token_download_url(payload["data"])
-                if not download_url:
-                    errors.append("genDlToken 未返回下载地址")
-                    continue
-                torrent_resp = client.get(download_url, headers={"User-Agent": "Media-Toolbox/1.0"})
-                torrent_resp.raise_for_status()
-                filename = filename_from_headers(torrent_resp.headers.get("content-disposition", "")) or f"{torrent_id}.torrent"
-                return torrent_resp.content, filename
-            except httpx.HTTPError as exc:
-                errors.append(str(exc))
+            for attempt in range(attempts):
+                try:
+                    resp = client.post(token_url, headers=token_headers, data={"id": torrent_id})
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    if str(payload.get("message") or "").upper() != "SUCCESS" or not payload.get("data"):
+                        errors.append(f"{token_url}: {payload.get('message') or payload}")
+                        break
+                    download_url = token_download_url(payload["data"])
+                    if not download_url:
+                        errors.append(f"{token_url}: genDlToken 未返回下载地址")
+                        break
+                    torrent_resp = client.get(download_url, headers={"User-Agent": "Media-Toolbox/1.0"})
+                    torrent_resp.raise_for_status()
+                    filename = filename_from_headers(torrent_resp.headers.get("content-disposition", "")) or f"{torrent_id}.torrent"
+                    return torrent_resp.content, filename
+                except httpx.HTTPStatusError as exc:
+                    status = int(exc.response.status_code)
+                    if status == 403:
+                        errors.append(f"{token_url}: 403 Forbidden（API Key 无下载令牌权限或站点地址不匹配）")
+                        break
+                    retryable = status == 429 or status >= 500
+                    errors.append(f"{token_url}: HTTP {status}" + ("，稍后重试" if retryable else ""))
+                    if not retryable or attempt + 1 >= attempts:
+                        break
+                    time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    errors.append(f"{token_url}: 临时网络错误（{type(exc).__name__}）")
+                    if attempt + 1 >= attempts:
+                        break
+                    time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                except (ValueError, TypeError) as exc:
+                    errors.append(f"{token_url}: 响应解析失败（{exc}）")
+                    break
     raise RuntimeError("MTeam 种子下载失败: " + "；".join(errors[-2:]))
 
 

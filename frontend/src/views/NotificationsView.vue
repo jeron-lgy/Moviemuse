@@ -365,13 +365,9 @@ function normalizeChannel(channel) {
 function defaultEventEnabled(key) {
   return [
     'av_subscribed',
-    'mteam_found',
-    'torrent_sent',
-    'jellyfin_in_library',
+    'subscription_in_library',
+    'wash_completed',
     'task_failed',
-    'automation_actress_poll',
-    'automation_av_download',
-    'automation_wash_download'
   ].includes(key)
 }
 

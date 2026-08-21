@@ -3,6 +3,11 @@ setlocal
 
 cd /d "%~dp0"
 
+if exist "MovieMuseWorker.exe" (
+  start "" "%~dp0MovieMuseWorker.exe"
+  exit /b 0
+)
+
 if "%WHISPER_MODEL%"=="" set "WHISPER_MODEL=large-v3-turbo"
 if "%WHISPER_MODEL_DIR%"=="" set "WHISPER_MODEL_DIR=%CD%\data\local-backend\whisper-models"
 if "%WHISPER_DEVICE%"=="" set "WHISPER_DEVICE=cuda"
@@ -56,7 +61,7 @@ if errorlevel 1 (
 if errorlevel 1 (
   echo.
   echo Dependency check still failed after installation.
-  echo Close other Media Toolbox windows and run this file again. The installer now keeps dependencies in versioned folders.
+  echo Close other MovieMuse windows and run this file again. The installer now keeps dependencies in versioned folders.
   echo.
   pause
   exit /b 1
@@ -66,10 +71,10 @@ echo.
 echo Windows 5090 subtitle backend
 echo Backend URL: shown as LAN URL after the server starts
 echo Health: shown after the server starts
-echo Web UI: disabled on Windows worker
-echo Manage settings from the Unraid subtitle console.
+echo Worker UI: http://127.0.0.1:%PORT%/worker
+echo Compute settings remain managed by the MovieMuse console.
 echo Model folder: %WHISPER_MODEL_DIR%
-echo Path map: controlled by Media Toolbox console
+echo Path map: controlled by MovieMuse console
 echo.
 echo Make sure Windows can open paths sent by the console, for example: \\UNRAID\media
 echo.

@@ -12,10 +12,10 @@
       <BaseCard as="article" class="panel" >
         <div class="section-heading">
           <h2>1. 选择字幕样本</h2>
-          <p>填写控制台可读取的媒体目录路径，例如 <code>/media/study3/ABF-302.srt</code>。</p>
+          <p>填写控制台可读取的媒体目录路径，例如 <code>/media/downloads/ABF-302.srt</code>。</p>
         </div>
         <div class="sample-controls">
-          <input v-model.trim="sample.path" placeholder="/media/study3/movie.srt">
+          <input v-model.trim="sample.path" placeholder="/media/downloads/movie.srt">
           <input v-model.number="sample.startNumber" type="number" min="1" placeholder="从第几段开始">
           <div class="segmented">
             <button type="button" :class="{ active: sample.count === 20 }" @click="sample.count = 20">20 段</button>

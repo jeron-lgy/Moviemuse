@@ -4,6 +4,8 @@
 
 MovieMuse 控制台不在容器内运行 Whisper。字幕和转码任务会转发到 Windows 算力端。
 
+`monitoring/` 是独立运行在 Unraid 宿主机的临时稳定性监控工具，不会打包进控制台镜像，也不属于 Compose 服务。它的部署、数据和授权边界见 [`monitoring/README.md`](monitoring/README.md)。
+
 ## Compose 文件
 
 | 文件 | 场景 | 镜像来源 | 说明 |
@@ -21,11 +23,13 @@ Unraid创建以下几个固定目录
 ```bash
 /mnt/user/appdata/moviemuse
 /mnt/user/media
+/mnt/user/media/downloads
+/mnt/user/media/processed
 /mnt/user/media/trash
-/mnt/user/media/study3
-/mnt/user/media/study_h265
 ```
 这些是我的固定目录，懂目录映射的就随便写就好了，不懂的就按我这个一模一样做
+
+新目录名只作为新安装默认值；升级不会自动移动已有文件或覆盖 WebUI 中保存的旧路径。
 
 复制粘贴以下docker compose：
 

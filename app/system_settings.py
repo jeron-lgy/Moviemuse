@@ -82,16 +82,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "channels": [],
         "events": {
             "av_subscribed": True,
-            "mteam_found": True,
-            "torrent_sent": True,
-            "jellyfin_in_library": True,
+            "subscription_in_library": True,
+            "wash_completed": True,
             "task_failed": True,
             "scan_completed": False,
             "subtitle_completed": False,
             "subtitle_failed": True,
-            "automation_actress_poll": True,
-            "automation_av_download": True,
-            "automation_wash_download": True,
         },
         "templates": {},
     },
@@ -118,6 +114,7 @@ class SystemSettingsService:
         self._lock = threading.RLock()
         self._generated_initial_password: str | None = None
         self._initialized_auth_password = False
+        self._settings_migrated = False
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._normalize_network()
@@ -125,7 +122,7 @@ class SystemSettingsService:
         self._normalize_auth()
         self._normalize_demo()
         self._normalize_duplicate_scan()
-        if self._initialized_auth_password:
+        if self._initialized_auth_password or self._settings_migrated:
             self._save()
         if self._generated_initial_password:
             self._write_initial_password_hint(self.data["auth"]["username"], self._generated_initial_password)
@@ -136,6 +133,27 @@ class SystemSettingsService:
             try:
                 loaded = json.loads(self.settings_file.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
+                    notifications = loaded.get("notifications") if isinstance(loaded.get("notifications"), dict) else {}
+                    events = notifications.get("events") if isinstance(notifications.get("events"), dict) else {}
+                    if "subscription_completed" in events or "jellyfin_in_library" in events:
+                        self._settings_migrated = True
+                    if "subscription_in_library" not in events:
+                        for legacy_key in ("subscription_completed", "jellyfin_in_library"):
+                            if legacy_key in events:
+                                events["subscription_in_library"] = bool(events[legacy_key])
+                                break
+                    events.pop("subscription_completed", None)
+                    events.pop("jellyfin_in_library", None)
+                    templates = notifications.get("templates") if isinstance(notifications.get("templates"), dict) else {}
+                    if "subscription_completed" in templates or "jellyfin_in_library" in templates:
+                        self._settings_migrated = True
+                    if "subscription_in_library" not in templates:
+                        for legacy_key in ("subscription_completed", "jellyfin_in_library"):
+                            if isinstance(templates.get(legacy_key), dict):
+                                templates["subscription_in_library"] = templates[legacy_key]
+                                break
+                    templates.pop("subscription_completed", None)
+                    templates.pop("jellyfin_in_library", None)
                     merge_dict(data, loaded)
             except Exception:
                 pass
@@ -220,9 +238,14 @@ class SystemSettingsService:
         events = notifications.setdefault("events", {})
         for key, default in DEFAULT_SETTINGS["notifications"]["events"].items():
             events[key] = bool(events.get(key, default))
+        events.pop("subscription_completed", None)
+        events.pop("jellyfin_in_library", None)
         templates = notifications.setdefault("templates", {})
         if not isinstance(templates, dict):
             notifications["templates"] = {}
+        else:
+            templates.pop("subscription_completed", None)
+            templates.pop("jellyfin_in_library", None)
 
     def _normalize_auth(self) -> None:
         auth = self.data.setdefault("auth", {})

@@ -54,8 +54,8 @@ echo.
 echo Windows 5090 subtitle backend
 echo Backend URL: shown as LAN URL after the server starts
 echo Health: shown after the server starts
-echo Web UI: disabled on Windows worker
-echo Manage settings from the Unraid subtitle console.
+echo Worker UI: http://127.0.0.1:%PORT%/worker
+echo Compute settings remain managed by the MovieMuse console.
 echo Model folder: %WHISPER_MODEL_DIR%
 echo Path map: controlled by MovieMuse console
 echo.

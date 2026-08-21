@@ -46,11 +46,13 @@ export function washActive(item) {
 }
 
 export function subscriptionStatus(item) {
+  const displayStatus = String(item?.display_status || '').toLowerCase()
   const status = String(item?.status || '').toLowerCase()
   const libraryStatus = String(item?.library_status || '').toLowerCase()
-  if (washActive(item)) return 'wash_active'
-  if (status === 'in_library' || libraryStatus === 'in_library') return 'in_library'
-  if (status === 'done') return 'done'
+  if (displayStatus === 'washing' || washActive(item)) return 'washing'
+  if (displayStatus === 'in_library') return 'in_library'
+  if (displayStatus === 'subscribing') return 'subscribed'
+  if ((status === 'in_library' || libraryStatus === 'in_library') && (item?.library_confirmed_at || item?.jellyfin_item_id)) return 'in_library'
   return 'subscribed'
 }
 
@@ -58,9 +60,8 @@ export function avSubscribeLabel(item, subscriptions = [], fallback = '订阅') 
   const current = subscribedAv(item, subscriptions)
   if (!current) return fallback
   const labels = {
-    wash_active: '洗版中',
+    washing: '洗版中',
     in_library: '已入库',
-    done: '已完成',
     subscribed: '已订阅'
   }
   return labels[subscriptionStatus(current)] || '已订阅'

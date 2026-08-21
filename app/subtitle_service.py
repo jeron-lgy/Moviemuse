@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import gc
 import json
+import math
 import os
 import queue
 import re
@@ -10,10 +12,27 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from .path_policy import configured_compute_roots, require_path_within
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".avi", ".m4v", ".ts", ".webm"}
 COMPUTE_SETTINGS_FILE = "compute_settings.json"
+SUBTITLE_END_PADDING_SECONDS = 0.2
+SUBTITLE_MIN_DURATION_SECONDS = 0.6
+SUBTITLE_MAX_DURATION_SECONDS = 12.0
+SUBTITLE_INTER_CUE_GAP_SECONDS = 0.08
+MANAGED_WHISPER_MODEL_FILES = ("config.json", "model.bin", "tokenizer.json")
+
+
+def managed_whisper_model_source(model_name: str, model_dir: Path | None) -> str:
+    """Prefer a Worker-managed flat model directory when it is complete."""
+    if not model_dir:
+        return model_name
+    candidate = model_dir / Path(str(model_name)).name
+    if candidate.is_dir() and all((candidate / name).is_file() for name in MANAGED_WHISPER_MODEL_FILES):
+        return str(candidate)
+    return model_name
 
 
 @dataclass
@@ -26,6 +45,7 @@ class SubtitleSettings:
     default_output_dir: Path | None = None
     api_token: str = ""
     path_map: list[tuple[str, str]] = field(default_factory=list)
+    allowed_media_dirs: list[Path] = field(default_factory=list)
     max_workers: int = 1
     translation_max_workers: int = 1
     default_translate_backend: str = "google"
@@ -51,6 +71,7 @@ class SubtitleSegment:
     end: float
     text: str
     translated_text: str = ""
+    timing_from_words: bool = False
 
 
 @dataclass
@@ -153,6 +174,7 @@ def load_subtitle_settings(data_dir: Path) -> SubtitleSettings:
     config = load_compute_config(data_dir)
     output_dir = config_value(config, "subtitle_output_dir", "SUBTITLE_OUTPUT_DIR")
     model_dir = config_value(config, "whisper_model_dir", "WHISPER_MODEL_DIR", str(data_dir / "whisper-models"))
+    path_map = parse_path_map(config_value(config, "subtitle_path_map", "SUBTITLE_PATH_MAP"))
     return SubtitleSettings(
         data_dir=data_dir,
         default_model=config_value(config, "whisper_model", "WHISPER_MODEL", "large-v3"),
@@ -161,7 +183,8 @@ def load_subtitle_settings(data_dir: Path) -> SubtitleSettings:
         compute_type=config_value(config, "whisper_compute_type", "WHISPER_COMPUTE_TYPE", "float16"),
         default_output_dir=Path(output_dir) if output_dir else None,
         api_token=config_value(config, "subtitle_api_token", "SUBTITLE_API_TOKEN"),
-        path_map=parse_path_map(config_value(config, "subtitle_path_map", "SUBTITLE_PATH_MAP")),
+        path_map=path_map,
+        allowed_media_dirs=configured_compute_roots(path_map),
         max_workers=config_int(config, "subtitle_max_workers", "SUBTITLE_MAX_WORKERS", 1),
         translation_max_workers=config_int(
             config,
@@ -268,6 +291,115 @@ def parse_subtitle_timestamp(value: str) -> float:
         + int(seconds)
         + int(milliseconds[:3].ljust(3, "0")) / 1000
     )
+
+
+def normalize_subtitle_language_tag(language: str | None, default: str = "und") -> str:
+    raw = str(language or "").strip().replace("_", "-")
+    if not raw or raw.lower() == "auto":
+        return default
+    aliases = {
+        "zh": "zh-CN",
+        "zh-cn": "zh-CN",
+        "chi": "zh-CN",
+        "zho": "zh-CN",
+        "ja": "ja",
+        "jp": "ja",
+        "jpn": "ja",
+        "japanese": "ja",
+        "en": "en",
+        "eng": "en",
+        "ko": "ko",
+        "kor": "ko",
+    }
+    normalized = aliases.get(raw.lower())
+    if normalized:
+        return normalized
+    if not re.fullmatch(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*", raw):
+        return default
+    parts = raw.split("-")
+    return "-".join(
+        part.lower() if index == 0 else (part.upper() if len(part) == 2 and part.isalpha() else part)
+        for index, part in enumerate(parts)
+    )
+
+
+def subtitle_output_paths(
+    output_dir: Path,
+    video_path: Path,
+    source_language: str | None,
+    target_language: str | None,
+) -> dict[str, Path]:
+    source_tag = normalize_subtitle_language_tag(source_language)
+    target_tag = normalize_subtitle_language_tag(target_language, default="zh-CN")
+    source_suffix = source_tag if source_tag != target_tag else f"source.{source_tag}"
+    stem = video_path.stem
+    return {
+        "original_srt": output_dir / f"{stem}.{source_suffix}.srt",
+        "original_vtt": output_dir / f"{stem}.{source_suffix}.vtt",
+        "translated_srt": output_dir / f"{stem}.{target_tag}.srt",
+        "translated_vtt": output_dir / f"{stem}.{target_tag}.vtt",
+        "bilingual_srt": output_dir / f"{stem}.bilingual.{target_tag}.srt",
+    }
+
+
+def subtitle_word_bounds(raw_segment: Any) -> tuple[float, float] | None:
+    words = list(getattr(raw_segment, "words", None) or [])
+    starts: list[float] = []
+    ends: list[float] = []
+    for word in words:
+        try:
+            start = float(word.start)
+            end = float(word.end)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if math.isfinite(start):
+            starts.append(start)
+        if math.isfinite(end):
+            ends.append(end)
+    if not starts or not ends:
+        return None
+    start = min(starts)
+    end = max(ends)
+    if end <= start:
+        return None
+    return start, end
+
+
+def fallback_subtitle_duration(text: str) -> float:
+    visible_characters = len(re.sub(r"\s+", "", str(text or "")))
+    return min(8.0, max(2.0, 1.2 + visible_characters / 5.0))
+
+
+def normalize_subtitle_timing(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
+    normalized: list[SubtitleSegment] = []
+    for segment in segments:
+        try:
+            start = max(0.0, float(segment.start))
+            end = float(segment.end)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        if segment.timing_from_words:
+            end += SUBTITLE_END_PADDING_SECONDS
+            maximum_duration = SUBTITLE_MAX_DURATION_SECONDS
+        else:
+            maximum_duration = min(SUBTITLE_MAX_DURATION_SECONDS, fallback_subtitle_duration(segment.text))
+        end = min(end, start + maximum_duration)
+        normalized.append(replace(segment, start=start, end=max(start, end)))
+
+    for index, segment in enumerate(normalized):
+        next_start = normalized[index + 1].start if index + 1 < len(normalized) else None
+        latest_end = segment.start + SUBTITLE_MAX_DURATION_SECONDS
+        if next_start is not None and next_start > segment.start:
+            latest_end = min(latest_end, max(segment.start, next_start - SUBTITLE_INTER_CUE_GAP_SECONDS))
+        end = min(segment.end, latest_end)
+        minimum_end = segment.start + SUBTITLE_MIN_DURATION_SECONDS
+        if next_start is not None and next_start > segment.start:
+            minimum_end = min(minimum_end, max(segment.start, next_start - SUBTITLE_INTER_CUE_GAP_SECONDS))
+        end = max(end, minimum_end)
+        normalized[index] = replace(segment, end=end)
+    return normalized
 
 
 def read_srt(path: Path) -> list[SubtitleSegment]:
@@ -391,22 +523,34 @@ class SubtitleService:
         self.jobs_path = settings.data_dir / "subtitle_jobs.json"
         self.upload_dir = settings.data_dir / "subtitle_uploads"
         self.lock = threading.Lock()
-        self.queue: queue.Queue[str] = queue.Queue()
-        self.translation_queue: queue.Queue[str] = queue.Queue()
+        self.queue: queue.Queue[str | None] = queue.Queue()
+        self.translation_queue: queue.Queue[str | None] = queue.Queue()
         self.jobs: dict[str, SubtitleJob] = {}
         self.cancelled_jobs: set[str] = set()
         self._model_cache: dict[tuple[str, str, str, str], Any] = {}
+        self._model_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._closed = False
+        self._workers: list[threading.Thread] = []
+        self._translation_workers: list[threading.Thread] = []
+        self._status_worker: threading.Thread | None = None
         self._load_jobs()
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        for _ in range(settings.max_workers):
-            worker = threading.Thread(target=self._worker_loop, daemon=True)
+        for index in range(settings.max_workers):
+            worker = threading.Thread(target=self._worker_loop, name=f"subtitle-worker-{index + 1}", daemon=True)
             worker.start()
-        for _ in range(max(1, min(4, int(settings.translation_max_workers or 1)))):
-            translation_worker = threading.Thread(target=self._translation_worker_loop, daemon=True)
+            self._workers.append(worker)
+        for index in range(max(1, min(4, int(settings.translation_max_workers or 1)))):
+            translation_worker = threading.Thread(
+                target=self._translation_worker_loop,
+                name=f"subtitle-translation-worker-{index + 1}",
+                daemon=True,
+            )
             translation_worker.start()
+            self._translation_workers.append(translation_worker)
         if os.getenv("COMPUTE_NODE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}:
-            status_worker = threading.Thread(target=self._status_loop, daemon=True)
-            status_worker.start()
+            self._status_worker = threading.Thread(target=self._status_loop, name="subtitle-status", daemon=True)
+            self._status_worker.start()
 
     def create_job(
         self,
@@ -418,6 +562,7 @@ class SubtitleService:
         translate: bool = True,
         translate_backend: str = "google",
     ) -> SubtitleJob:
+        self._ensure_open()
         job = self._prepare_job(video_path, output_dir, source_language, target_language, model, translate, translate_backend)
         with self.lock:
             self.jobs[job.id] = job
@@ -426,6 +571,7 @@ class SubtitleService:
         return job
 
     def create_jobs(self, payloads: list[dict[str, Any]]) -> list[SubtitleJob]:
+        self._ensure_open()
         jobs = [
             self._prepare_job(
                 str(payload.get("video_path") or ""),
@@ -457,6 +603,7 @@ class SubtitleService:
         translate_backend: str = "google",
     ) -> SubtitleJob:
         resolved_video = map_remote_path(video_path, self.settings).resolve()
+        require_path_within(resolved_video, [*self.settings.allowed_media_dirs, self.upload_dir], "视频路径")
         if not resolved_video.exists() or not resolved_video.is_file():
             raise FileNotFoundError(f"视频文件不存在: {resolved_video}")
         if resolved_video.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -471,6 +618,7 @@ class SubtitleService:
         else:
             resolved_output = resolved_video.parent
 
+        require_path_within(resolved_output, [*self.settings.allowed_media_dirs, self.upload_dir], "字幕输出目录")
         resolved_output.mkdir(parents=True, exist_ok=True)
         job = SubtitleJob(
             id=uuid.uuid4().hex,
@@ -491,6 +639,27 @@ class SubtitleService:
         safe_name = f"{uuid.uuid4().hex}{suffix}"
         target = self.upload_dir / safe_name
         target.write_bytes(content)
+        return target
+
+    def save_upload_stream(self, filename: str, stream: Any, max_bytes: int) -> Path:
+        suffix = Path(filename).suffix.lower()
+        if suffix not in VIDEO_EXTENSIONS:
+            raise ValueError(f"不支持的视频格式: {suffix}")
+        target = self.upload_dir / f"{uuid.uuid4().hex}{suffix}"
+        written = 0
+        try:
+            with target.open("wb") as output:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise ValueError(f"上传文件超过 {max_bytes // (1024 ** 3)} GiB 限制")
+                    output.write(chunk)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
         return target
 
     def get_job(self, job_id: str) -> SubtitleJob | None:
@@ -566,6 +735,13 @@ class SubtitleService:
         candidates: list[Path] = []
         if job.original_srt:
             candidates.append(Path(job.original_srt))
+        output_paths = subtitle_output_paths(
+            Path(job.output_dir),
+            Path(job.video_path),
+            job.detected_language or job.source_language,
+            job.target_language,
+        )
+        candidates.append(output_paths["original_srt"])
         candidates.append(Path(job.output_dir) / f"{Path(job.video_path).stem}.srt")
         for path in candidates:
             if path.exists() and path.is_file():
@@ -576,6 +752,13 @@ class SubtitleService:
         candidates: list[Path] = []
         if job.original_vtt:
             candidates.append(Path(job.original_vtt))
+        output_paths = subtitle_output_paths(
+            Path(job.output_dir),
+            Path(job.video_path),
+            job.detected_language or job.source_language,
+            job.target_language,
+        )
+        candidates.append(output_paths["original_vtt"])
         candidates.append(Path(job.output_dir) / f"{Path(job.video_path).stem}.vtt")
         for path in candidates:
             if path.exists() and path.is_file():
@@ -583,6 +766,7 @@ class SubtitleService:
         return None
 
     def _create_translation_retry(self, source: SubtitleJob, original_srt: Path, translate_backend: str) -> SubtitleJob:
+        self._ensure_open()
         original_vtt = self._existing_original_vtt(source)
         job = SubtitleJob(
             id=uuid.uuid4().hex,
@@ -624,6 +808,8 @@ class SubtitleService:
         while True:
             job_id = self.queue.get()
             try:
+                if job_id is None:
+                    return
                 self._run_job(job_id)
             finally:
                 self.queue.task_done()
@@ -632,13 +818,14 @@ class SubtitleService:
         while True:
             job_id = self.translation_queue.get()
             try:
+                if job_id is None:
+                    return
                 self._run_translation_job(job_id)
             finally:
                 self.translation_queue.task_done()
 
     def _status_loop(self) -> None:
-        while True:
-            time.sleep(30)
+        while not self._stop_event.wait(30):
             with self.lock:
                 jobs = list(self.jobs.values())
             active = sum(1 for job in jobs if job.status in {"queued", "running", "translating"})
@@ -647,6 +834,15 @@ class SubtitleService:
                 f"model={self.settings.default_model} device={self.settings.device}/{self.settings.compute_type}",
                 flush=True,
             )
+
+    def _recognition_heartbeat(self, job_id: str, stop_event: threading.Event, started_at: float) -> None:
+        while not stop_event.wait(10):
+            current = self.get_job(job_id)
+            if not current or current.status != "running" or self._is_cancelled(job_id):
+                return
+            elapsed = max(0, int(time.monotonic() - started_at))
+            minutes, seconds = divmod(elapsed, 60)
+            self._update(job_id, message=f"正在识别语音 · 已运行 {minutes:02d}:{seconds:02d}")
 
     def _run_job(self, job_id: str) -> None:
         job = self.get_job(job_id)
@@ -659,34 +855,73 @@ class SubtitleService:
                 return
             video_path = Path(job.video_path)
             output_dir = Path(job.output_dir)
-            output_stem = output_dir / video_path.stem
             model = self._get_model(job.model)
 
             if self._is_cancelled(job_id):
                 return
             self._update(job_id, progress=0.08, message="正在识别语音")
-            segments_iter, info = model.transcribe(
-                str(video_path),
-                language=job.source_language,
-                vad_filter=True,
-                beam_size=5,
+            recognition_started = time.monotonic()
+            recognition_stop = threading.Event()
+            recognition_heartbeat = threading.Thread(
+                target=self._recognition_heartbeat,
+                args=(job_id, recognition_stop, recognition_started),
+                name=f"subtitle-recognition-heartbeat-{job_id[:8]}",
+                daemon=True,
             )
-            segments: list[SubtitleSegment] = []
-            duration = float(getattr(info, "duration", 0.0) or 0.0)
-            detected_language = getattr(info, "language", None)
-            for raw_segment in segments_iter:
-                if self._is_cancelled(job_id):
-                    return
-                text = " ".join(str(raw_segment.text).split())
-                if text:
-                    segments.append(SubtitleSegment(start=float(raw_segment.start), end=float(raw_segment.end), text=text))
-                if duration:
-                    self._update(job_id, progress=min(0.78, 0.10 + (float(raw_segment.end) / duration) * 0.68))
+            recognition_heartbeat.start()
+            try:
+                segments_iter, info = model.transcribe(
+                    str(video_path),
+                    language=job.source_language,
+                    vad_filter=True,
+                    vad_parameters={
+                        "min_silence_duration_ms": 500,
+                        "speech_pad_ms": 200,
+                    },
+                    beam_size=5,
+                    word_timestamps=True,
+                    condition_on_previous_text=False,
+                    hallucination_silence_threshold=2.0,
+                )
+                segments: list[SubtitleSegment] = []
+                duration = float(getattr(info, "duration", 0.0) or 0.0)
+                detected_language = getattr(info, "language", None)
+                for raw_segment in segments_iter:
+                    if self._is_cancelled(job_id):
+                        return
+                    text = " ".join(str(raw_segment.text).split())
+                    if text:
+                        word_bounds = subtitle_word_bounds(raw_segment)
+                        start, end = word_bounds or (float(raw_segment.start), float(raw_segment.end))
+                        segments.append(
+                            SubtitleSegment(
+                                start=start,
+                                end=end,
+                                text=text,
+                                timing_from_words=word_bounds is not None,
+                            )
+                        )
+                    if duration:
+                        processed = max(0.0, min(duration, float(raw_segment.end)))
+                        self._update(
+                            job_id,
+                            progress=min(0.78, 0.10 + (processed / duration) * 0.68),
+                            message=f"正在识别语音 · 已处理 {srt_timestamp(processed).split(',')[0]} / {srt_timestamp(duration).split(',')[0]}",
+                        )
+            finally:
+                recognition_stop.set()
 
             if self._is_cancelled(job_id):
                 return
-            original_srt = output_stem.with_suffix(".srt")
-            original_vtt = output_stem.with_suffix(".vtt")
+            segments = normalize_subtitle_timing(segments)
+            output_paths = subtitle_output_paths(
+                output_dir,
+                video_path,
+                detected_language or job.source_language,
+                job.target_language,
+            )
+            original_srt = output_paths["original_srt"]
+            original_vtt = output_paths["original_vtt"]
             write_srt(original_srt, segments)
             write_vtt(original_vtt, segments)
             self._update(
@@ -741,7 +976,6 @@ class SubtitleService:
 
             video_path = Path(job.video_path)
             output_dir = Path(job.output_dir)
-            output_stem = output_dir / video_path.stem
             if self._is_cancelled(job_id):
                 return
             self._update(
@@ -755,17 +989,39 @@ class SubtitleService:
                 original_srt=str(original_srt),
                 original_vtt=str(self._existing_original_vtt(job)) if self._existing_original_vtt(job) else job.original_vtt,
             )
+            last_reported = {"completed": -1}
+
+            def report_translation_progress(completed: int, total: int) -> None:
+                total = max(1, int(total))
+                completed = max(0, min(total, int(completed)))
+                report_step = max(1, total // 50)
+                if completed < total and completed - last_reported["completed"] < report_step:
+                    return
+                last_reported["completed"] = completed
+                self._update(
+                    job_id,
+                    progress=min(0.98, 0.86 + (completed / total) * 0.12),
+                    message=f"正在翻译字幕 ({job.translate_backend}) · {completed}/{total} 段",
+                )
+
             self._translate_segments(
                 segments,
                 job.detected_language or job.source_language or "auto",
                 job.target_language,
                 job.translate_backend,
+                progress_callback=report_translation_progress,
             )
             if self._is_cancelled(job_id):
                 return
-            translated_srt = output_stem.with_name(f"{output_stem.name}.{job.target_language}").with_suffix(".srt")
-            translated_vtt = output_stem.with_name(f"{output_stem.name}.{job.target_language}").with_suffix(".vtt")
-            bilingual_srt = output_stem.with_name(f"{output_stem.name}.bilingual").with_suffix(".srt")
+            output_paths = subtitle_output_paths(
+                output_dir,
+                video_path,
+                job.detected_language or job.source_language,
+                job.target_language,
+            )
+            translated_srt = output_paths["translated_srt"]
+            translated_vtt = output_paths["translated_vtt"]
+            bilingual_srt = output_paths["bilingual_srt"]
             write_srt(translated_srt, segments, translated=True)
             write_vtt(translated_vtt, segments, translated=True)
             write_srt(bilingual_srt, segments, bilingual=True)
@@ -803,8 +1059,12 @@ class SubtitleService:
 
     def _get_model(self, model_name: str) -> Any:
         model_dir = self.settings.model_dir
-        cache_key = (model_name, self.settings.device, self.settings.compute_type, str(model_dir or ""))
-        if cache_key not in self._model_cache:
+        model_source = managed_whisper_model_source(model_name, model_dir)
+        cache_key = (model_source, self.settings.device, self.settings.compute_type, str(model_dir or ""))
+        with self._model_lock:
+            cached = self._model_cache.get(cache_key)
+            if cached is not None:
+                return cached
             if self.settings.device == "cuda":
                 add_nvidia_dll_dirs()
             try:
@@ -813,13 +1073,55 @@ class SubtitleService:
                 raise RuntimeError("缺少 faster-whisper，请先安装 requirements.txt 里的依赖") from exc
             if model_dir:
                 model_dir.mkdir(parents=True, exist_ok=True)
-            self._model_cache[cache_key] = WhisperModel(
-                model_name,
+            loaded = WhisperModel(
+                model_source,
                 device=self.settings.device,
                 compute_type=self.settings.compute_type,
                 download_root=str(model_dir) if model_dir else None,
             )
-        return self._model_cache[cache_key]
+            # Keep only the currently selected model. Running jobs retain their
+            # own local reference until they finish, so this does not interrupt
+            # active transcription.
+            self._model_cache.clear()
+            self._model_cache[cache_key] = loaded
+            return loaded
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("字幕服务正在关闭，请稍后重试")
+
+    def close(self, timeout: float = 5.0) -> bool:
+        if self._closed:
+            threads = [*self._workers, *self._translation_workers]
+            if self._status_worker:
+                threads.append(self._status_worker)
+            stopped = not any(worker.is_alive() for worker in threads)
+            if stopped:
+                with self._model_lock:
+                    self._model_cache.clear()
+                gc.collect()
+            return stopped
+        self._closed = True
+        self._stop_event.set()
+        for _ in self._workers:
+            self.queue.put(None)
+        for _ in self._translation_workers:
+            self.translation_queue.put(None)
+        deadline = time.monotonic() + max(0.1, timeout)
+        threads = [*self._workers, *self._translation_workers]
+        if self._status_worker:
+            threads.append(self._status_worker)
+        for worker in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        stopped = not any(worker.is_alive() for worker in threads)
+        if stopped:
+            with self._model_lock:
+                self._model_cache.clear()
+            gc.collect()
+        return stopped
 
     def _translate_segments(
         self,
@@ -827,29 +1129,37 @@ class SubtitleService:
         source_language: str,
         target_language: str,
         translate_backend: str = "google",
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         if not segments:
             return
+        total = len(segments)
+        if progress_callback:
+            progress_callback(0, total)
         if source_language == target_language:
             for segment in segments:
                 segment.translated_text = segment.text
+            if progress_callback:
+                progress_callback(total, total)
             return
         backend = (translate_backend or "google").lower()
         if backend == "none":
             for segment in segments:
                 segment.translated_text = segment.text
+            if progress_callback:
+                progress_callback(total, total)
             return
         if backend == "google":
-            self._translate_with_google(segments, source_language, target_language)
+            self._translate_with_google(segments, source_language, target_language, progress_callback)
             return
         if backend == "deepl":
-            self._translate_with_deepl(segments, source_language, target_language)
+            self._translate_with_deepl(segments, source_language, target_language, progress_callback)
             return
         if backend in {"deepseek", "openai"}:
-            self._translate_with_openai(segments, source_language, target_language)
+            self._translate_with_openai(segments, source_language, target_language, progress_callback)
             return
         if backend == "ollama":
-            self._translate_with_ollama(segments, source_language, target_language)
+            self._translate_with_ollama(segments, source_language, target_language, progress_callback)
             return
 
         errors: list[str] = []
@@ -863,7 +1173,7 @@ class SubtitleService:
                 errors.append(f"{name}: 未配置")
                 continue
             try:
-                runner(segments, source_language, target_language)
+                runner(segments, source_language, target_language, progress_callback)
                 return
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
@@ -942,7 +1252,11 @@ class SubtitleService:
         return replace(self.settings, **values)
 
     def _translate_with_google(
-        self, segments: list[SubtitleSegment], source_language: str, target_language: str
+        self,
+        segments: list[SubtitleSegment],
+        source_language: str,
+        target_language: str,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         import httpx
 
@@ -963,7 +1277,7 @@ class SubtitleService:
             "Accept": "application/json,text/plain,*/*",
         }
         with httpx.Client(timeout=60, headers=headers, follow_redirects=True) as client:
-            for segment in segments:
+            for index, segment in enumerate(segments, start=1):
                 segment_errors: list[str] = []
                 for endpoint in endpoints:
                     try:
@@ -989,11 +1303,17 @@ class SubtitleService:
                 if not segment.translated_text:
                     segment.translated_text = segment.text
                     errors.extend(segment_errors[:1])
+                if progress_callback:
+                    progress_callback(index, len(segments))
         if translated_count == 0 and errors:
             raise RuntimeError("Google 免费翻译不可用：" + "；".join(errors[:3]))
 
     def _translate_with_deepl(
-        self, segments: list[SubtitleSegment], source_language: str, target_language: str
+        self,
+        segments: list[SubtitleSegment],
+        source_language: str,
+        target_language: str,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         import httpx
 
@@ -1003,7 +1323,7 @@ class SubtitleService:
         source = "" if source_language == "auto" else self._deepl_lang(source_language)
         headers = {"Authorization": f"DeepL-Auth-Key {self.settings.deepl_api_key}"}
         with httpx.Client(timeout=120) as client:
-            for segment in segments:
+            for index, segment in enumerate(segments, start=1):
                 data = {
                     "text": segment.text,
                     "target_lang": target,
@@ -1014,6 +1334,8 @@ class SubtitleService:
                 response.raise_for_status()
                 translations = response.json().get("translations") or []
                 segment.translated_text = (translations[0].get("text", "") if translations else "").strip() or segment.text
+                if progress_callback:
+                    progress_callback(index, len(segments))
 
     @staticmethod
     def _deepl_lang(language: str) -> str:
@@ -1022,7 +1344,11 @@ class SubtitleService:
         return aliases.get(value, value or "ZH")
 
     def _translate_with_ollama(
-        self, segments: list[SubtitleSegment], source_language: str, target_language: str
+        self,
+        segments: list[SubtitleSegment],
+        source_language: str,
+        target_language: str,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         import httpx
 
@@ -1030,7 +1356,7 @@ class SubtitleService:
             raise RuntimeError("Ollama 未配置 OLLAMA_URL")
         endpoint = f"{self.settings.ollama_url}/api/generate"
         with httpx.Client(timeout=180) as client:
-            for segment in segments:
+            for index, segment in enumerate(segments, start=1):
                 prompt = (
                     f"Translate the subtitle from {source_language} to {target_language}. "
                     "Return only the translated subtitle text, no explanation.\n\n"
@@ -1046,8 +1372,16 @@ class SubtitleService:
                 )
                 response.raise_for_status()
                 segment.translated_text = str(response.json().get("response", "")).strip() or segment.text
+                if progress_callback:
+                    progress_callback(index, len(segments))
 
-    def _translate_with_openai(self, segments: list[SubtitleSegment], source_language: str, target_language: str) -> None:
+    def _translate_with_openai(
+        self,
+        segments: list[SubtitleSegment],
+        source_language: str,
+        target_language: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
         import httpx
 
         base_url = normalize_openai_base_url(self.settings.openai_base_url)
@@ -1067,10 +1401,12 @@ class SubtitleService:
         batches = [(start, segments[start : start + batch_size]) for start in range(0, len(segments), batch_size)]
 
         limits = httpx.Limits(max_connections=max_concurrency, max_keepalive_connections=max_concurrency)
+        completed = 0
         with httpx.Client(timeout=180, limits=limits) as client:
             if max_concurrency == 1 or len(batches) <= 1:
-                translated_batches = [
-                    self._translate_openai_batch_resilient(
+                translated_batches = []
+                for start, batch in batches:
+                    result = self._translate_openai_batch_resilient(
                         client,
                         endpoint,
                         headers,
@@ -1081,8 +1417,10 @@ class SubtitleService:
                         segments[max(0, start - context_lines) : start],
                         segments[start + len(batch) : start + len(batch) + context_lines],
                     )
-                    for start, batch in batches
-                ]
+                    translated_batches.append(result)
+                    completed += len(result[1])
+                    if progress_callback:
+                        progress_callback(completed, len(segments))
             else:
                 workers = min(max_concurrency, len(batches))
                 translated_batches = []
@@ -1103,7 +1441,11 @@ class SubtitleService:
                         for start, batch in batches
                     ]
                     for future in as_completed(futures):
-                        translated_batches.append(future.result())
+                        result = future.result()
+                        translated_batches.append(result)
+                        completed += len(result[1])
+                        if progress_callback:
+                            progress_callback(completed, len(segments))
 
         for start, translations in sorted(translated_batches, key=lambda item: item[0]):
             batch = segments[start : start + len(translations)]

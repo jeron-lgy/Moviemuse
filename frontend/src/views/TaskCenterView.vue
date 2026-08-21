@@ -11,9 +11,9 @@
     <section class="service-grid">
       <BaseCard as="button" class="service-card" type="button" @click="computeDialog = true">
         <span>算力端</span>
-        <strong>{{ backendOnline ? '在线' : '离线' }}</strong>
-        <em :class="{ on: backendOnline }">{{ connection.subtitle_backend_url || '本机模式 / 未配置地址' }}</em>
-        <i :class="{ on: backendOnline }"></i>
+        <strong>{{ backendStateLabel }}</strong>
+        <em :class="{ on: backendOnline, warn: backendPairingRequired }">{{ connection.subtitle_backend_url || '本机模式 / 未配置地址' }}</em>
+        <i :class="{ on: backendOnline, warn: backendPairingRequired }"></i>
       </BaseCard>
       <BaseCard as="button" class="service-card" type="button" @click="translateDialog = true">
         <span>翻译后端</span>
@@ -57,8 +57,8 @@
 
       <div class="toolbar">
         <div class="segmented">
-          <button type="button" :class="{ active: taskTab === 'current' }" @click="taskTab = 'current'">当前任务</button>
-          <button type="button" :class="{ active: taskTab === 'history' }" @click="taskTab = 'history'">历史任务</button>
+          <button type="button" :class="{ active: taskTab === 'current' }" @click="taskTab = 'current'">当前任务 {{ taskCounts.current }}</button>
+          <button type="button" :class="{ active: taskTab === 'history' }" @click="taskTab = 'history'">历史任务 {{ taskCounts.history }}</button>
         </div>
         <div v-if="taskTab === 'current'" class="state-tabs">
           <button v-for="state in statusTabs" :key="state.key" type="button" :class="{ active: taskStatusTab === state.key }" @click="taskStatusTab = state.key">
@@ -77,10 +77,10 @@
       />
 
       <div v-if="!visibleJobs.length" class="empty">这个状态暂时没有任务。</div>
-      <div v-if="pageCount > 1" class="pagination">
-        <BaseButton  type="button" :disabled="page <= 1" @click="page -= 1">上一页</BaseButton>
-        <span>{{ page }} / {{ pageCount }}</span>
-        <BaseButton  type="button" :disabled="page >= pageCount" @click="page += 1">下一页</BaseButton>
+      <div v-if="taskPagination.total" class="pagination">
+        <BaseButton type="button" :disabled="page <= 1 || loading" @click="changeTaskPage(page - 1)">上一页</BaseButton>
+        <span>第 {{ page }} / {{ pageCount }} 页 · 显示 {{ taskPagination.start }}–{{ taskPagination.end }} / 共 {{ taskPagination.total }} 条</span>
+        <BaseButton type="button" :disabled="page >= pageCount || loading" @click="changeTaskPage(page + 1)">下一页</BaseButton>
       </div>
     </BaseCard>
 
@@ -88,50 +88,55 @@
       <div class="compute-settings">
         <section class="settings-section">
           <BaseSwitch v-model="computeEnabled" label="启用 Windows 算力端" />
+          <div class="worker-connection-summary" :class="{ online: backendOnline, pairing: backendPairingRequired }">
+            <div><strong>{{ workerConnectionTitle }}</strong><span>{{ backendPairingRequired ? '网络已经连通，请输入 Worker 显示的六位配对码' : backendStatus.readiness?.summary || connection.subtitle_backend_url || '可以自动扫描同一局域网中的 Worker' }}</span></div>
+            <BaseButton type="button" :disabled="discoveringWorkers" @click="discoverWorkers">{{ discoveringWorkers ? '扫描中…' : '自动扫描' }}</BaseButton>
+          </div>
+          <div v-if="discoveredWorkers.length" class="worker-discovery-list">
+            <button v-for="worker in discoveredWorkers" :key="worker.url" type="button" :class="{ active: selectedWorker?.url === worker.url }" @click="selectWorker(worker)">
+              <span><strong>{{ worker.hostname }}</strong><small>{{ worker.url }} · {{ worker.gpu?.name || '未检测到 NVIDIA GPU' }}</small></span>
+              <em>{{ worker.build_version || 'dev' }} · {{ worker.readiness?.ready ? '环境就绪' : '需要配置' }}</em>
+            </button>
+          </div>
           <div class="form-grid compact-grid">
-            <FormField label="算力端地址">
-              <input v-model.trim="connection.subtitle_backend_url" placeholder="http://WINDOWS-IP:18181">
+            <FormField label="算力端地址" wide>
+              <input v-model.trim="connection.subtitle_backend_url" placeholder="可手动填写 192.168.2.46:18181 或完整 http:// 地址" @input="selectedWorker = null">
             </FormField>
-            <FormField label="回调地址">
-              <input v-model.trim="settings.console_public_url" placeholder="http://unraid-host.local:18188">
-            </FormField>
-            <FormField label="API Token" wide>
-              <SecretInput v-model.trim="connection.subtitle_backend_token" autocomplete="off" placeholder="未设置可留空" />
+            <FormField v-if="computeEnabled" label="六位配对码" wide hint="自动扫描或手动填写地址都可以配对；API Token 会自动生成并安全保存。">
+              <div class="pairing-input"><input v-model.trim="pairingCode" inputmode="numeric" maxlength="6" placeholder="000000"><BaseButton variant="primary" type="button" :disabled="pairingWorker || pairingCode.length !== 6 || !connection.subtitle_backend_url" @click="pairSelectedWorker">{{ pairingWorker ? '配对中…' : '使用此地址配对' }}</BaseButton></div>
             </FormField>
           </div>
         </section>
 
         <section class="settings-section">
-          <div class="compute-section-head">
-            <strong>Whisper 参数</strong>
-          </div>
+          <div class="compute-section-head"><strong>识别任务</strong><span>设备和计算精度由 Worker 根据硬件自动选择</span></div>
           <div class="form-grid compact-grid">
-            <FormField label="Whisper 模型">
-              <input v-model.trim="settings.whisper_model">
+            <FormField label="当前 Whisper 模型" :hint="modelSelectionHint">
+              <select v-model="settings.whisper_model" :disabled="!installedModels.length">
+                <option v-for="model in installedModels" :key="model.name" :value="model.name">{{ model.name }}</option>
+                <option v-if="!installedModels.length" value="">请先在 Worker 下载模型</option>
+              </select>
             </FormField>
-            <FormField label="设备">
-              <select v-model="settings.whisper_device"><option>cuda</option><option>cpu</option></select>
+            <FormField label="并发策略" hint="自动模式使用 Worker 根据显存计算的安全上限。">
+              <select v-model="settings.subtitle_workers_auto"><option :value="true">自动（推荐）</option><option :value="false">自定义</option></select>
             </FormField>
-            <FormField label="计算类型">
-              <select v-model="settings.whisper_compute_type"><option>float16</option><option>int8_float16</option><option>int8</option><option>float32</option></select>
-            </FormField>
-            <FormField label="并发数">
+            <FormField v-if="!settings.subtitle_workers_auto" label="请求并发数" hint="最终并发不会超过 Worker 安全上限。">
               <input v-model.number="settings.subtitle_max_workers" type="number" min="1" max="4">
             </FormField>
-            <FormField label="模型目录" wide>
-              <input v-model.trim="settings.whisper_model_dir">
-            </FormField>
           </div>
         </section>
 
-        <section class="settings-section">
-          <div class="compute-section-head">
-            <strong>路径映射</strong>
+        <details class="advanced-worker-settings">
+          <summary>高级连接设置</summary>
+          <div class="form-grid compact-grid">
+            <FormField label="回调地址" wide>
+              <input v-model.trim="settings.console_public_url" placeholder="默认使用当前 MovieMuse 地址">
+            </FormField>
+            <FormField label="路径映射" wide>
+              <textarea v-model="settings.subtitle_path_map" rows="3" placeholder="/media=\\NAS\media"></textarea>
+            </FormField>
           </div>
-          <FormField label="映射规则" wide>
-            <textarea v-model="settings.subtitle_path_map" rows="3" placeholder="/media=\\NAS\media"></textarea>
-          </FormField>
-        </section>
+        </details>
 
         <section class="settings-section hardware-section">
           <div class="compute-section-head">
@@ -141,6 +146,7 @@
             <div><span>CPU</span><strong>{{ backendStatus.hardware?.cpu || '未连接' }}</strong></div>
             <div><span>内存</span><strong>{{ memoryLabel }}</strong></div>
             <div><span>显卡</span><strong>{{ gpuLabel }}</strong></div>
+            <div><span>执行配置</span><strong>{{ backendStatus.effective_config?.device || '自动' }} · {{ backendStatus.effective_config?.compute_type || '自动' }}</strong></div>
           </div>
         </section>
       </div>
@@ -289,6 +295,8 @@ const taskStatusTab = ref('all')
 const page = ref(1)
 const jobs = ref([])
 const postprocessTasks = ref([])
+const taskCounts = reactive({ current: 0, history: 0, running: 0, waiting: 0, detached: 0, failed: 0, completed: 0, total: 0 })
+const taskPagination = reactive({ page: 1, page_size: PAGE_SIZE, page_count: 1, total: 0, start: 0, end: 0 })
 const backendStatus = ref({})
 const computeDialog = ref(false)
 const translateDialog = ref(false)
@@ -297,6 +305,11 @@ const computeEnabled = ref(false)
 const savingCompute = ref(false)
 const savingSettings = ref(false)
 const savingTranscode = ref(false)
+const discoveringWorkers = ref(false)
+const pairingWorker = ref(false)
+const discoveredWorkers = ref([])
+const selectedWorker = ref(null)
+const pairingCode = ref('')
 const loadingQbOptions = ref(false)
 const qbOptionState = ref('')
 const retryingSelected = ref(false)
@@ -310,10 +323,8 @@ let refreshGeneration = 0
 const connection = reactive({ subtitle_backend_url: '', subtitle_backend_token: '' })
 const settings = reactive({
   whisper_model: 'large-v3',
-  whisper_model_dir: '',
-  whisper_device: 'cuda',
-  whisper_compute_type: 'float16',
   subtitle_max_workers: 1,
+  subtitle_workers_auto: true,
   translation_max_workers: 1,
   subtitle_output_dir: '',
   subtitle_path_map: '',
@@ -339,8 +350,8 @@ const postprocessSettings = reactive({
   auto_transcode_enabled: false,
   auto_subtitle_enabled: false,
   worker_auto_run: false,
-  download_dir: '/media/study3',
-  output_dir: '/media/压制',
+  download_dir: '/media/downloads',
+  output_dir: '/media/processed',
   target_codec: 'av1',
   target_encoder: 'av1_nvenc',
   crf: 36,
@@ -372,7 +383,14 @@ const providerFields = {
 
 const activeProvider = computed(() => providerCards.find((item) => item.value === settings.default_translate_backend))
 const activeProviderFields = computed(() => providerFields[settings.default_translate_backend] || providerFields.google)
-const backendOnline = computed(() => !!backendStatus.value.online)
+const backendPairingRequired = computed(() => !!backendStatus.value.pairing_required)
+const backendOnline = computed(() => !!backendStatus.value.online && !backendPairingRequired.value)
+const backendStateLabel = computed(() => backendPairingRequired.value ? '待配对' : backendOnline.value ? '在线' : '离线')
+const workerConnectionTitle = computed(() => {
+  if (!computeEnabled.value) return '算力端未启用'
+  if (backendPairingRequired.value) return '算力端等待配对'
+  return backendOnline.value ? '算力端已连接' : '等待连接算力端'
+})
 const computeCallbackWarning = computed(() => {
   if (!computeEnabled.value) return ''
   const value = String(settings.console_public_url || '').trim()
@@ -413,30 +431,18 @@ const adaptedPostprocessJobs = computed(() => postprocessTasks.value.map(adaptPo
 const adaptedJobs = computed(() => [...adaptedPostprocessJobs.value, ...adaptedSubtitleJobs.value].sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0)))
 const runningStatusKeys = ['running', 'translating']
 const waitingStatusKeys = ['queued', 'translation_queued']
-const activeStatusKeys = [...runningStatusKeys, ...waitingStatusKeys, 'detached']
 const cancellableStatusKeys = [...runningStatusKeys, ...waitingStatusKeys]
-const runningJobs = computed(() => adaptedJobs.value.filter((job) => runningStatusKeys.includes(job.statusKey)))
-const waitingJobs = computed(() => adaptedJobs.value.filter((job) => waitingStatusKeys.includes(job.statusKey)))
-const failedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'failed'))
-const detachedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'detached'))
-const completedJobs = computed(() => adaptedJobs.value.filter((job) => job.statusKey === 'completed'))
-const activeJobs = computed(() => adaptedJobs.value.filter((job) => activeStatusKeys.includes(job.statusKey)))
-const historyJobs = computed(() => adaptedJobs.value.filter((job) => ['completed', 'failed', 'detached'].includes(job.statusKey)))
-const runningCount = computed(() => runningJobs.value.length)
-const waitingCount = computed(() => waitingJobs.value.length)
-const failedCount = computed(() => failedJobs.value.length)
-const detachedCount = computed(() => detachedJobs.value.length)
 const statusTabs = computed(() => [
-  { key: 'all', label: '全部', count: activeJobs.value.length, items: activeJobs.value },
-  { key: 'running', label: '运行中', count: runningCount.value, items: runningJobs.value },
-  { key: 'waiting', label: '等待中', count: waitingCount.value, items: waitingJobs.value },
-  { key: 'detached', label: '已清理', count: detachedCount.value, items: detachedJobs.value },
-  { key: 'failed', label: '失败', count: failedCount.value, items: failedJobs.value },
-  { key: 'completed', label: '已完成', count: completedJobs.value.length, items: completedJobs.value }
+  { key: 'all', label: '全部', count: taskCounts.current },
+  { key: 'running', label: '运行中', count: taskCounts.running },
+  { key: 'waiting', label: '等待中', count: taskCounts.waiting },
+  { key: 'detached', label: '已清理', count: taskCounts.detached },
+  { key: 'failed', label: '失败', count: taskCounts.failed },
+  { key: 'completed', label: '已完成', count: taskCounts.completed }
 ])
-const visibleJobs = computed(() => taskTab.value === 'history' ? historyJobs.value : (statusTabs.value.find((state) => state.key === taskStatusTab.value)?.items || []))
-const pageCount = computed(() => Math.max(1, Math.ceil(visibleJobs.value.length / PAGE_SIZE)))
-const visiblePagedJobs = computed(() => visibleJobs.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE))
+const visibleJobs = computed(() => adaptedJobs.value)
+const pageCount = computed(() => Math.max(1, Number(taskPagination.page_count || 1)))
+const visiblePagedJobs = computed(() => visibleJobs.value)
 const selectedJobs = computed(() => adaptedJobs.value.filter((job) => selectedIds.has(job.id)))
 const runnableSelectedJobs = computed(() => selectedJobs.value.filter((job) => job.canRun))
 const allVisibleSelected = computed(() => visiblePagedJobs.value.length > 0 && visiblePagedJobs.value.every((job) => selectedIds.has(job.id)))
@@ -445,6 +451,17 @@ const memoryLabel = computed(() => {
   return memory ? `${memory.label || ''} · ${memory.used_percent || 0}%` : '未连接'
 })
 const gpuLabel = computed(() => backendStatus.value.hardware?.gpus?.[0]?.label || '未检测')
+const installedModels = computed(() => {
+  const models = backendStatus.value?.settings?.local_models || []
+  return models.filter((item) => item?.name && !String(item.name).startsWith('.'))
+})
+const modelSelectionHint = computed(() => {
+  if (!installedModels.value.length) {
+    const recommended = backendStatus.value?.model_recommendation?.recommended_model
+    return recommended ? `推荐 ${recommended}，请先在 Worker 模型页下载。` : '请先在 Worker 模型页下载并验证模型。'
+  }
+  return `仅显示 Worker 已安装并验证的模型；当前共 ${installedModels.value.length} 个。`
+})
 const transcodeSummary = computed(() => transcodeFormatLabel(postprocessSettings.target_codec))
 const allEncodingPresets = computed(() => [
   ...standardEncodingPresets,
@@ -485,14 +502,12 @@ async function loadConsole() {
   try {
     const [consolePayload, postprocessPayload] = await Promise.all([
       api('/api/subtitle/console'),
-      api('/api/postprocess/tasks?limit=200')
+      api(taskCenterUrl())
     ])
     if (generation !== refreshGeneration) return
     Object.assign(connection, consolePayload.connection || {})
     computeEnabled.value = !!connection.subtitle_backend_url
     Object.assign(settings, consolePayload.compute_settings || {})
-    jobs.value = consolePayload.jobs || []
-    postprocessTasks.value = postprocessPayload.tasks || []
     applyPostprocessPayload(postprocessPayload)
     backendStatus.value = postprocessPayload.worker_status || consolePayload.backend_status || {}
   } catch (error) {
@@ -517,13 +532,8 @@ const standardEncodingPresets = [
 async function refreshAll() {
   if (isCompareView) return
   const generation = ++refreshGeneration
-  const [subtitlePayload, postprocessPayload] = await Promise.all([
-    api('/api/subtitle/jobs?limit=0'),
-    api('/api/postprocess/tasks?limit=200')
-  ])
+  const postprocessPayload = await api(taskCenterUrl())
   if (generation !== refreshGeneration) return
-  jobs.value = subtitlePayload.jobs || []
-  postprocessTasks.value = postprocessPayload.tasks || []
   applyPostprocessPayload(postprocessPayload)
   backendStatus.value = postprocessPayload.worker_status || backendStatus.value
 }
@@ -552,6 +562,58 @@ async function saveConnection() {
   })
   Object.assign(connection, result.connection || {})
   backendStatus.value = result.backend_status || backendStatus.value
+  return result
+}
+
+async function discoverWorkers() {
+  discoveringWorkers.value = true
+  errorMessage.value = ''
+  try {
+    const host = window.location.hostname || ''
+    const payload = await api(`/api/subtitle/discovery?host=${encodeURIComponent(host)}`)
+    discoveredWorkers.value = payload.workers || []
+    if (discoveredWorkers.value.length === 1) selectWorker(discoveredWorkers.value[0])
+    notice.value = discoveredWorkers.value.length
+      ? `发现 ${discoveredWorkers.value.length} 台 MovieMuse Worker。`
+      : `没有在 ${payload.network || '当前局域网'} 找到 Worker，可保留手动填写地址。`
+  } catch (error) {
+    errorMessage.value = error.message || '自动扫描失败'
+  } finally {
+    discoveringWorkers.value = false
+  }
+}
+
+function selectWorker(worker) {
+  selectedWorker.value = worker
+  connection.subtitle_backend_url = worker.url || ''
+  computeEnabled.value = true
+  pairingCode.value = ''
+}
+
+async function pairSelectedWorker() {
+  let workerUrl = String(connection.subtitle_backend_url || '').trim().replace(/\/+$/, '')
+  if (!workerUrl) return
+  if (!/^https?:\/\//i.test(workerUrl)) workerUrl = `http://${workerUrl}`
+  connection.subtitle_backend_url = workerUrl
+  pairingWorker.value = true
+  errorMessage.value = ''
+  try {
+    if (!settings.console_public_url) settings.console_public_url = window.location.origin
+    const result = await postJson('/api/subtitle/pair', {
+      worker_url: workerUrl,
+      pairing_code: pairingCode.value
+    })
+    Object.assign(connection, result.connection || {})
+    backendStatus.value = result.backend_status || backendStatus.value
+    pairingCode.value = ''
+    selectedWorker.value = null
+    notice.value = result.sync_warning || '算力端配对成功，API Token 已自动保存。'
+    await loadConsole()
+  } catch (error) {
+    errorMessage.value = error.message || '算力端配对失败'
+  } finally {
+    pairingWorker.value = false
+  }
 }
 
 async function saveSettings(closeDialog = true) {
@@ -564,6 +626,7 @@ async function saveSettings(closeDialog = true) {
     backendStatus.value = payload.backend_status || backendStatus.value
     notice.value = payload.warning || '翻译后端设置已保存。'
     if (closeDialog) translateDialog.value = false
+    return payload
   } catch (error) {
     errorMessage.value = error.message || '保存翻译设置失败'
   } finally {
@@ -575,15 +638,21 @@ async function saveComputeAll() {
   savingCompute.value = true
   errorMessage.value = ''
   try {
+    if (!settings.console_public_url) settings.console_public_url = window.location.origin
     if (computeCallbackWarning.value) {
       throw new Error(computeCallbackWarning.value)
     }
     refreshGeneration += 1
-    await saveConnection()
-    await saveSettings(false)
+    const connectionResult = await saveConnection()
+    const settingsResult = await saveSettings(false)
+    if (!settingsResult) return
     computeDialog.value = false
     await loadConsole()
-    notice.value = '算力端设置已保存。'
+    notice.value = connectionResult.sync_warning
+      || settingsResult?.warning
+      || (connectionResult.settings_synced ? '算力端设置已保存，并已同步控制端配置。' : '算力端设置已保存。')
+  } catch (error) {
+    errorMessage.value = error.message || '保存算力端设置失败'
   } finally {
     savingCompute.value = false
   }
@@ -678,10 +747,33 @@ function transcodeFormatLabel(codec) {
 }
 
 function applyPostprocessPayload(payload = {}) {
-  postprocessTasks.value = payload.tasks || []
+  const items = Array.isArray(payload.items) ? payload.items : []
+  postprocessTasks.value = items.filter((item) => item?.source_type === 'postprocess').map((item) => item.raw)
+  jobs.value = items.filter((item) => item?.source_type === 'subtitle').map((item) => item.raw)
+  Object.assign(taskCounts, payload.counts || {})
+  Object.assign(taskPagination, payload.pagination || {})
+  page.value = Number(taskPagination.page || 1)
   if (!transcodeDialog.value && !savingTranscode.value) {
     Object.assign(postprocessSettings, normalizePostprocessSettings(payload.settings || {}))
   }
+}
+
+function taskCenterUrl() {
+  const params = new URLSearchParams({
+    scope: taskTab.value,
+    category: taskTab.value === 'history' ? 'all' : taskStatusTab.value,
+    page: String(page.value),
+    page_size: String(PAGE_SIZE)
+  })
+  return `/api/task-center?${params.toString()}`
+}
+
+async function changeTaskPage(nextPage) {
+  const target = Math.max(1, Math.min(pageCount.value, Number(nextPage || 1)))
+  if (target === page.value) return
+  page.value = target
+  selectedIds.clear()
+  await refreshAll()
 }
 
 async function runPostprocessQueue() {
@@ -1119,8 +1211,8 @@ function normalizePostprocessSettings(payload = {}) {
     auto_transcode_enabled: !!payload.auto_transcode_enabled,
     auto_subtitle_enabled: !!payload.auto_subtitle_enabled,
     worker_auto_run: !!payload.worker_auto_run,
-    download_dir: payload.download_dir || '/media/study3',
-    output_dir: payload.output_dir || '/media/压制',
+    download_dir: payload.download_dir || '/media/downloads',
+    output_dir: payload.output_dir || '/media/processed',
     target_codec: payload.target_codec || 'av1',
     target_encoder: payload.target_encoder || (payload.target_codec === 'h265' ? 'libx265' : 'av1_nvenc'),
     crf: Number(payload.crf || 36),
@@ -1163,7 +1255,7 @@ function clearRefreshTimer() {
 
 function nextRefreshDelay() {
   if (document.hidden) return HIDDEN_POLL_MS
-  return activeJobs.value.length ? ACTIVE_POLL_MS : IDLE_POLL_MS
+  return Number(taskCounts.running || 0) + Number(taskCounts.waiting || 0) > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS
 }
 
 function scheduleRefresh() {
@@ -1184,7 +1276,15 @@ function handleVisibilityChange() {
   scheduleRefresh()
 }
 
-watch([taskTab, taskStatusTab], () => { page.value = 1 })
+watch([taskTab, taskStatusTab], async () => {
+  page.value = 1
+  selectedIds.clear()
+  try {
+    await refreshAll()
+  } catch (error) {
+    errorMessage.value = error.message || '读取任务列表失败'
+  }
+})
 
 onMounted(async () => {
   if (isCompareView) return
@@ -1293,6 +1393,10 @@ h1 {
   color: var(--mm-primary);
 }
 
+.service-card em.warn {
+  color: var(--mm-warning);
+}
+
 .service-card i {
   position: absolute;
   top: 28px;
@@ -1307,6 +1411,11 @@ h1 {
 .service-card i.on {
   background: var(--mm-primary);
   box-shadow: 0 0 0 10px var(--mm-primary-soft);
+}
+
+.service-card i.warn {
+  background: var(--mm-warning);
+  box-shadow: 0 0 0 10px var(--mm-warning-soft);
 }
 
 .task-panel {
@@ -1482,6 +1591,98 @@ h1 {
   gap: 14px 20px;
 }
 
+.worker-connection-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: var(--mm-control-bg);
+}
+
+.worker-connection-summary.online {
+  border-color: rgba(72, 190, 112, 0.42);
+}
+
+.worker-connection-summary.pairing {
+  border-color: var(--mm-warning-border);
+  background: var(--mm-warning-soft);
+}
+
+.worker-connection-summary div,
+.worker-discovery-list button span {
+  display: grid;
+  gap: 4px;
+}
+
+.worker-connection-summary span,
+.worker-discovery-list small,
+.compute-section-head span {
+  color: var(--mm-muted);
+  font-size: 12px;
+}
+
+.worker-discovery-list {
+  display: grid;
+  gap: 8px;
+}
+
+.worker-discovery-list button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: var(--mm-control-bg);
+  color: var(--mm-text);
+  text-align: left;
+}
+
+.worker-discovery-list button.active {
+  border-color: var(--mm-primary);
+  background: var(--mm-primary-soft);
+}
+
+.worker-discovery-list em {
+  color: var(--mm-muted);
+  font-size: 12px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.pairing-input {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 10px;
+}
+
+.pairing-input input {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-weight: 700;
+  letter-spacing: .2em;
+}
+
+.advanced-worker-settings {
+  padding: 14px;
+  border: 1px solid var(--mm-border);
+  border-radius: 8px;
+  background: var(--mm-surface);
+}
+
+.advanced-worker-settings summary {
+  cursor: pointer;
+  color: var(--mm-muted);
+  font-weight: 650;
+}
+
+.advanced-worker-settings[open] summary {
+  margin-bottom: 14px;
+}
+
 .settings-section :deep(.mm-field) {
   min-width: 0;
 }
@@ -1496,7 +1697,7 @@ h1 {
 }
 
 .hardware-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 input,

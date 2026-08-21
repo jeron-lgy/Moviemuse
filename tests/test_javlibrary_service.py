@@ -55,6 +55,98 @@ class JavLibraryServiceSessionTest(unittest.TestCase):
         self.assertEqual(len(homepage_hits), 1)
         self.assertEqual(service.stats()["session_uses"], 2)
 
+    def test_single_flaresolverr_500_retries_same_session(self) -> None:
+        service = JavLibraryService()
+        service.set_service_url_provider(lambda: "http://flaresolverr.local/v1")
+        commands: list[dict[str, object]] = []
+        target_attempts = 0
+
+        def fake_post(url: str, json: dict[str, object], timeout: object) -> FakeResponse:
+            nonlocal target_attempts
+            commands.append(dict(json))
+            if json.get("cmd") == "sessions.create":
+                return FakeResponse({"status": "ok"})
+            if json.get("cmd") == "sessions.destroy":
+                return FakeResponse({"status": "ok"})
+            if json.get("cmd") == "request.get":
+                if str(json.get("url") or "").endswith("/cn/"):
+                    return FakeResponse(ok_html("<html><title>JavLibrary</title></html>"))
+                target_attempts += 1
+                if target_attempts == 1:
+                    return FakeResponse({}, status_code=500)
+                return FakeResponse(ok_html("<html><div>recovered</div></html>"))
+            return FakeResponse({"status": "error", "message": "unexpected"})
+
+        with patch("app.javlibrary_service.requests.post", side_effect=fake_post):
+            html = service.fetch_with_flaresolverr(
+                "https://www.javlibrary.com/cn/vl_star.php?s=abc",
+                retries=1,
+                base_delay=0,
+                max_delay=0,
+                cooldown=0,
+            )
+
+        self.assertIn("recovered", html)
+        self.assertEqual([item["cmd"] for item in commands].count("sessions.create"), 1)
+        self.assertEqual([item["cmd"] for item in commands].count("sessions.destroy"), 0)
+
+    def test_consecutive_flaresolverr_500_rebuilds_once(self) -> None:
+        service = JavLibraryService()
+        service.set_service_url_provider(lambda: "http://flaresolverr.local/v1")
+        commands: list[dict[str, object]] = []
+        target_attempts = 0
+
+        def fake_post(url: str, json: dict[str, object], timeout: object) -> FakeResponse:
+            nonlocal target_attempts
+            commands.append(dict(json))
+            if json.get("cmd") in {"sessions.create", "sessions.destroy"}:
+                return FakeResponse({"status": "ok"})
+            if json.get("cmd") == "request.get":
+                if str(json.get("url") or "").endswith("/cn/"):
+                    return FakeResponse(ok_html("<html><title>JavLibrary</title></html>"))
+                target_attempts += 1
+                if target_attempts <= 2:
+                    return FakeResponse({}, status_code=500)
+                return FakeResponse(ok_html("<html><div>recovered</div></html>"))
+            return FakeResponse({"status": "error", "message": "unexpected"})
+
+        with patch("app.javlibrary_service.requests.post", side_effect=fake_post):
+            html = service.fetch_with_flaresolverr(
+                "https://www.javlibrary.com/cn/vl_star.php?s=abc",
+                retries=2,
+                base_delay=0,
+                max_delay=0,
+                cooldown=0,
+            )
+
+        self.assertIn("recovered", html)
+        self.assertEqual([item["cmd"] for item in commands].count("sessions.create"), 2)
+        self.assertEqual([item["cmd"] for item in commands].count("sessions.destroy"), 1)
+
+    def test_destroy_failure_is_reported_and_keeps_session_owned(self) -> None:
+        service = JavLibraryService()
+        service.set_service_url_provider(lambda: "http://flaresolverr.local/v1")
+
+        def fake_post(url: str, json: dict[str, object], timeout: object) -> FakeResponse:
+            if json.get("cmd") == "sessions.create":
+                return FakeResponse({"status": "ok"})
+            if json.get("cmd") == "sessions.destroy":
+                return FakeResponse({}, status_code=500)
+            return FakeResponse(ok_html("<html><div>ok</div></html>"))
+
+        with patch("app.javlibrary_service.requests.post", side_effect=fake_post), \
+            patch("app.javlibrary_service.time.sleep", return_value=None):
+            service.fetch_with_flaresolverr(
+                "https://www.javlibrary.com/cn/vl_star.php?s=abc",
+                cooldown=0,
+            )
+            closed = service.close(timeout_ms=1000)
+
+        self.assertFalse(closed)
+        self.assertTrue(service.stats()["session_active"])
+        self.assertTrue(service.stats()["session_destroy_pending"])
+        self.assertEqual(service.stats()["session_destroy_failures"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

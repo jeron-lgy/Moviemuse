@@ -11,11 +11,15 @@ import threading
 import time
 import json
 import secrets
+import stat
 import uuid
 import hashlib
 import base64
 import codecs
 import struct
+import ipaddress
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -25,16 +29,17 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .log_service import AppLogService
+from .path_policy import require_path_within
 from .scanner import ScanResult, detect_catalog_number, normalize_catalog_digits, scan_libraries
 from .scan_state import scan_cache
 from .storage import MoveRequest, MoveResult, Storage
 from .mteam_service import download_mteam_torrent, search_mteam
-from .postprocess_service import PostprocessService
+from .postprocess_service import DEFAULT_POSTPROCESS_DOWNLOAD_DIR, DEFAULT_POSTPROCESS_OUTPUT_DIR, PostprocessService
 from .subscription_service import SubscriptionService, date_is_after
 from .system_settings import SystemSettingsService
 from .dmm_service import dmm
@@ -46,14 +51,27 @@ from .subtitle_service import (
     SubtitleService,
     load_compute_config,
     load_subtitle_settings,
+    map_remote_path,
     read_srt,
     save_compute_config,
     translation_source_text,
 )
+from .worker_service import WorkerModelService, WorkerRuntimeControl, whisper_model_recommendation
+from .worker_gpu_runtime_service import WorkerGpuRuntimeService
+from .worker_readiness_service import WorkerReadinessService
+from .worker_update_service import WorkerSoftwareUpdateService
 
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
+WORKER_UI_DIST = next(
+    (path for path in (BASE_DIR.parent / "worker-ui", BASE_DIR.parent / "frontend" / "worker-dist") if path.exists()),
+    BASE_DIR.parent / "frontend" / "worker-dist",
+)
+PROCESS_STARTED_AT = time.time()
+WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+WINDOWS_CPU_TIMES_LOCK = threading.Lock()
+WINDOWS_CPU_TIMES_PREVIOUS: tuple[int, int, int] | None = None
 SUBTITLE_FILE_KINDS = {"original_srt", "translated_srt", "bilingual_srt", "original_vtt", "translated_vtt"}
 SUBTITLE_REMOTE_JOBS_CACHE_FILE = "subtitle_remote_jobs_cache.json"
 
@@ -238,7 +256,8 @@ def remote_http_client(timeout: float | None = 30) -> httpx.Client:
 
 
 def frontend_api_token() -> str:
-    return os.getenv("SUBTITLE_API_TOKEN", "").strip()
+    _, _, data_dir = settings()
+    return str(load_compute_config(data_dir).get("subtitle_api_token") or os.getenv("SUBTITLE_API_TOKEN", "")).strip()
 
 
 POSTPROCESS_TERMINAL_STATUSES = {"completed", "failed", "ignored", "expired", "conflict"}
@@ -326,6 +345,7 @@ def remote_settings() -> dict[str, Any]:
         "whisper_device": "cuda",
         "whisper_compute_type": "float16",
         "subtitle_max_workers": 1,
+        "subtitle_workers_auto": True,
         "translation_max_workers": 1,
         "subtitle_output_dir": os.getenv("SUBTITLE_OUTPUT_DIR", ""),
         "subtitle_path_map": "",
@@ -423,7 +443,7 @@ def whisper_model_options() -> list[dict[str, str]]:
             "id": "large-v3-turbo",
             "name": "large-v3-turbo",
             "note": "速度更快，适合批量补字幕时优先尝试。",
-            "url": "https://huggingface.co/Systran/faster-whisper-large-v3-turbo",
+            "url": "https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo",
         },
         {
             "id": "medium",
@@ -530,6 +550,7 @@ def compute_settings_payload(settings_obj: Any, config: dict[str, Any] | None = 
         "whisper_device": value("whisper_device", "device", "cuda"),
         "whisper_compute_type": value("whisper_compute_type", "compute_type", "float16"),
         "subtitle_max_workers": value("subtitle_max_workers", "max_workers", 1),
+        "subtitle_workers_auto": bool(config.get("subtitle_workers_auto", True)),
         "translation_max_workers": value("translation_max_workers", "translation_max_workers", 1),
         "subtitle_output_dir": str(value("subtitle_output_dir", "default_output_dir", "") or ""),
         "subtitle_path_map": config.get("subtitle_path_map", ""),
@@ -559,6 +580,7 @@ SAVED_COMPUTE_SETTING_KEYS = {
     "whisper_device",
     "whisper_compute_type",
     "subtitle_max_workers",
+    "subtitle_workers_auto",
     "translation_max_workers",
     "subtitle_output_dir",
     "subtitle_path_map",
@@ -584,10 +606,9 @@ SAVED_COMPUTE_SETTING_KEYS = {
 
 REMOTE_COMPUTE_SETTING_KEYS = {
     "whisper_model",
-    "whisper_device",
-    "whisper_compute_type",
     "subtitle_max_workers",
     "translation_max_workers",
+    "subtitle_path_map",
     "default_translate_backend",
     "google_translate_url",
     "deepl_api_url",
@@ -605,9 +626,85 @@ REMOTE_COMPUTE_SETTING_KEYS = {
     "ollama_model",
 }
 
+WORKER_LOCAL_SETTING_KEYS = {
+    "whisper_model_dir",
+    "whisper_device",
+    "whisper_compute_type",
+}
+
+
+def worker_safe_concurrency_limits(gpus: list[dict[str, Any]] | None = None) -> dict[str, int]:
+    candidates = gpus if gpus is not None else gpu_summary()
+    memory_mb = max(
+        (int(item.get("memory_total_mb") or 0) for item in candidates if isinstance(item, dict)),
+        default=0,
+    )
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return {
+        "subtitle": 2 if memory_mb >= 20 * 1024 else 1,
+        "translation": max(1, min(2, cpu_count // 4)),
+        "transcode": 2 if memory_mb >= 16 * 1024 else 1,
+    }
+
+
+def normalize_worker_compute_payload(payload: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Apply controller requests without allowing them to replace Worker-local decisions."""
+    normalized = {key: value for key, value in payload.items() if key not in WORKER_LOCAL_SETTING_KEYS}
+    gpus = gpu_summary()
+    limits = worker_safe_concurrency_limits(gpus)
+    device = "cuda" if gpus else "cpu"
+    compute_type = "float16" if gpus else "int8"
+    for key, limit_name in (
+        ("subtitle_max_workers", "subtitle"),
+        ("translation_max_workers", "translation"),
+    ):
+        raw = normalized.get(key, current.get(f"controller_requested_{key}", current.get(key, 1)))
+        try:
+            requested = max(1, int(raw))
+        except (TypeError, ValueError):
+            requested = 1
+        normalized[f"controller_requested_{key}"] = requested
+        normalized[key] = min(requested, limits[limit_name])
+    normalized.update({
+        "whisper_device": device,
+        "whisper_compute_type": compute_type,
+        "worker_safe_subtitle_max_workers": limits["subtitle"],
+        "worker_safe_translation_max_workers": limits["translation"],
+        "worker_safe_transcode_max_workers": limits["transcode"],
+    })
+    return normalized
+
+
+def migrate_compute_config_ownership() -> None:
+    _, _, data_dir = settings()
+    current = load_compute_config(data_dir)
+    if compute_node_only():
+        migrated = {**current, **normalize_worker_compute_payload(current, current)}
+    else:
+        migrated = {key: value for key, value in current.items() if key not in WORKER_LOCAL_SETTING_KEYS}
+    if migrated != current:
+        save_compute_config(data_dir, migrated)
+
 
 def remote_compute_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {key: payload[key] for key in REMOTE_COMPUTE_SETTING_KEYS if key in payload}
+    result = {key: payload[key] for key in REMOTE_COMPUTE_SETTING_KEYS if key in payload}
+    if bool(payload.get("subtitle_workers_auto")):
+        result["subtitle_max_workers"] = 999
+    return result
+
+
+def current_remote_compute_settings_payload() -> dict[str, Any]:
+    """Build the authoritative Worker settings from the controller's saved config."""
+    _, _, data_dir = settings()
+    config = load_compute_config(data_dir)
+    saved_settings = load_subtitle_settings(data_dir)
+    return remote_compute_settings_payload(compute_settings_payload(saved_settings, config))
+
+
+def sync_remote_compute_settings() -> dict[str, Any]:
+    if not backend_url():
+        return {"status": "skipped", "reason": "local_compute"}
+    return remote_post_json("/api/compute/settings", current_remote_compute_settings_payload())
 
 
 def overlay_saved_console_settings(visible_settings: Any, console_config: dict[str, Any] | None = None) -> dict[str, object]:
@@ -644,6 +741,8 @@ def save_local_compute_settings(payload: dict[str, Any]) -> dict[str, object]:
     _, _, data_dir = settings()
     config = load_compute_config(data_dir)
     payload = restore_secret_placeholders(payload, config)
+    if compute_node_only():
+        payload = normalize_worker_compute_payload(payload, config)
     config.update(payload)
     save_compute_config(data_dir, config)
     restarted = reset_subtitle_service_if_idle()
@@ -658,6 +757,9 @@ def save_console_compute_config(payload: dict[str, Any]) -> dict[str, Any]:
     _, _, data_dir = settings()
     config = load_compute_config(data_dir)
     payload = restore_secret_placeholders(payload, config)
+    for key in WORKER_LOCAL_SETTING_KEYS:
+        config.pop(key, None)
+        payload.pop(key, None)
     config.update(payload)
     save_compute_config(data_dir, config)
     return config
@@ -667,10 +769,14 @@ app = FastAPI(title="媒体工具箱")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST), name="frontend-assets")
+if WORKER_UI_DIST.exists():
+    app.mount("/worker-assets", StaticFiles(directory=WORKER_UI_DIST), name="worker-assets")
 move_jobs: dict[str, dict[str, Any]] = {}
 move_jobs_lock = threading.Lock()
 console_sessions: dict[str, dict[str, Any]] = {}
 console_sessions_lock = threading.RLock()
+IN_MEMORY_JOB_HISTORY_LIMIT = max(20, int(os.getenv("IN_MEMORY_JOB_HISTORY_LIMIT", "200")))
+CONSOLE_SESSION_MAX_ENTRIES = max(10, int(os.getenv("CONSOLE_SESSION_MAX_ENTRIES", "256")))
 CONSOLE_SESSION_COOKIE = "moviemuse_session"
 CONSOLE_SESSION_TTL = 7 * 24 * 60 * 60
 CONSOLE_AUTH_OPEN_PREFIXES = (
@@ -681,13 +787,27 @@ CONSOLE_AUTH_OPEN_PREFIXES = (
     "/api/subtitle/translate",
     "/api/transcode",
     "/api/compute",
+    "/api/worker",
     "/api/integrations/jellyfin",
     "/static",
     "/assets",
+    "/worker",
+    "/worker-assets",
     "/docs",
     "/openapi.json",
 )
 CONSOLE_AUTH_OPEN_EXACT = {"/api/v1/message"}
+CONSOLE_AUTH_LEGACY_WRITE_EXACT = {
+    "/scan/run",
+    "/scan/subtitles",
+    "/terminal/settings",
+    "/subtitles/backend/settings",
+    "/subtitles/connection",
+    "/subtitles/jobs",
+    "/preview",
+    "/move",
+    "/move/jobs",
+}
 
 
 def console_auth_required_path(path: str) -> bool:
@@ -697,6 +817,10 @@ def console_auth_required_path(path: str) -> bool:
         return False
     if path.startswith("/api/postprocess/tasks/") and path.endswith("/worker-done"):
         return False
+    if path in CONSOLE_AUTH_LEGACY_WRITE_EXACT:
+        return True
+    if path.startswith("/subtitles/batches/") and path.endswith("/submit"):
+        return True
     return path.startswith("/api/")
 
 
@@ -728,8 +852,29 @@ def frontend_app_response() -> FileResponse:
     raise HTTPException(status_code=404, detail="MovieMuse frontend is not built. Run the frontend build first.")
 
 
+def worker_app_response() -> FileResponse:
+    worker_index = WORKER_UI_DIST / "index.html"
+    if worker_index.exists():
+        return FileResponse(worker_index, headers={"Cache-Control": "no-store"})
+    raise HTTPException(status_code=404, detail="MovieMuse Worker UI is not built. Run npm run build:worker first.")
+
+
 transcode_jobs: dict[str, dict[str, Any]] = {}
 transcode_jobs_lock = threading.Lock()
+
+
+def prune_finished_job_registry(registry: dict[str, dict[str, Any]], *, limit: int = IN_MEMORY_JOB_HISTORY_LIMIT) -> None:
+    overflow = len(registry) - max(1, limit)
+    if overflow <= 0:
+        return
+    terminal = [
+        (job_id, job)
+        for job_id, job in registry.items()
+        if str(job.get("status") or "") in {"completed", "failed", "cancelled"}
+    ]
+    terminal.sort(key=lambda item: float(item[1].get("finished_at") or item[1].get("created_at") or 0))
+    for job_id, _ in terminal[:overflow]:
+        registry.pop(job_id, None)
 
 
 def move_result_payload(result: MoveResult) -> dict[str, object]:
@@ -794,6 +939,7 @@ def create_move_job(paths: list[str]) -> str:
     }
     with move_jobs_lock:
         move_jobs[job_id] = job
+        prune_finished_job_registry(move_jobs)
     thread = threading.Thread(target=run_move_job, args=(job_id, unique_paths), daemon=True)
     thread.start()
     return job_id
@@ -841,6 +987,54 @@ def run_move_job(job_id: str, paths: list[str]) -> None:
             job["updated_at"] = time.time()
             job["finished_at"] = time.time()
 subtitle_service: SubtitleService | None = None
+worker_model_service: WorkerModelService | None = None
+worker_runtime_control = WorkerRuntimeControl()
+worker_software_update_service: WorkerSoftwareUpdateService | None = None
+worker_gpu_runtime_service: WorkerGpuRuntimeService | None = None
+worker_readiness_service = WorkerReadinessService()
+worker_pairing_lock = threading.RLock()
+worker_pairing_state: dict[str, Any] = {}
+WORKER_PAIRING_TTL_SECONDS = 10 * 60
+
+
+def worker_pairing_payload(*, include_code: bool = False) -> dict[str, Any]:
+    now = time.time()
+    with worker_pairing_lock:
+        if float(worker_pairing_state.get("expires_at") or 0) <= now:
+            worker_pairing_state.update({
+                "code": f"{secrets.randbelow(1_000_000):06d}",
+                "expires_at": now + WORKER_PAIRING_TTL_SECONDS,
+            })
+        payload = {
+            "paired": bool(frontend_api_token()),
+            "expires_at": float(worker_pairing_state["expires_at"]),
+        }
+        if include_code:
+            payload["code"] = str(worker_pairing_state["code"])
+        return payload
+
+
+def consume_worker_pairing_code(code: str) -> bool:
+    expected = worker_pairing_payload(include_code=True)
+    candidate = re.sub(r"\D", "", str(code or ""))
+    if len(candidate) != 6 or not secrets.compare_digest(candidate, str(expected.get("code") or "")):
+        return False
+    with worker_pairing_lock:
+        worker_pairing_state.clear()
+    return True
+
+
+def worker_pairing_attempt_allowed() -> bool:
+    now = time.time()
+    with worker_pairing_lock:
+        failures = [float(value) for value in worker_pairing_state.get("failures", []) if float(value) > now - 60]
+        worker_pairing_state["failures"] = failures
+        return len(failures) < 8
+
+
+def record_worker_pairing_failure() -> None:
+    with worker_pairing_lock:
+        worker_pairing_state.setdefault("failures", []).append(time.time())
 
 
 class SubtitleJobCreate(BaseModel):
@@ -869,6 +1063,42 @@ def get_subtitle_service() -> SubtitleService:
     return subtitle_service
 
 
+def get_worker_model_service() -> WorkerModelService:
+    global worker_model_service
+    _, _, data_dir = settings()
+    model_dir = load_subtitle_settings(data_dir).model_dir or (data_dir / "whisper-models")
+    if worker_model_service is None or worker_model_service.model_dir.resolve() != model_dir.resolve():
+        worker_model_service = WorkerModelService(model_dir)
+    return worker_model_service
+
+
+def get_worker_software_update_service() -> WorkerSoftwareUpdateService:
+    global worker_software_update_service
+    _, _, data_dir = settings()
+    current_version = worker_build_version()
+    cache_path = data_dir / "worker-software-update.json"
+    if (
+        worker_software_update_service is None
+        or worker_software_update_service.current_version != current_version
+        or worker_software_update_service.cache_path.resolve() != cache_path.resolve()
+    ):
+        worker_software_update_service = WorkerSoftwareUpdateService(current_version, cache_path)
+    return worker_software_update_service
+
+
+def get_worker_gpu_runtime_service() -> WorkerGpuRuntimeService:
+    global worker_gpu_runtime_service
+    _, _, data_dir = settings()
+    package_root = BASE_DIR.parent
+    if (
+        worker_gpu_runtime_service is None
+        or worker_gpu_runtime_service.data_dir != data_dir.resolve()
+        or worker_gpu_runtime_service.package_root != package_root.resolve()
+    ):
+        worker_gpu_runtime_service = WorkerGpuRuntimeService(data_dir, package_root)
+    return worker_gpu_runtime_service
+
+
 def reset_subtitle_service_if_idle() -> bool:
     global subtitle_service
     if subtitle_service is None:
@@ -876,9 +1106,11 @@ def reset_subtitle_service_if_idle() -> bool:
     active = [
         job
         for job in subtitle_service.list_jobs()
-        if job.status in {"queued", "running"}
+        if job.status in {"queued", "running", "translating"}
     ]
     if active:
+        return False
+    if not subtitle_service.close(timeout=5):
         return False
     subtitle_service = None
     return True
@@ -890,12 +1122,22 @@ def require_subtitle_token(
 ) -> None:
     expected = frontend_api_token()
     if not expected:
+        if compute_node_only():
+            raise HTTPException(status_code=401, detail="算力端尚未与 MovieMuse 配对")
         return
     bearer = ""
     if authorization and authorization.lower().startswith("bearer "):
         bearer = authorization[7:].strip()
     if x_api_key != expected and bearer != expected:
         raise HTTPException(status_code=401, detail="字幕 API token 不正确")
+
+
+def subtitle_upload_max_bytes() -> int:
+    default = 8 * 1024 ** 3
+    try:
+        return max(1024 ** 2, int(os.getenv("SUBTITLE_UPLOAD_MAX_BYTES", str(default))))
+    except (TypeError, ValueError):
+        return default
 
 
 def job_payload(job: SubtitleJob | dict[str, Any]) -> dict[str, object]:
@@ -1261,6 +1503,70 @@ def memory_summary() -> dict[str, object]:
     return {"total_bytes": 0, "available_bytes": 0, "used_percent": 0, "label": "未知"}
 
 
+def runtime_memory_summary() -> dict[str, object]:
+    result: dict[str, object] = {
+        "threads": threading.active_count(),
+        "process_rss_bytes": 0,
+        "process_peak_rss_bytes": 0,
+    }
+    status_path = Path("/proc/self/status")
+    if status_path.exists():
+        try:
+            values: dict[str, int] = {}
+            for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, _, raw = line.partition(":")
+                parts = raw.split()
+                if parts and parts[0].isdigit():
+                    values[key] = int(parts[0]) * (1024 if len(parts) > 1 and parts[1].lower() == "kb" else 1)
+            result["process_rss_bytes"] = values.get("VmRSS", 0)
+            result["process_peak_rss_bytes"] = values.get("VmHWM", 0)
+            result["threads"] = values.get("Threads", threading.active_count())
+        except Exception:
+            pass
+
+    cgroup_root = Path("/sys/fs/cgroup")
+
+    def read_cgroup_value(name: str) -> int | str | None:
+        path = cgroup_root / name
+        if not path.exists():
+            return None
+        try:
+            value = path.read_text(encoding="utf-8", errors="ignore").strip()
+            return int(value) if value.isdigit() else value
+        except Exception:
+            return None
+
+    cgroup: dict[str, object] = {}
+    for key, filename in (
+        ("current_bytes", "memory.current"),
+        ("peak_bytes", "memory.peak"),
+        ("limit_bytes", "memory.max"),
+        ("swap_current_bytes", "memory.swap.current"),
+        ("swap_limit_bytes", "memory.swap.max"),
+    ):
+        value = read_cgroup_value(filename)
+        if value is not None:
+            cgroup[key] = value
+    for filename, target in (("memory.events", "events"), ("memory.stat", "stat")):
+        path = cgroup_root / filename
+        if not path.exists():
+            continue
+        try:
+            parsed: dict[str, int] = {}
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, _, value = line.partition(" ")
+                if value.strip().isdigit():
+                    parsed[key] = int(value.strip())
+            if target == "stat":
+                parsed = {key: parsed.get(key, 0) for key in ("anon", "file", "shmem", "slab")}
+            cgroup[target] = parsed
+        except Exception:
+            pass
+    if cgroup:
+        result["cgroup"] = cgroup
+    return result
+
+
 def gpu_summary() -> list[dict[str, object]]:
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
@@ -1269,7 +1575,7 @@ def gpu_summary() -> list[dict[str, object]]:
         result = subprocess.run(
             [
                 nvidia_smi,
-                "--query-gpu=name,memory.total,memory.used,driver_version",
+                "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,driver_version",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -1278,6 +1584,7 @@ def gpu_summary() -> list[dict[str, object]]:
             errors="replace",
             timeout=4,
             check=True,
+            creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
     except Exception:
         return []
@@ -1285,7 +1592,7 @@ def gpu_summary() -> list[dict[str, object]]:
     gpus: list[dict[str, object]] = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 4:
+        if len(parts) < 6:
             continue
         total = int(float(parts[1])) if parts[1].replace(".", "", 1).isdigit() else 0
         used = int(float(parts[2])) if parts[2].replace(".", "", 1).isdigit() else 0
@@ -1294,7 +1601,9 @@ def gpu_summary() -> list[dict[str, object]]:
                 "name": parts[0],
                 "memory_total_mb": total,
                 "memory_used_mb": used,
-                "driver": parts[3],
+                "utilization_percent": int(float(parts[3])) if parts[3].replace(".", "", 1).isdigit() else 0,
+                "temperature_c": int(float(parts[4])) if parts[4].replace(".", "", 1).isdigit() else 0,
+                "driver": parts[5],
                 "label": f"{parts[0]} · {total / 1024:.0f} GB",
             }
         )
@@ -1434,6 +1743,117 @@ def append_tail(current: str, chunk: str, limit: int = 4000) -> str:
     return f"{current}{chunk}"[-limit:]
 
 
+def windows_filetime_from_ns(timestamp_ns: int) -> int:
+    return timestamp_ns // 100 + 11644473600 * 10000000
+
+
+def windows_filetime_struct(timestamp_ns: int) -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    ticks = windows_filetime_from_ns(timestamp_ns)
+    filetime = wintypes.FILETIME()
+    filetime.dwLowDateTime = ticks & 0xFFFFFFFF
+    filetime.dwHighDateTime = ticks >> 32
+    return filetime
+
+
+def copy_windows_file_times(source_stat: os.stat_result, target_path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.SetFileTime.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.SetFileTime.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    file_write_attributes = 0x0100
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle_value = wintypes.HANDLE(-1).value
+
+    handle = kernel32.CreateFileW(
+        str(target_path),
+        file_write_attributes,
+        file_share_read | file_share_write | file_share_delete,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise OSError(ctypes.get_last_error(), f"打开文件设置时间失败: {target_path}")
+    try:
+        creation_time = windows_filetime_struct(source_stat.st_ctime_ns)
+        access_time = windows_filetime_struct(source_stat.st_atime_ns)
+        write_time = windows_filetime_struct(source_stat.st_mtime_ns)
+        ok = kernel32.SetFileTime(
+            handle,
+            ctypes.byref(creation_time),
+            ctypes.byref(access_time),
+            ctypes.byref(write_time),
+        )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), f"设置文件时间失败: {target_path}")
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def copy_transcode_output_timestamps(source_path: str | Path, target_path: str | Path) -> dict[str, Any]:
+    source = Path(source_path)
+    target = Path(target_path)
+    result: dict[str, Any] = {
+        "ok": False,
+        "source_path": str(source),
+        "target_path": str(target),
+        "creation_time_copied": False,
+    }
+    if not source.exists():
+        result["error"] = "源文件不存在"
+        return result
+    if not target.exists():
+        result["error"] = "输出文件不存在"
+        return result
+
+    source_stat = source.stat()
+    os.utime(target, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+    result.update(
+        {
+            "ok": True,
+            "source_mtime": source_stat.st_mtime,
+            "target_mtime": target.stat().st_mtime,
+        }
+    )
+    if os.name == "nt":
+        try:
+            result["creation_time_copied"] = copy_windows_file_times(source_stat, target)
+        except Exception as exc:
+            result["creation_time_error"] = str(exc)
+    return result
+
+
 def normalize_target_codec(value: Any) -> str:
     codec = str(value or "av1").strip().lower()
     if codec in {"h265", "hevc", "x265"}:
@@ -1512,6 +1932,8 @@ def transcode_ffmpeg_command(job: dict[str, Any]) -> list[str]:
     quality_flag = transcode_quality_flag(encoder)
     custom_template = str(job.get("ffmpeg_custom_template") or "").strip()
     if bool(job.get("ffmpeg_custom_enabled")) and custom_template:
+        if "{input}" not in custom_template or "{output}" not in custom_template:
+            raise RuntimeError("自定义 FFmpeg 模板必须包含 {input} 和 {output}")
         try:
             rendered = custom_template.format(
                 input=input_path,
@@ -1525,7 +1947,14 @@ def transcode_ffmpeg_command(job: dict[str, Any]) -> list[str]:
             )
         except KeyError as exc:
             raise RuntimeError(f"自定义 FFmpeg 模板变量不存在: {exc}") from exc
-        return shlex.split(rendered)
+        command = shlex.split(rendered)
+        if not command:
+            raise RuntimeError("自定义 FFmpeg 模板为空")
+        expected_executable = Path(ffmpeg).name.casefold()
+        actual_executable = Path(command[0]).name.casefold()
+        if actual_executable != expected_executable:
+            raise RuntimeError("自定义 FFmpeg 模板只能调用配置的 ffmpeg 可执行文件")
+        return command
     command = [
         ffmpeg,
         "-hide_banner",
@@ -1561,6 +1990,25 @@ def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict
         raise HTTPException(status_code=400, detail="缺少 input_path")
     if not output_path:
         raise HTTPException(status_code=400, detail="缺少 output_path")
+    _, _, data_dir = settings()
+    compute_settings = load_subtitle_settings(data_dir)
+    try:
+        input_path = str(
+            require_path_within(
+                map_remote_path(input_path, compute_settings),
+                compute_settings.allowed_media_dirs,
+                "转码输入路径",
+            )
+        )
+        output_path = str(
+            require_path_within(
+                map_remote_path(output_path, compute_settings),
+                compute_settings.allowed_media_dirs,
+                "转码输出路径",
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = str(payload.get("job_id") or uuid.uuid4().hex)
     ffmpeg_mode = str(payload.get("ffmpeg_mode") or "").strip().lower()
     if ffmpeg_mode not in {"standard", "custom"}:
@@ -1603,9 +2051,11 @@ def create_transcode_job(payload: dict[str, Any], *, start: bool = True) -> dict
         "updated_at": time.time(),
         "started_at": 0,
         "finished_at": 0,
+        "timestamp_copy": {},
     }
     with transcode_jobs_lock:
         transcode_jobs[job_id] = job
+        prune_finished_job_registry(transcode_jobs)
     if start:
         start_transcode_job(job_id)
     return transcode_job_snapshot(job_id)
@@ -1629,6 +2079,7 @@ def run_transcode_job_background(job_id: str) -> None:
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
         chunks: queue.Queue[str | None] = queue.Queue()
         if process.stderr:
@@ -1691,6 +2142,10 @@ def run_transcode_job_background(job_id: str) -> None:
             )
             callback_payload = {"status": "failed", "job_id": job_id, "error": message, "stderr_tail": stderr_tail}
         else:
+            timestamp_copy = copy_transcode_output_timestamps(
+                str(job.get("input_path") or ""),
+                str(job.get("output_path") or ""),
+            )
             job = set_transcode_job(
                 job_id,
                 status="worker_done",
@@ -1700,6 +2155,7 @@ def run_transcode_job_background(job_id: str) -> None:
                 message="转码完成",
                 returncode=returncode,
                 finished_at=time.time(),
+                timestamp_copy=timestamp_copy,
             )
             callback_payload = {
                 "status": "worker_done",
@@ -1711,6 +2167,7 @@ def run_transcode_job_background(job_id: str) -> None:
                 "target_codec": job.get("target_codec", ""),
                 "progress": job.get("progress", 1),
                 "progress_percent": job.get("progress_percent", 100),
+                "timestamp_copy": timestamp_copy,
             }
     except Exception as exc:
         try:
@@ -1800,6 +2257,7 @@ def backend_path_preview(sample_path: str | None = None, remote_status: dict[str
 
 def local_node_status() -> dict[str, object]:
     service = get_subtitle_service()
+    model_service = get_worker_model_service()
     _, _, data_dir = settings()
     config = load_compute_config(data_dir)
     compute_settings = compute_settings_payload(service.settings, config)
@@ -1808,9 +2266,12 @@ def local_node_status() -> dict[str, object]:
     all_transcode_items = transcode_jobs_payload()
     transcode_items = all_transcode_items[:10]
     active_transcode = [job for job in all_transcode_items if job.get("status") in {"queued", "running"}]
+    gpus = gpu_summary()
+    safe_limits = worker_safe_concurrency_limits(gpus)
     return {
         "status": "ok",
         "online": True,
+        **worker_runtime_control.snapshot(),
         "mode": "local",
         "settings": redact_secret_settings({
             **compute_settings,
@@ -1821,14 +2282,30 @@ def local_node_status() -> dict[str, object]:
             "max_workers": service.settings.max_workers,
             "default_output_dir": str(service.settings.default_output_dir) if service.settings.default_output_dir else "",
             "translation_backends": translation_backend_options(service.settings),
-            "local_models": local_model_dirs(service.settings.model_dir),
+            "local_models": [
+                {"name": item["id"], "size": item.get("actual_size_bytes") or item.get("size_bytes") or 0}
+                for item in model_service.models(service.settings.default_model)
+                if item.get("installed") and item.get("verified")
+            ],
         }),
         "hardware": {
             "cpu": platform.processor() or platform.machine() or "未知 CPU",
             "cpu_count": os.cpu_count(),
             "memory": memory_summary(),
-            "gpus": gpu_summary(),
+            "gpus": gpus,
             "platform": platform.platform(),
+        },
+        "model_recommendation": whisper_model_recommendation(gpus),
+        "gpu_runtime": get_worker_gpu_runtime_service().status(),
+        "software_update": get_worker_software_update_service().status(),
+        "readiness": worker_readiness_service.snapshot(),
+        "effective_config": {
+            "model": service.settings.default_model,
+            "device": service.settings.device,
+            "compute_type": service.settings.compute_type,
+            "subtitle_workers": service.settings.max_workers,
+            "translation_workers": service.settings.translation_max_workers,
+            "safe_limits": safe_limits,
         },
         "jobs": {
             "total": len(jobs),
@@ -1867,6 +2344,238 @@ def offline_backend_status(error: str) -> dict[str, object]:
     }
 
 
+def cpu_usage_from_system_times(
+    previous: tuple[int, int, int],
+    current: tuple[int, int, int],
+) -> int:
+    idle_delta = current[0] - previous[0]
+    kernel_delta = current[1] - previous[1]
+    user_delta = current[2] - previous[2]
+    total_delta = kernel_delta + user_delta
+    if total_delta <= 0:
+        return 0
+    busy_delta = max(0, total_delta - idle_delta)
+    return max(0, min(100, round(busy_delta / total_delta * 100)))
+
+
+def windows_system_cpu_times() -> tuple[int, int, int] | None:
+    try:
+        import ctypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_ulong), ("high", ctypes.c_ulong)]
+
+        idle = FileTime()
+        kernel = FileTime()
+        user = FileTime()
+        if not ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+        ):
+            return None
+
+        def value(item: FileTime) -> int:
+            return (int(item.high) << 32) | int(item.low)
+
+        return value(idle), value(kernel), value(user)
+    except Exception:
+        return None
+
+
+def cpu_usage_percent() -> int:
+    global WINDOWS_CPU_TIMES_PREVIOUS
+    if os.name == "nt":
+        current = windows_system_cpu_times()
+        if current is None:
+            return 0
+        with WINDOWS_CPU_TIMES_LOCK:
+            previous = WINDOWS_CPU_TIMES_PREVIOUS
+            WINDOWS_CPU_TIMES_PREVIOUS = current
+        return cpu_usage_from_system_times(previous, current) if previous else 0
+    try:
+        load = os.getloadavg()[0]
+        return max(0, min(100, round(load / max(1, os.cpu_count() or 1) * 100)))
+    except (AttributeError, OSError):
+        return 0
+
+
+def worker_build_version() -> str:
+    configured = os.getenv("MOVIEMUSE_BUILD_VERSION", "").strip()
+    if configured:
+        return configured
+    build_info = BASE_DIR.parent / "BUILD-INFO.txt"
+    if build_info.exists():
+        try:
+            for line in build_info.read_text(encoding="utf-8", errors="ignore").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() == "version" and value.strip():
+                    return value.strip()
+        except OSError:
+            pass
+    return "dev"
+
+
+def worker_activity_items() -> list[dict[str, Any]]:
+    subtitle_items: list[dict[str, Any]] = []
+    for job in get_subtitle_service().list_jobs(limit=200):
+        raw = job_payload(job)
+        status = str(raw.get("status") or "queued")
+        task_type = "translation" if status == "translating" else "whisper"
+        subtitle_items.append({
+            "id": raw.get("id"),
+            "name": Path(str(raw.get("video_path") or "未命名任务")).name,
+            "path": raw.get("video_path") or "",
+            "type": task_type,
+            "type_label": "DeepSeek 翻译" if task_type == "translation" else "Whisper 识别",
+            "model": raw.get("translate_backend") if task_type == "translation" else raw.get("model"),
+            "status": status,
+            "progress": round(float(raw.get("progress") or 0) * 100, 1),
+            "message": raw.get("message") or "",
+            "error": raw.get("error") or "",
+            "created_at": raw.get("created_at"),
+            "started_at": raw.get("started_at"),
+            "finished_at": raw.get("finished_at"),
+            "updated_at": raw.get("updated_at"),
+            "stage": raw.get("message") or status,
+        })
+    transcode_items: list[dict[str, Any]] = []
+    for raw in transcode_jobs_payload():
+        status = str(raw.get("status") or "queued")
+        error = str(raw.get("error") or "")
+        if not error and status in {"failed", "error"}:
+            error = str(raw.get("stderr_tail") or "")
+        transcode_items.append({
+            "id": raw.get("id"),
+            "name": Path(str(raw.get("input_path") or raw.get("video_path") or "未命名任务")).name,
+            "path": raw.get("input_path") or raw.get("video_path") or "",
+            "type": "transcode",
+            "type_label": "AV1 转码",
+            "model": raw.get("target_codec") or "AV1",
+            "status": status,
+            "progress": float(raw.get("progress_percent") or float(raw.get("progress") or 0) * 100),
+            "message": raw.get("message") or "",
+            "error": error,
+            "created_at": raw.get("created_at"),
+            "started_at": raw.get("started_at"),
+            "finished_at": raw.get("finished_at"),
+            "updated_at": raw.get("updated_at"),
+            "stage": raw.get("message") or raw.get("status") or "",
+        })
+    return sorted(subtitle_items + transcode_items, key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
+
+
+def worker_console_payload() -> dict[str, Any]:
+    service = get_subtitle_service()
+    model_service = get_worker_model_service()
+    _, _, data_dir = settings()
+    config = load_compute_config(data_dir)
+    memory = memory_summary()
+    gpus = gpu_summary()
+    gpu_runtime = get_worker_gpu_runtime_service().status()
+    model_recommendation = whisper_model_recommendation(gpus)
+    safe_limits = worker_safe_concurrency_limits(gpus)
+    activities = worker_activity_items()
+    now = time.time()
+    active_states = {"queued", "running", "translating"}
+    completed_states = {"completed", "done", "success"}
+    failed_states = {"failed", "error", "cancelled"}
+    return {
+        "status": "ok",
+        "online": True,
+        **worker_runtime_control.snapshot(),
+        "hostname": platform.node() or "Windows Worker",
+        "updated_at": now,
+        "controller_synced_at": float(config.get("controller_synced_at") or 0),
+        "uptime_seconds": max(0, now - PROCESS_STARTED_AT),
+        "build_version": worker_build_version(),
+        "hardware": {
+            "cpu": platform.processor() or platform.machine() or "未知 CPU",
+            "cpu_count": os.cpu_count() or 0,
+            "cpu_usage_percent": cpu_usage_percent(),
+            "memory": memory,
+            "gpus": gpus,
+        },
+        "model_recommendation": model_recommendation,
+        "gpu_runtime": gpu_runtime,
+        "software_update": get_worker_software_update_service().status(),
+        "readiness": worker_readiness_service.snapshot(),
+        "storage": model_service.storage(),
+        "effective_config": {
+            "model": service.settings.default_model,
+            "subtitle_workers": service.settings.max_workers,
+            "translation_workers": service.settings.translation_max_workers,
+            "transcode_workers": safe_limits["transcode"],
+            "device": service.settings.device,
+            "compute_type": service.settings.compute_type,
+            "requested": {
+                "subtitle_workers": int(config.get("controller_requested_subtitle_max_workers") or service.settings.max_workers),
+                "translation_workers": int(config.get("controller_requested_translation_max_workers") or service.settings.translation_max_workers),
+            },
+            "safe_limits": safe_limits,
+            "source": "controller",
+        },
+        "activities": activities,
+        "counts": {
+            "running": sum(1 for item in activities if item["status"] in {"running", "translating"}),
+            "waiting": sum(1 for item in activities if item["status"] == "queued"),
+            "completed_today": sum(1 for item in activities if item["status"] in completed_states and float(item.get("finished_at") or 0) >= now - 86400),
+            "failed_today": sum(1 for item in activities if item["status"] in failed_states and float(item.get("finished_at") or item.get("updated_at") or 0) >= now - 86400),
+            "active": sum(1 for item in activities if item["status"] in active_states),
+        },
+        "last_error": next(
+            (
+                item["error"]
+                for item in activities
+                if item.get("status") in {"failed", "error"} and item.get("error")
+            ),
+            "",
+        ),
+    }
+
+
+def scan_worker_readiness() -> dict[str, Any]:
+    service = get_subtitle_service()
+    model_service = get_worker_model_service()
+    _, _, data_dir = settings()
+    config = load_compute_config(data_dir)
+    gpus = gpu_summary()
+    gpu_runtime = get_worker_gpu_runtime_service().status()
+    recommendation = whisper_model_recommendation(gpus)
+    models = model_service.models(service.settings.default_model)
+    return worker_readiness_service.scan(
+        settings=service.settings,
+        compute_enabled=bool(worker_runtime_control.snapshot().get("compute_enabled")),
+        controller_synced_at=float(config.get("controller_synced_at") or 0),
+        gpus=gpus,
+        gpu_runtime=gpu_runtime,
+        models=models,
+        recommended_model=str(recommendation.get("recommended_label") or recommendation.get("recommended_model") or ""),
+        ffmpeg_bin=os.getenv("FFMPEG_BIN", "ffmpeg"),
+    )
+
+
+def require_worker_model_access(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
+) -> None:
+    expected = frontend_api_token()
+    client_host = str(request.client.host if request.client else "")
+    if client_host in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        return
+    if not expected:
+        raise HTTPException(status_code=401, detail="算力端尚未与 MovieMuse 配对")
+    bearer = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else ""
+    if x_api_key != expected and bearer != expected:
+        raise HTTPException(status_code=401, detail="模型管理仅允许在算力端本机操作")
+
+
+def require_worker_compute_enabled() -> None:
+    try:
+        worker_runtime_control.require_enabled()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 def subtitle_backend_status() -> dict[str, object]:
     if not backend_url():
         status = local_node_status()
@@ -1882,6 +2591,15 @@ def subtitle_backend_status() -> dict[str, object]:
         status["backend_url"] = backend_url()
         return status
     except HTTPException as exc:
+        if exc.status_code == 401:
+            status = offline_backend_status("算力端已找到，但尚未完成安全配对")
+            status.update({
+                "status": "pairing_required",
+                "reachable": True,
+                "pairing_required": True,
+                "auth_error": str(exc.detail),
+            })
+            return status
         return offline_backend_status(str(exc.detail))
 
 
@@ -2012,9 +2730,9 @@ def dashboard_payload() -> dict[str, Any]:
     error_week = dashboard_week_count([item for item in logs if item.get("level") == "error"], "ts", *current_week)
     error_prev = dashboard_week_count([item for item in logs if item.get("level") == "error"], "ts", *previous_week)
 
-    pending = sum(1 for item in avs if item.get("status", "pending") == "pending")
-    done = sum(1 for item in avs if item.get("status") == "done")
-    in_library = sum(1 for item in avs if item.get("status") == "in_library" or item.get("library_status") == "in_library")
+    pending = sum(1 for item in avs if subscription_display_status(item) == "subscribing")
+    in_library = sum(1 for item in avs if subscription_display_status(item) == "in_library")
+    washing = sum(1 for item in avs if subscription_display_status(item) == "washing")
     active_actresses = sum(1 for item in actresses if item.get("poll_enabled", True))
     duplicate_groups = len(result.groups)
     total_files = int(result.total_files or len(result.files))
@@ -2111,15 +2829,15 @@ def dashboard_payload() -> dict[str, Any]:
 
     return {
         "cards": [
-            {"label": "订阅番号", "value": len(avs), "note": f"{pending} 个订阅中 / {done} 个已完成", "trend": dashboard_trend(av_week, av_prev)},
+            {"label": "订阅番号", "value": len(avs), "note": f"{pending} 个订阅中 / {in_library} 个已入库", "trend": dashboard_trend(av_week, av_prev)},
             {"label": "订阅女优", "value": len(actresses), "note": f"{active_actresses} 个正在轮询", "trend": dashboard_trend(actress_week, actress_prev)},
             {"label": "媒体扫描", "value": total_files, "note": f"{duplicate_groups} 组重复 / {duplicate_ratio}% 重复文件", "trend": {"text": "缓存快照", "tone": "flat"}},
             {"label": "异常事件", "value": error_week, "note": f"最近日志 {len(logs)} 条", "trend": dashboard_trend(error_week, error_prev)},
         ],
         "subscription": {
             "pending": pending,
-            "done": done,
             "in_library": in_library,
+            "washing": washing,
             "downloaded": mteam_downloaded,
             "total": max(len(avs), 1),
         },
@@ -2155,7 +2873,7 @@ def dashboard_payload() -> dict[str, Any]:
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page(request: Request, legacy: int = 0) -> Response:
     if compute_node_only():
-        return Response("MovieMuse compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
+        return RedirectResponse("/worker", status_code=307)
     return frontend_app_response()
 
 
@@ -2174,8 +2892,16 @@ def api_dashboard() -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, view: str = "duplicates", legacy: int = 0) -> Response:
     if compute_node_only():
-        return Response("MovieMuse compute node is running. Use the Unraid console to manage settings.", media_type="text/plain")
+        return RedirectResponse("/worker", status_code=307)
     return frontend_app_response()
+
+
+@app.get("/worker", response_class=HTMLResponse)
+@app.get("/worker/{worker_path:path}", response_class=HTMLResponse)
+def worker_console(worker_path: str = "") -> Response:
+    if not compute_node_only():
+        raise HTTPException(status_code=404, detail="Worker 控制台仅在 Windows 算力端启用")
+    return worker_app_response()
 
 
 @app.get("/api/scan")
@@ -2336,7 +3062,7 @@ def create_subtitle_jobs_from_scan(paths: list[str] = Form(default=[])) -> Redir
 @app.get("/terminal", response_class=HTMLResponse)
 def terminal_console(saved: str = "", restart: str = "") -> RedirectResponse:
     if compute_node_only():
-        raise HTTPException(status_code=404, detail="Windows 算力端不提供 Web 控制台，请在 Unraid 字幕算力控制台管理设置。")
+        return RedirectResponse("/worker", status_code=307)
     return RedirectResponse("/subtitles", status_code=307)
 
 
@@ -2511,6 +3237,109 @@ def api_subtitle_console() -> dict[str, object]:
     return subtitle_console_payload()
 
 
+def worker_discovery_network(host: str) -> ipaddress.IPv4Network:
+    candidate = str(host or "").strip()
+    if not candidate:
+        candidate = str(urlparse(console_public_url()).hostname or "")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(socket.gethostbyname(candidate))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="无法确定局域网地址，请手动填写算力端地址") from exc
+    if not isinstance(address, ipaddress.IPv4Address) or not (address.is_private or address.is_loopback):
+        raise HTTPException(status_code=400, detail="自动发现仅支持局域网 IPv4 地址")
+    # Windows accepts every address in 127.0.0.0/8 as loopback. Scanning a
+    # loopback /24 would therefore report the same local Worker 254 times.
+    prefix = 32 if address.is_loopback else 24
+    return ipaddress.ip_network(f"{address}/{prefix}", strict=False)
+
+
+def probe_worker_discovery(address: ipaddress.IPv4Address, port: int) -> dict[str, Any] | None:
+    url = f"http://{address}:{port}"
+    try:
+        with httpx.Client(timeout=httpx.Timeout(0.8), trust_env=False) as client:
+            response = client.get(f"{url}/api/worker/discovery")
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("service") != "moviemuse-worker":
+        return None
+    return {**payload, "ip": str(address), "url": url}
+
+
+@app.get("/api/subtitle/discovery")
+def api_discover_subtitle_workers(host: str = "", port: int = 18181) -> dict[str, Any]:
+    if port < 1 or port > 65535:
+        raise HTTPException(status_code=400, detail="端口范围不正确")
+    network = worker_discovery_network(host)
+    workers: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=48, thread_name_prefix="worker-discovery") as executor:
+        futures = {executor.submit(probe_worker_discovery, address, port): address for address in network.hosts()}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                workers.append(result)
+    workers.sort(key=lambda item: tuple(int(part) for part in str(item["ip"]).split(".")))
+    return {"status": "ok", "network": str(network), "workers": workers}
+
+
+@app.post("/api/subtitle/pair")
+async def api_pair_subtitle_worker(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="配对信息格式不正确")
+    worker_url = str(payload.get("worker_url") or "").strip().rstrip("/")
+    parsed = urlparse(worker_url)
+    try:
+        worker_ip = ipaddress.ip_address(str(parsed.hostname or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="算力端地址必须使用局域网 IP") from exc
+    if parsed.scheme != "http" or not (worker_ip.is_private or worker_ip.is_loopback):
+        raise HTTPException(status_code=400, detail="配对仅支持局域网 HTTP 算力端")
+    pair_payload = {
+        "pairing_code": str(payload.get("pairing_code") or ""),
+        "controller_url": console_public_url(),
+    }
+    try:
+        with httpx.Client(timeout=8, trust_env=False) as client:
+            response = client.post(f"{worker_url}/api/worker/pair", json=pair_payload)
+            response.raise_for_status()
+            paired = response.json()
+    except httpx.HTTPStatusError as exc:
+        try:
+            detail = str(exc.response.json().get("detail") or exc.response.text)
+        except (ValueError, AttributeError):
+            detail = exc.response.text
+        raise HTTPException(status_code=exc.response.status_code, detail=f"算力端配对失败：{detail}") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"无法连接算力端：{exc}") from exc
+    token = str(paired.get("token") or "") if isinstance(paired, dict) else ""
+    if not token:
+        raise HTTPException(status_code=502, detail="算力端没有返回配对凭据")
+    save_console_compute_config({"subtitle_backend_url": worker_url, "subtitle_backend_token": token})
+    remote_settings: dict[str, Any] | None = None
+    sync_warning = ""
+    try:
+        remote_settings = sync_remote_compute_settings()
+    except HTTPException as exc:
+        sync_warning = f"配对凭据已保存，但控制端配置暂未同步：{exc.detail}"
+    return {
+        "status": "ok",
+        "settings_synced": remote_settings is not None,
+        "sync_warning": sync_warning,
+        "connection": {
+            "subtitle_backend_url": worker_url,
+            "subtitle_backend_token": SECRET_PLACEHOLDER,
+        },
+        "worker": paired.get("worker", {}),
+        "remote_settings": redact_secret_response(remote_settings),
+        "backend_status": subtitle_backend_status(),
+    }
+
+
 @app.post("/api/subtitle/connection")
 async def api_save_subtitle_connection(request: Request) -> dict[str, object]:
     payload = await request.json()
@@ -2527,9 +3356,21 @@ async def api_save_subtitle_connection(request: Request) -> dict[str, object]:
             "subtitle_backend_token": token,
         }
     )
+    synced = False
+    sync_warning = ""
+    remote_settings: dict[str, Any] | None = None
+    if backend_url():
+        try:
+            remote_settings = sync_remote_compute_settings()
+            synced = True
+        except HTTPException as exc:
+            sync_warning = f"算力端连接已保存，但控制端配置暂未同步: {exc.detail}"
     saved_token = str(load_compute_config(data_dir).get("subtitle_backend_token", ""))
     return {
         "status": "ok",
+        "settings_synced": synced,
+        "sync_warning": sync_warning,
+        "remote_settings": redact_secret_response(remote_settings),
         "connection": {
             "subtitle_backend_url": backend_url(),
             "subtitle_backend_token": SECRET_PLACEHOLDER if saved_token else "",
@@ -2743,13 +3584,22 @@ def test_subtitle_backend(
     target = subtitle_backend_url.strip().rstrip("/")
     if not target:
         raise HTTPException(status_code=400, detail="请先填写 Windows 算力端地址")
-    headers = {"X-API-Key": subtitle_backend_token.strip()} if subtitle_backend_token.strip() else {}
+    token = subtitle_backend_token.strip()
+    if is_secret_placeholder(token):
+        _, _, data_dir = settings()
+        token = str(load_compute_config(data_dir).get("subtitle_backend_token", "")).strip()
+    headers = {"X-API-Key": token} if token else {}
     try:
         with remote_http_client(timeout=8.0) as client:
             response = client.get(f"{target}/api/subtitle/node/status", headers=headers)
             response.raise_for_status()
             payload = response.json()
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 401:
+            raise HTTPException(
+                status_code=401,
+                detail="算力端已找到，但尚未配对。请填写 Worker 概览页显示的六位配对码。",
+            ) from exc
         raise HTTPException(status_code=exc.response.status_code, detail=f"算力端返回错误: {exc.response.text}") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"无法连接算力端: {exc}") from exc
@@ -2923,7 +3773,258 @@ def health() -> dict[str, str]:
 
 @app.get("/api/subtitle/node/status", dependencies=[Depends(require_subtitle_token)])
 def api_subtitle_node_status() -> dict[str, object]:
+    if backend_url() and not compute_node_only():
+        return {
+            "status": "controller",
+            "online": False,
+            "mode": "remote_controller",
+            "backend_url": backend_url(),
+            "error": "当前实例配置为控制端，本地计算服务未启动",
+            "updated_at": time.time(),
+        }
     return local_node_status()
+
+
+def worker_discovery_payload() -> dict[str, Any]:
+    gpus = gpu_summary()
+    recommendation = whisper_model_recommendation(gpus)
+    readiness = worker_readiness_service.snapshot()
+    pairing = worker_pairing_payload(include_code=False)
+    return {
+        "service": "moviemuse-worker",
+        "hostname": platform.node() or "Windows Worker",
+        "port": int(os.getenv("PORT", "18181")),
+        "build_version": worker_build_version(),
+        "gpu": (gpus or [{}])[0],
+        "recommended_model": recommendation.get("recommended_model"),
+        "readiness": {
+            "status": readiness.get("status"),
+            "ready": bool(readiness.get("ready")),
+            "summary": readiness.get("summary"),
+        },
+        "pairing_required": not bool(pairing.get("paired")),
+    }
+
+
+@app.get("/api/worker/discovery")
+def api_worker_discovery() -> dict[str, Any]:
+    if not compute_node_only():
+        raise HTTPException(status_code=404, detail="当前实例不是 Windows 算力端")
+    return worker_discovery_payload()
+
+
+@app.post("/api/worker/pair")
+async def api_worker_pair(request: Request) -> dict[str, Any]:
+    if not compute_node_only():
+        raise HTTPException(status_code=404, detail="当前实例不是 Windows 算力端")
+    client_host = str(request.client.host if request.client else "")
+    try:
+        client_ip = ipaddress.ip_address(client_host)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="配对仅允许来自局域网") from exc
+    if not (client_ip.is_private or client_ip.is_loopback):
+        raise HTTPException(status_code=403, detail="配对仅允许来自局域网")
+    if not worker_pairing_attempt_allowed():
+        raise HTTPException(status_code=429, detail="配对尝试过于频繁，请稍后再试")
+    payload = await request.json()
+    if not isinstance(payload, dict) or not consume_worker_pairing_code(str(payload.get("pairing_code") or "")):
+        record_worker_pairing_failure()
+        raise HTTPException(status_code=401, detail="配对码不正确或已过期")
+    token = secrets.token_urlsafe(32)
+    _, _, data_dir = settings()
+    config = load_compute_config(data_dir)
+    config["subtitle_api_token"] = token
+    controller_url = str(payload.get("controller_url") or "").strip().rstrip("/")
+    if controller_url:
+        config["paired_controller_url"] = controller_url
+    save_compute_config(data_dir, config)
+    return {"status": "ok", "token": token, "worker": worker_discovery_payload()}
+
+
+@app.get("/api/worker/status", dependencies=[Depends(require_worker_model_access)])
+def api_worker_status() -> dict[str, Any]:
+    payload = worker_console_payload()
+    payload["pairing"] = worker_pairing_payload(include_code=True)
+    return payload
+
+
+@app.get("/api/worker/readiness", dependencies=[Depends(require_worker_model_access)])
+def api_worker_readiness() -> dict[str, Any]:
+    return worker_readiness_service.snapshot()
+
+
+@app.post("/api/worker/readiness/scan", dependencies=[Depends(require_worker_model_access)])
+def api_worker_readiness_scan() -> dict[str, Any]:
+    if not compute_node_only():
+        raise HTTPException(status_code=404, detail="自动体检仅在 Windows 算力端启用")
+    return scan_worker_readiness()
+
+
+@app.post("/api/worker/runtime/{action}", dependencies=[Depends(require_worker_model_access)])
+def api_worker_runtime_action(action: str) -> dict[str, Any]:
+    if action == "start":
+        runtime = worker_runtime_control.set_enabled(True)
+    elif action == "stop":
+        runtime = worker_runtime_control.set_enabled(False)
+    else:
+        raise HTTPException(status_code=404, detail="不支持的算力端操作")
+    return {"status": "ok", **runtime}
+
+
+@app.get("/api/worker/models", dependencies=[Depends(require_worker_model_access)])
+def api_worker_models() -> dict[str, Any]:
+    service = get_subtitle_service()
+    manager = get_worker_model_service()
+    gpus = gpu_summary()
+    return {
+        "models": manager.models(service.settings.default_model),
+        "storage": manager.storage(),
+        "downloads": manager.downloads(),
+        "active_model": service.settings.default_model,
+        "managed_by": "MovieMuse 控制端",
+        "recommendation": whisper_model_recommendation(gpus),
+    }
+
+
+@app.post("/api/worker/models/check-updates", dependencies=[Depends(require_worker_model_access)])
+def api_worker_check_model_updates(force: bool = False) -> dict[str, Any]:
+    service = get_subtitle_service()
+    manager = get_worker_model_service()
+    result = manager.check_updates(force=force)
+    return {"status": "ok", **result, "models": manager.models(service.settings.default_model)}
+
+
+@app.get("/api/worker/software-update", dependencies=[Depends(require_worker_model_access)])
+def api_worker_software_update() -> dict[str, Any]:
+    return get_worker_software_update_service().status()
+
+
+@app.get("/api/worker/gpu-runtime", dependencies=[Depends(require_worker_model_access)])
+def api_worker_gpu_runtime() -> dict[str, Any]:
+    return get_worker_gpu_runtime_service().status()
+
+
+@app.post("/api/worker/gpu-runtime/install", dependencies=[Depends(require_worker_model_access)])
+def api_worker_install_gpu_runtime() -> dict[str, Any]:
+    try:
+        return get_worker_gpu_runtime_service().start_install()
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/worker/software-update/check", dependencies=[Depends(require_worker_model_access)])
+def api_worker_check_software_update(force: bool = False) -> dict[str, Any]:
+    return get_worker_software_update_service().check(force=force)
+
+
+@app.post("/api/worker/models/{model_id}/download", dependencies=[Depends(require_worker_model_access)])
+def api_worker_download_model(model_id: str) -> dict[str, Any]:
+    try:
+        service = get_subtitle_service()
+        manager = get_worker_model_service()
+        target = manager.model_dir / model_id
+        if target.exists() and Path(str(service.settings.default_model or "")).name == model_id:
+            raise PermissionError("当前生效模型由 MovieMuse 控制端管理，请先在控制端切换模型再修复")
+        return {"status": "accepted", "download": manager.start_download(model_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/worker/models/{model_id}/update", dependencies=[Depends(require_worker_model_access)])
+def api_worker_update_model(model_id: str) -> dict[str, Any]:
+    service = get_subtitle_service()
+    if Path(str(service.settings.default_model or "")).name == model_id:
+        raise HTTPException(status_code=409, detail="当前生效模型由 MovieMuse 控制端管理，请先在控制端切换模型再更新")
+    try:
+        return {
+            "status": "accepted",
+            "download": get_worker_model_service().start_download(model_id, replace=True),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/worker/model-downloads/{job_id}/{action}", dependencies=[Depends(require_worker_model_access)])
+def api_worker_download_action(job_id: str, action: str) -> dict[str, Any]:
+    manager = get_worker_model_service()
+    try:
+        if action == "pause":
+            job = manager.pause(job_id)
+        elif action == "resume":
+            job = manager.resume(job_id)
+        elif action == "cancel":
+            job = manager.cancel(job_id)
+        else:
+            raise HTTPException(status_code=404, detail="不支持的下载操作")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="下载任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "ok", "download": job}
+
+
+@app.post("/api/worker/models/{model_id}/verify", dependencies=[Depends(require_worker_model_access)])
+def api_worker_verify_model(model_id: str) -> dict[str, Any]:
+    try:
+        return {"status": "ok", "verification": get_worker_model_service().validate(model_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/worker/models/{model_id}", dependencies=[Depends(require_worker_model_access)])
+def api_worker_remove_model(model_id: str) -> dict[str, str]:
+    service = get_subtitle_service()
+    try:
+        get_worker_model_service().remove(model_id, service.settings.default_model)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "ok"}
+
+
+@app.post("/api/worker/models/{model_id}/open-folder", dependencies=[Depends(require_worker_model_access)])
+def api_worker_open_model_folder(model_id: str) -> dict[str, str]:
+    manager = get_worker_model_service()
+    try:
+        manager.validate(model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    path = manager.model_dir / model_id
+    if not path.exists():
+        path = manager.model_dir
+    if os.name != "nt":
+        raise HTTPException(status_code=501, detail="仅 Windows 算力端支持打开文件夹")
+    os.startfile(str(path))  # type: ignore[attr-defined]
+    return {"status": "ok", "path": str(path)}
+
+
+@app.get("/api/worker/diagnostics", dependencies=[Depends(require_worker_model_access)])
+def api_worker_diagnostics() -> dict[str, Any]:
+    payload = worker_console_payload()
+    return {
+        "hostname": payload["hostname"],
+        "online": payload["online"],
+        "compute_enabled": payload["compute_enabled"],
+        "runtime_changed_at": payload["runtime_changed_at"],
+        "build_version": payload["build_version"],
+        "software_update": payload["software_update"],
+        "gpu_runtime": payload["gpu_runtime"],
+        "model_recommendation": payload["model_recommendation"],
+        "readiness": payload["readiness"],
+        "uptime_seconds": payload["uptime_seconds"],
+        "hardware": payload["hardware"],
+        "effective_config": payload["effective_config"],
+        "counts": payload["counts"],
+        "last_error": payload["last_error"],
+        "generated_at": payload["updated_at"],
+    }
 
 
 @app.get("/api/subtitle/backend/status")
@@ -2953,6 +4054,8 @@ async def api_save_compute_settings(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="设置内容格式不正确")
+    if compute_node_only():
+        payload["controller_synced_at"] = time.time()
     result = save_local_compute_settings(payload)
     service = get_subtitle_service()
     _, _, data_dir = settings()
@@ -2983,7 +4086,10 @@ async def api_save_transcode_worker_settings(request: Request) -> dict[str, obje
     }
 
 
-@app.post("/api/transcode/jobs", dependencies=[Depends(require_subtitle_token)])
+@app.post(
+    "/api/transcode/jobs",
+    dependencies=[Depends(require_subtitle_token), Depends(require_worker_compute_enabled)],
+)
 async def api_create_transcode_job(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
@@ -3007,7 +4113,10 @@ def api_list_subtitle_jobs(limit: int = 0) -> dict[str, object]:
     return {"jobs": jobs, "total": len(jobs), "active": len(active)}
 
 
-@app.post("/api/subtitle/jobs", dependencies=[Depends(require_subtitle_token)])
+@app.post(
+    "/api/subtitle/jobs",
+    dependencies=[Depends(require_subtitle_token), Depends(require_worker_compute_enabled)],
+)
 def api_create_subtitle_job(payload: SubtitleJobCreate) -> dict[str, object]:
     if backend_url():
         result = remote_post_json("/api/subtitle/jobs", rewrite_subtitle_payload(payload.model_dump()))
@@ -3031,7 +4140,10 @@ def api_create_subtitle_job(payload: SubtitleJobCreate) -> dict[str, object]:
     return job_payload(job)
 
 
-@app.post("/api/subtitle/jobs/bulk", dependencies=[Depends(require_subtitle_token)])
+@app.post(
+    "/api/subtitle/jobs/bulk",
+    dependencies=[Depends(require_subtitle_token), Depends(require_worker_compute_enabled)],
+)
 def api_create_subtitle_jobs_bulk(payload: dict[str, Any]) -> dict[str, object]:
     raw_jobs = payload.get("jobs") if isinstance(payload, dict) else None
     if not isinstance(raw_jobs, list):
@@ -3048,7 +4160,10 @@ def api_create_subtitle_jobs_bulk(payload: dict[str, Any]) -> dict[str, object]:
     return {"status": "ok", "submitted": len(jobs), "jobs": [job_payload(job) for job in jobs]}
 
 
-@app.post("/api/subtitle/jobs/retry-failed", dependencies=[Depends(require_subtitle_token)])
+@app.post(
+    "/api/subtitle/jobs/retry-failed",
+    dependencies=[Depends(require_subtitle_token), Depends(require_worker_compute_enabled)],
+)
 async def api_retry_failed_subtitle_jobs(request: Request) -> dict[str, object]:
     payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
     if not isinstance(payload, dict):
@@ -3069,7 +4184,10 @@ async def api_retry_failed_subtitle_jobs(request: Request) -> dict[str, object]:
     }
 
 
-@app.post("/api/subtitle/jobs/{job_id}/retry", dependencies=[Depends(require_subtitle_token)])
+@app.post(
+    "/api/subtitle/jobs/{job_id}/retry",
+    dependencies=[Depends(require_subtitle_token), Depends(require_worker_compute_enabled)],
+)
 async def api_retry_subtitle_job(job_id: str, request: Request) -> dict[str, object]:
     payload = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
     if not isinstance(payload, dict):
@@ -3119,7 +4237,10 @@ def api_delete_subtitle_job(job_id: str) -> dict[str, object]:
     return {"status": "ok", "deleted": job_payload(job)}
 
 
-@app.post("/api/subtitle/upload", dependencies=[Depends(require_subtitle_token)])
+@app.post(
+    "/api/subtitle/upload",
+    dependencies=[Depends(require_subtitle_token), Depends(require_worker_compute_enabled)],
+)
 async def api_upload_subtitle_job(
     file: UploadFile = File(...),
     source_language: str | None = Form(default=None),
@@ -3127,9 +4248,12 @@ async def api_upload_subtitle_job(
     model: str | None = Form(default=None),
     translate: bool = Form(default=True),
 ) -> dict[str, object]:
+    max_bytes = subtitle_upload_max_bytes()
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(status_code=413, detail=f"上传文件超过 {max_bytes // (1024 ** 3)} GiB 限制")
+    await file.seek(0)
     if backend_url():
-        content = await file.read()
-        files = {"file": (file.filename or "upload.mkv", content, file.content_type or "application/octet-stream")}
+        files = {"file": (file.filename or "upload.mkv", file.file, file.content_type or "application/octet-stream")}
         data = {
             "source_language": source_language or "",
             "target_language": target_language,
@@ -3153,7 +4277,7 @@ async def api_upload_subtitle_job(
 
     service = get_subtitle_service()
     try:
-        saved_path = service.save_upload(file.filename or "upload.mkv", await file.read())
+        saved_path = service.save_upload_stream(file.filename or "upload.mkv", file.file, max_bytes)
         job = service.create_job(
             video_path=str(saved_path),
             source_language=source_language,
@@ -3163,7 +4287,8 @@ async def api_upload_subtitle_job(
             translate_backend="google",
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        status_code = 413 if "超过" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     return job_payload(job)
 
 
@@ -3266,6 +4391,8 @@ notification_dedupe_lock = threading.RLock()
 notification_dedupe: dict[str, float] = {}
 asset_prewarm_lock = threading.RLock()
 asset_prewarm_pending: set[str] = set()
+subscription_download_locks_guard = threading.RLock()
+subscription_download_locks: dict[str, threading.RLock] = {}
 wechat_token_lock = threading.RLock()
 wechat_token_cache: dict[str, dict[str, Any]] = {}
 wechat_session_lock = threading.RLock()
@@ -3519,8 +4646,24 @@ def current_console_user(request: Request) -> str:
 
 def create_console_session(username: str) -> str:
     token = secrets.token_urlsafe(32)
+    now = time.time()
     with console_sessions_lock:
-        console_sessions[token] = {"username": username, "created_at": time.time(), "last_seen_at": time.time()}
+        expired = [
+            key
+            for key, session in console_sessions.items()
+            if now - float(session.get("created_at") or 0) > CONSOLE_SESSION_TTL
+        ]
+        for key in expired:
+            console_sessions.pop(key, None)
+        overflow = len(console_sessions) - CONSOLE_SESSION_MAX_ENTRIES + 1
+        if overflow > 0:
+            oldest = sorted(
+                console_sessions.items(),
+                key=lambda item: float(item[1].get("last_seen_at") or item[1].get("created_at") or 0),
+            )
+            for key, _ in oldest[:overflow]:
+                console_sessions.pop(key, None)
+        console_sessions[token] = {"username": username, "created_at": now, "last_seen_at": now}
     return token
 
 
@@ -3599,12 +4742,6 @@ def notify_from_app_log(level: str, source: str, message: str, data: dict[str, A
             "detail": str(data.get("error") or data.get("message") or message),
             "av_id": av_id,
             "torrent_id": data.get("torrent_id", ""),
-        })
-    elif stage == "jellyfin_refresh_done" and int(data.get("changed") or 0) > 0:
-        sender("jellyfin_in_library", {
-            "status": "in_library",
-            "title": "Jellyfin 入库状态更新",
-            "detail": f"{data.get('changed')} 个订阅已确认入库",
         })
     elif level == "error" and source in {"subscription", "download", "mteam", "qbittorrent", "task", "wash", "postprocess"}:
         sender("task_failed", {
@@ -3913,7 +5050,12 @@ def normalize_image_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 DMM_PLACEHOLDER_COVER_CACHE: dict[str, tuple[float, bool]] = {}
+DMM_PLACEHOLDER_COVER_CACHE_LOCK = threading.RLock()
 DMM_PLACEHOLDER_COVER_CACHE_TTL = int(os.getenv("DMM_PLACEHOLDER_COVER_CACHE_TTL_SECONDS", "86400"))
+DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES = max(
+    100,
+    int(os.getenv("DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES", "4096")),
+)
 
 
 def dmm_placeholder_cover_cache_key(url: str) -> str:
@@ -3926,7 +5068,21 @@ def remember_dmm_placeholder_cover(url: str, placeholder: bool = True) -> None:
         return
     now = time.time()
     value = bool(placeholder)
-    DMM_PLACEHOLDER_COVER_CACHE[target] = (now, value)
+    with DMM_PLACEHOLDER_COVER_CACHE_LOCK:
+        DMM_PLACEHOLDER_COVER_CACHE[target] = (now, value)
+        if len(DMM_PLACEHOLDER_COVER_CACHE) > DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES:
+            expired = [
+                key
+                for key, cached in DMM_PLACEHOLDER_COVER_CACHE.items()
+                if now - cached[0] >= DMM_PLACEHOLDER_COVER_CACHE_TTL
+            ]
+            for key in expired:
+                DMM_PLACEHOLDER_COVER_CACHE.pop(key, None)
+            overflow = len(DMM_PLACEHOLDER_COVER_CACHE) - DMM_PLACEHOLDER_COVER_CACHE_MAX_ENTRIES
+            if overflow > 0:
+                oldest = sorted(DMM_PLACEHOLDER_COVER_CACHE.items(), key=lambda item: item[1][0])
+                for key, _ in oldest[:overflow]:
+                    DMM_PLACEHOLDER_COVER_CACHE.pop(key, None)
     try:
         cache_set("dmm_cover_placeholder", dmm_placeholder_cover_cache_key(target), {"placeholder": value, "checked_at": now}, DMM_PLACEHOLDER_COVER_CACHE_TTL)
     except Exception:
@@ -3938,13 +5094,15 @@ def dmm_placeholder_cover_cached(url: str) -> bool:
     if not target or "pics.dmm.co.jp/mono/movie/adult/" not in target.lower():
         return False
     now = time.time()
-    cached = DMM_PLACEHOLDER_COVER_CACHE.get(target)
+    with DMM_PLACEHOLDER_COVER_CACHE_LOCK:
+        cached = DMM_PLACEHOLDER_COVER_CACHE.get(target)
     if cached and now - cached[0] < DMM_PLACEHOLDER_COVER_CACHE_TTL:
         return cached[1]
     payload = cache_get("dmm_cover_placeholder", dmm_placeholder_cover_cache_key(target))
     if isinstance(payload, dict):
         result = bool(payload.get("placeholder"))
-        DMM_PLACEHOLDER_COVER_CACHE[target] = (now, result)
+        with DMM_PLACEHOLDER_COVER_CACHE_LOCK:
+            DMM_PLACEHOLDER_COVER_CACHE[target] = (now, result)
         return result
     return False
 
@@ -5770,7 +6928,7 @@ def poll_subscriptions_once() -> dict[str, Any]:
                 payload["source_actress_id"] = actress_id
                 payload["source_actress_name"] = actress.get("name", "")
                 payload["actresses"] = [actor.get("name", "") for actor in actors] or [actress.get("name", "")]
-                apply_jellyfin_status(payload)
+                apply_jellyfin_status(payload, arm_library_notification=True, confirmation_source="baseline")
                 saved = service.subscribe_av(payload)
                 added.append(saved)
                 app_log("info", "subscription", "自动订阅新增番号", {
@@ -5872,7 +7030,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
             payload["source_actress_id"] = actress_id
             payload["source_actress_name"] = actress.get("name", "")
             payload["actresses"] = actors or [{"id": actress_id, "name": actress.get("name", "")}]
-            apply_jellyfin_status(payload)
+            apply_jellyfin_status(payload, arm_library_notification=True, confirmation_source="baseline")
             saved = service.subscribe_av(payload)
             added.append(saved)
             app_log("info", "subscription", "女优一键订阅新增番号", {
@@ -5894,7 +7052,7 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
                 "release_date": release_date,
                 "cover": saved.get("cover") or saved.get("cover_url") or "",
             })
-            if download and saved.get("status") != "in_library":
+            if download and not subscription_is_in_library(saved):
                 download_av_from_mteam(saved)
         except Exception as exc:
             errors.append(f"{av_id}: {exc}")
@@ -5917,26 +7075,96 @@ def subscribe_latest_for_actress(actress: dict[str, Any], *, future_only: bool =
 
 
 def refresh_library_status_for_subscriptions(limit: int = 80) -> int:
-    service = get_subscription_service()
     changed = 0
-    items = [item for item in subscribed_avs_with_global_filter("library_refresh") if item.get("status") != "in_library"][:limit]
+    items = [item for item in subscribed_avs_with_global_filter("library_refresh") if not subscription_is_in_library(item)][:limit]
     for item in items:
-        updated = refresh_subscription_library_status(item)
-        if updated.get("status") == "in_library":
+        updated = refresh_subscription_library_status(item, include_existing=False, transition_source="poll")
+        if subscription_is_in_library(updated) and not subscription_is_in_library(item):
             changed += 1
     if changed:
         app_log("info", "jellyfin", "刷新订阅入库状态完成", {"stage": "jellyfin_refresh_done", "changed": changed})
     return changed
 
 
+def reconcile_local_subscription_states(limit: int = 500) -> int:
+    changed = 0
+    items = [
+        item for item in get_subscription_service().get_subscribed_av()
+        if not subscription_is_in_library(item)
+    ][:limit]
+    for item in items:
+        before = (
+            str(item.get("status") or ""),
+            str(item.get("download_status") or ""),
+            str(item.get("download_message") or ""),
+        )
+        updated, handled = reconcile_subscription_existing_media(item)
+        after = (
+            str(updated.get("status") or ""),
+            str(updated.get("download_status") or ""),
+            str(updated.get("download_message") or ""),
+        )
+        if handled and after != before:
+            changed += 1
+    return changed
+
+
 def download_pending_subscriptions() -> dict[str, Any]:
-    service = get_subscription_service()
-    items = [item for item in subscribed_avs_with_global_filter("bulk_download") if item.get("status", "pending") == "pending"]
+    items = [
+        item for item in subscribed_avs_with_global_filter("bulk_download")
+        if not subscription_is_in_library(item)
+    ]
+    priority = {
+        "error": 0,
+        "dedupe_error": 1,
+        "not_found": 2,
+        "": 3,
+        "queued": 4,
+        "searching": 5,
+        "downloading": 6,
+        "downloaded": 7,
+        "waiting_worker": 8,
+        "processing": 9,
+    }
+    items.sort(key=lambda item: (priority.get(str(item.get("download_status") or ""), 5), float(item.get("subscribed_at") or 0)))
     app_log("info", "download", "开始一键下载订阅中番号", {"stage": "bulk_download_start", "count": len(items)})
-    results = [download_av_from_mteam(item) for item in items]
+    results: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        av_id = str(item.get("id") or "")
+        try:
+            result = download_av_from_mteam(item)
+        except Exception as exc:
+            message = str(exc)
+            get_subscription_service().update_av_download(av_id, {"download_status": "error", "download_message": message})
+            app_log("error", "download", "批量订阅下载单项异常，继续处理后续番号", {
+                "stage": "bulk_download_item_error",
+                "av_id": av_id,
+                "index": index,
+                "count": len(items),
+                "error": message,
+            })
+            result = {"av_id": av_id, "status": "error", "message": message}
+        results.append(result)
+        app_log("info", "download", "批量订阅下载进度", {
+            "stage": "bulk_download_progress",
+            "av_id": av_id,
+            "index": index,
+            "count": len(items),
+            "status": result.get("status", ""),
+        })
     sent = len([item for item in results if item.get("status") in {"ok", "exists", "sent"}])
-    app_log("info", "download", "一键下载完成", {"stage": "bulk_download_done", "count": len(results), "sent": sent})
-    return {"results": results, "checked": len(items), "sent": sent}
+    not_found = len([item for item in results if item.get("status") == "not_found"])
+    failed = len([item for item in results if item.get("status") in {"error", "failed", "conflict", "dedupe_error", "existing_failed"}])
+    active = len([item for item in results if item.get("status") == "active"])
+    app_log("info", "download", "一键下载完成", {
+        "stage": "bulk_download_done",
+        "count": len(results),
+        "sent": sent,
+        "not_found": not_found,
+        "failed": failed,
+        "active": active,
+    })
+    return {"results": results, "checked": len(items), "sent": sent, "not_found": not_found, "failed": failed, "active": active}
 
 
 def download_pending_wash_subscriptions() -> dict[str, Any]:
@@ -6458,56 +7686,558 @@ def cron_part_matches(part: str, value: int) -> bool:
         return False
 
 
-def apply_jellyfin_status(av: dict[str, Any]) -> None:
+def subscription_is_in_library(av: dict[str, Any]) -> bool:
+    library_status = str(av.get("library_status") or "").lower()
+    legacy_status = str(av.get("status") or "").lower()
+    has_confirmation = bool(av.get("library_confirmed_at") or av.get("jellyfin_item_id"))
+    return has_confirmation and (library_status == "in_library" or legacy_status == "in_library")
+
+
+def subscription_display_status(av: dict[str, Any]) -> str:
+    wash = av.get("wash") if isinstance(av.get("wash"), dict) else {}
+    if str(wash.get("status") or "").lower() in {"requested", "downloading", "error"}:
+        return "washing"
+    if subscription_is_in_library(av):
+        return "in_library"
+    return "subscribing"
+
+
+def subscription_needs_attention(av: dict[str, Any]) -> bool:
+    wash = av.get("wash") if isinstance(av.get("wash"), dict) else {}
+    return (
+        str(av.get("download_status") or "").lower() in {"error", "dedupe_error", "conflict", "failed"}
+        or str(wash.get("status") or "").lower() == "error"
+    )
+
+
+def subscription_api_record(av: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(av)
+    payload["display_status"] = subscription_display_status(av)
+    payload["needs_attention"] = subscription_needs_attention(av)
+    return payload
+
+
+def inferred_record_av_id(record: dict[str, Any]) -> str:
+    direct_value = record.get("av_id") if "av_id" in record else record.get("id")
+    direct = canonical_av_id(direct_value)
+    if direct:
+        return direct
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    candidates = [
+        record.get("path"),
+        record.get("input_path"),
+        record.get("output_path"),
+        record.get("content_path"),
+        data.get("mteam_keyword"),
+        data.get("selected_torrent_title"),
+        data.get("qb_name"),
+        data.get("title"),
+    ]
+    for candidate in candidates:
+        detected = detect_catalog_number(str(candidate or ""))
+        if detected:
+            return canonical_av_id(detected)
+    return ""
+
+
+def record_matches_av_id(record: dict[str, Any], av_id: str) -> bool:
+    target = canonical_av_id(av_id)
+    if not target:
+        return False
+    if inferred_record_av_id(record) == target:
+        return True
+    compact_target = re.sub(r"[^A-Z0-9]", "", target)
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    candidates = [
+        record.get("path"),
+        record.get("input_path"),
+        record.get("output_path"),
+        record.get("content_path"),
+        data.get("mteam_keyword"),
+        data.get("selected_torrent_title"),
+        data.get("qb_name"),
+    ]
+    for candidate in candidates:
+        compact_candidate = re.sub(r"[^A-Z0-9]", "", str(candidate or "").upper())
+        if compact_target and compact_target in compact_candidate:
+            return True
+    return False
+
+
+def active_media_version_for_av(av_id: str) -> dict[str, Any] | None:
+    target = canonical_av_id(av_id)
+    if not target:
+        return None
+    post = get_postprocess_service()
+    direct = post.active_version(target)
+    if direct and Path(str(direct.get("path") or "")).is_file():
+        return direct
+    for version in post.list_versions(limit=500):
+        if str(version.get("status") or "") != "active":
+            continue
+        if not record_matches_av_id(version, target):
+            continue
+        if Path(str(version.get("path") or "")).is_file():
+            return version
+    return None
+
+
+def managed_output_file_for_av(av_id: str) -> str:
+    target = canonical_av_id(av_id)
+    if not target:
+        return ""
+    output_root = Path(str(get_postprocess_service().get_settings().get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
+    movie_dir = output_root / target
+    if not movie_dir.is_dir():
+        return ""
+    candidates: list[Path] = []
+    try:
+        for path in movie_dir.iterdir():
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                candidates.append(path)
+    except OSError:
+        return ""
+    if not candidates:
+        return ""
+    matching = [path for path in candidates if record_matches_av_id({"path": str(path)}, target)]
+    choices = matching or candidates
+    try:
+        return str(max(choices, key=lambda path: path.stat().st_size))
+    except OSError:
+        return ""
+
+
+def related_postprocess_task_for_av(av_id: str) -> dict[str, Any] | None:
+    target = canonical_av_id(av_id)
+    if not target:
+        return None
+    terminal = {"completed", "failed", "ignored", "expired", "conflict"}
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for task in get_postprocess_service().list_tasks(limit=500):
+        if not record_matches_av_id(task, target):
+            continue
+        status = str(task.get("status") or "")
+        has_acquisition = bool(task.get("torrent_hash") or task.get("input_path") or task.get("output_path"))
+        if status not in terminal and has_acquisition:
+            candidates.append((0, task))
+        elif status == "completed":
+            candidates.append((1, task))
+        elif status in {"failed", "conflict"} and has_acquisition:
+            candidates.append((2, task))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], -float(item[1].get("updated_at") or 0)))
+    return candidates[0][1]
+
+
+SUBSCRIPTION_MEDIA_AVAILABLE_TASK_STATUSES = {
+    "waiting_worker",
+    "ready_to_run",
+    "dispatching",
+    "sent_to_worker",
+    "transcoding",
+    "worker_done",
+    "transcode_validating",
+    "transcode_done",
+    "subtitle_processing",
+    "subtitle_validating",
+    "jellyfin_refreshing",
+}
+
+
+def task_owned_input_media_path(task: dict[str, Any] | None) -> str:
+    if not task or str(task.get("task_type") or "") not in {"subscription", "external_qb"}:
+        return ""
+    input_path = str(task.get("input_path") or "").strip()
+    if not input_path or not record_matches_av_id(task, str(task.get("av_id") or "")):
+        return ""
+    return input_path if Path(input_path).is_file() else ""
+
+
+def subscription_task_media_path(task: dict[str, Any] | None) -> str:
+    if str((task or {}).get("status") or "") not in SUBSCRIPTION_MEDIA_AVAILABLE_TASK_STATUSES:
+        return ""
+    return task_owned_input_media_path(task)
+
+
+def update_subscription_record(av: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if all(av.get(key) == value for key, value in payload.items()):
+        return {**av, **payload}
+    av_id = str(av.get("id") or "")
+    saved = get_subscription_service().update_av_download(av_id, payload)
+    if saved:
+        return saved
+    return {**av, **payload}
+
+
+def mark_subscription_in_library(
+    av: dict[str, Any],
+    *,
+    path: str = "",
+    message: str,
+    jellyfin_item_id: str = "",
+    jellyfin_item_name: str = "",
+    download_status: str = "completed",
+    confirmation_source: str = "jellyfin",
+) -> dict[str, Any]:
+    now = time.time()
+    payload: dict[str, Any] = {
+        "status": "in_library",
+        "library_status": "in_library",
+        "download_status": download_status,
+        "download_message": message,
+        "downloaded_at": float(av.get("downloaded_at") or now),
+        "library_checked_at": now,
+        "library_confirmed_at": float(av.get("library_confirmed_at") or now),
+        "library_confirmation_source": confirmation_source,
+    }
+    if path:
+        payload["jellyfin_path"] = path
+    if jellyfin_item_id:
+        payload["jellyfin_item_id"] = jellyfin_item_id
+    if jellyfin_item_name:
+        payload["jellyfin_item_name"] = jellyfin_item_name
+    return update_subscription_record(av, payload)
+
+
+def mark_subscription_media_available(
+    av: dict[str, Any],
+    *,
+    path: str,
+    message: str,
+    download_status: str = "downloaded",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "download_status": download_status,
+        "download_message": message,
+        "downloaded_at": float(av.get("downloaded_at") or time.time()),
+    }
+    if path:
+        payload["jellyfin_path"] = path
+    if not subscription_is_in_library(av):
+        payload.update({"status": "pending", "library_status": str(av.get("library_status") or "unknown")})
+    return update_subscription_record(av, payload)
+
+
+def reconcile_subscription_existing_media(av: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    av_id = str(av.get("id") or "")
+    if subscription_is_in_library(av):
+        updated = mark_subscription_in_library(
+            av,
+            path=str(av.get("jellyfin_path") or ""),
+            message=str(av.get("download_message") or "Jellyfin 已确认入库"),
+            jellyfin_item_id=str(av.get("jellyfin_item_id") or ""),
+            jellyfin_item_name=str(av.get("jellyfin_item_name") or ""),
+            download_status=str(av.get("download_status") or "completed"),
+            confirmation_source=str(av.get("library_confirmation_source") or "legacy"),
+        )
+        return updated, {"av_id": av_id, "status": "in_library", "message": updated.get("download_message", "")}
+    version = active_media_version_for_av(av_id)
+    if version:
+        path = str(version.get("path") or "")
+        updated = mark_subscription_media_available(av, path=path, message="媒体文件已可用，等待 Jellyfin 确认")
+        return updated, {
+            "av_id": av_id,
+            "status": "available",
+            "message": updated.get("download_message", ""),
+            "version_id": version.get("id", ""),
+            "path": path,
+        }
+
+    managed_path = managed_output_file_for_av(av_id)
+    if managed_path:
+        updated = mark_subscription_media_available(av, path=managed_path, message="托管目录已有媒体文件，等待 Jellyfin 确认")
+        return updated, {
+            "av_id": av_id,
+            "status": "available",
+            "message": updated.get("download_message", ""),
+            "path": managed_path,
+        }
+
+    task = related_postprocess_task_for_av(av_id)
+    if not task:
+        return av, None
+    task_status = str(task.get("status") or "")
+    acquired_path = subscription_task_media_path(task)
+    if acquired_path:
+        download_status, task_message = subscription_task_download_state(task_status) or (
+            "downloaded",
+            "媒体文件已下载，等待后处理",
+        )
+        updated = mark_subscription_media_available(
+            av,
+            path=acquired_path,
+            message=f"媒体文件已可用；{task_message}；等待 Jellyfin 确认",
+            download_status=download_status,
+        )
+        return updated, {
+            "av_id": av_id,
+            "status": "available",
+            "message": updated.get("download_message", ""),
+            "task_id": task.get("id", ""),
+            "path": acquired_path,
+            "postprocess_status": task_status,
+        }
+    if task_status == "completed":
+        output_path = str(task.get("output_path") or "")
+        if output_path and Path(output_path).is_file():
+            updated = mark_subscription_media_available(av, path=output_path, message="后处理已完成，等待 Jellyfin 确认", download_status="completed")
+            return updated, {
+                "av_id": av_id,
+                "status": "available",
+                "message": updated.get("download_message", ""),
+                "task_id": task.get("id", ""),
+                "path": output_path,
+            }
+        message = "同番号后处理任务标记完成，但成品文件不存在，请先检查后处理记录"
+        updated = update_subscription_record(av, {"download_status": "error", "download_message": message})
+        return updated, {"av_id": av_id, "status": "existing_failed", "message": message, "task_id": task.get("id", "")}
+    if task_status not in {"failed", "ignored", "expired", "conflict"}:
+        updated = sync_subscription_task_state(task) or av
+        return updated, {
+            "av_id": av_id,
+            "status": "active",
+            "message": str(updated.get("download_message") or "同番号已有下载或后处理任务"),
+            "task_id": task.get("id", ""),
+        }
+    message = str(task.get("error_message") or "同番号已有失败的后处理任务，请从后处理任务重试")
+    updated = update_subscription_record(av, {
+        "download_status": "error",
+        "download_message": f"已有同番号后处理任务失败：{message}",
+        "qb_hash": str(task.get("torrent_hash") or av.get("qb_hash") or ""),
+    })
+    return updated, {
+        "av_id": av_id,
+        "status": "existing_failed",
+        "message": updated.get("download_message", ""),
+        "task_id": task.get("id", ""),
+        "error_code": task.get("error_code", ""),
+    }
+
+
+def apply_jellyfin_status(
+    av: dict[str, Any],
+    *,
+    arm_library_notification: bool = False,
+    confirmation_source: str = "baseline",
+) -> dict[str, Any]:
     jellyfin = get_system_settings_service().get().get("jellyfin", {})
     if not jellyfin.get("dedupe_enabled", True):
         app_log("info", "jellyfin", "跳过 Jellyfin 查重：未启用", {"stage": "jellyfin_skip", "av_id": av.get("id", "")})
-        return
+        return {"status": "disabled"}
     app_log("info", "jellyfin", "开始 Jellyfin 查重", {
         "stage": "jellyfin_start",
         "av_id": av.get("id", ""),
         "library": jellyfin.get("library_name") or jellyfin.get("library_id") or "全部媒体库",
     })
-    match = find_jellyfin_match(str(av.get("id") or ""), str(av.get("title") or ""), jellyfin)
+    try:
+        match = find_jellyfin_match(
+            str(av.get("id") or ""),
+            str(av.get("title") or ""),
+            jellyfin,
+            raise_errors=True,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        app_log("error", "jellyfin", "Jellyfin 查重失败，暂停 MTeam 下载", {
+            "stage": "jellyfin_lookup_error",
+            "av_id": av.get("id", ""),
+            "error": message,
+        })
+        return {"status": "error", "message": message}
     if not match:
+        av["library_checked_at"] = time.time()
+        if not subscription_is_in_library(av):
+            av["status"] = "pending"
+            av["library_status"] = "not_in_library"
+            if arm_library_notification:
+                av["library_notification_armed"] = True
         app_log("info", "jellyfin", "Jellyfin 未入库", {"stage": "jellyfin_miss", "av_id": av.get("id", "")})
-        return
+        return {"status": "not_found"}
+    now = time.time()
     av["status"] = "in_library"
     av["library_status"] = "in_library"
+    av["download_status"] = "completed"
+    av["download_message"] = "Jellyfin 已确认，订阅已入库"
+    av["downloaded_at"] = float(av.get("downloaded_at") or time.time())
     av["jellyfin_item_id"] = match.get("id", "")
     av["jellyfin_item_name"] = match.get("name", "")
     av["jellyfin_path"] = match.get("path", "")
-    app_log("info", "jellyfin", "Jellyfin 查重命中，标记已入库", {"av_id": av.get("id", ""), "item": match.get("name", ""), "path": match.get("path", "")})
+    av["library_checked_at"] = now
+    av["library_confirmed_at"] = float(av.get("library_confirmed_at") or now)
+    av["library_confirmation_source"] = confirmation_source
+    app_log("info", "jellyfin", "Jellyfin 查重命中，订阅标记已入库", {"av_id": av.get("id", ""), "item": match.get("name", ""), "path": match.get("path", "")})
+    return {"status": "found", "match": match}
 
 
-def refresh_subscription_library_status(av: dict[str, Any]) -> dict[str, Any]:
+def notify_subscription_in_library(
+    av: dict[str, Any],
+    *,
+    notification_key: str = "",
+) -> dict[str, Any]:
+    if not bool(av.get("library_notification_armed")):
+        return av
+    key = str(notification_key or av.get("jellyfin_item_id") or av.get("jellyfin_path") or av.get("id") or "")
+    if not key or str(av.get("library_notification_key") or "") == key:
+        return av
+    send_notification_event("subscription_in_library", {
+        "status": "in_library",
+        "title": str(av.get("title") or av.get("id") or ""),
+        "detail": f"{av.get('id', '')} 已入库，可在 Jellyfin 播放",
+        "av_id": av.get("id", ""),
+        "path": av.get("jellyfin_path", ""),
+        "file_name": notification_filename(av.get("jellyfin_path"), str(av.get("id") or "")),
+        "save_path": notification_parent_path(av.get("jellyfin_path"), ""),
+        "cover": av.get("cover") or av.get("cover_url") or "",
+        "notification_key": key,
+    })
+    return update_subscription_record(av, {
+        "library_notification_armed": False,
+        "library_notification_key": key,
+        "library_notified_at": time.time(),
+    })
+
+
+def notify_wash_completed(av: dict[str, Any], *, task_id: str, path: str) -> dict[str, Any]:
+    wash = av.get("wash") if isinstance(av.get("wash"), dict) else {}
+    key = str(task_id or path or "")
+    if not key or str(wash.get("completion_notification_key") or "") == key:
+        return av
+    send_notification_event("wash_completed", {
+        "status": "completed",
+        "title": str(av.get("title") or av.get("id") or ""),
+        "detail": f"{av.get('id', '')} 洗版完成，新版本已激活",
+        "av_id": av.get("id", ""),
+        "task_id": task_id,
+        "path": path,
+        "file_name": notification_filename(path, str(av.get("id") or "")),
+        "save_path": notification_parent_path(path, ""),
+        "cover": av.get("cover") or av.get("cover_url") or "",
+    })
+    saved = get_subscription_service().update_av_wash(str(av.get("id") or ""), {
+        "mode": str(wash.get("mode") or "chinese"),
+        "status": str(wash.get("status") or "completed"),
+        "completion_notification_key": key,
+        "completion_notified_at": time.time(),
+    })
+    return saved or av
+
+
+def refresh_subscription_library_status(
+    av: dict[str, Any],
+    *,
+    include_existing: bool = True,
+    transition_source: str = "reconciliation",
+    notification_key: str = "",
+) -> dict[str, Any]:
+    if include_existing:
+        reconciled, handled = reconcile_subscription_existing_media(av)
+        if handled:
+            return reconciled
     probe = dict(av)
-    apply_jellyfin_status(probe)
-    if probe.get("status") == "in_library":
-        saved = get_subscription_service().update_av_download(str(probe.get("id") or ""), {
+    baseline = transition_source == "baseline"
+    lookup = apply_jellyfin_status(
+        probe,
+        arm_library_notification=baseline,
+        confirmation_source=transition_source,
+    )
+    if lookup.get("status") == "error":
+        if baseline:
+            return update_subscription_record(av, {
+                "download_status": "dedupe_error",
+                "download_message": f"Jellyfin 查重失败，已暂停下载：{lookup.get('message') or '连接异常'}",
+            })
+        return av
+    if lookup.get("status") == "not_found":
+        return update_subscription_record(av, {
+            "status": probe.get("status", "pending"),
+            "library_status": probe.get("library_status", "not_in_library"),
+            "library_checked_at": probe.get("library_checked_at", time.time()),
+            "library_notification_armed": bool(probe.get("library_notification_armed")),
+        })
+    if probe.get("status") == "in_library" and probe.get("library_status") == "in_library":
+        saved = update_subscription_record(av, {
             "status": "in_library",
             "library_status": "in_library",
+            "download_status": "completed",
+            "download_message": probe.get("download_message", "Jellyfin 已确认，订阅已入库"),
+            "downloaded_at": probe.get("downloaded_at", time.time()),
             "jellyfin_item_id": probe.get("jellyfin_item_id", ""),
             "jellyfin_item_name": probe.get("jellyfin_item_name", ""),
             "jellyfin_path": probe.get("jellyfin_path", ""),
+            "library_checked_at": probe.get("library_checked_at", time.time()),
+            "library_confirmed_at": probe.get("library_confirmed_at", time.time()),
+            "library_confirmation_source": transition_source,
         })
-        if str(av.get("status") or "") != "in_library":
-            send_notification_event("jellyfin_in_library", {
-                "status": "in_library",
-                "title": str(probe.get("title") or probe.get("id") or ""),
-                "detail": f"{probe.get('id', '')} 已在 Jellyfin 媒体库中",
-                "av_id": probe.get("id", ""),
-                "path": probe.get("jellyfin_path", ""),
-                "file_name": notification_filename(probe.get("jellyfin_path"), str(probe.get("id") or "")),
-                "save_path": notification_parent_path(probe.get("jellyfin_path"), ""),
-                "cover": probe.get("cover") or probe.get("cover_url") or "",
-            })
-        return saved or probe
+        in_library = saved or probe
+        if not subscription_is_in_library(av) and transition_source not in {"baseline", "reconciliation", "migration"}:
+            in_library = notify_subscription_in_library(in_library, notification_key=notification_key)
+        return in_library
     return av
 
 
 def wash_task_type(mode: str) -> str:
     return "wash_4k" if mode == "4k" else "wash_chinese"
+
+
+def ensure_wash_supersede_version(av: dict[str, Any]) -> dict[str, Any]:
+    post = get_postprocess_service()
+    av_id = canonical_av_id(av.get("id"))
+    active = active_media_version_for_av(av_id)
+    if active and canonical_av_id(active.get("av_id")) == av_id:
+        return active
+
+    acquisition_task = related_postprocess_task_for_av(av_id)
+    acquired_input_path = task_owned_input_media_path(acquisition_task)
+    source_path = str(
+        (active or {}).get("path")
+        or av.get("jellyfin_path")
+        or managed_output_file_for_av(av_id)
+        or acquired_input_path
+        or ""
+    ).strip()
+    if not source_path:
+        raise HTTPException(status_code=409, detail="未定位到当前媒体文件，无法创建洗版任务")
+    source = Path(source_path)
+    output_root = Path(str(post.get_settings().get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
+    if not source.is_file():
+        raise HTTPException(status_code=409, detail="当前媒体文件不存在，无法创建洗版任务")
+    task_owns_source = bool(
+        acquired_input_path
+        and source.resolve() == Path(acquired_input_path).resolve()
+    )
+    if not path_under(source, output_root) and not task_owns_source:
+        raise HTTPException(status_code=409, detail="当前媒体文件不在 MovieMuse 托管输出目录，拒绝自动替换")
+    if active and str(active.get("generated_by") or "") != "moviemuse":
+        raise HTTPException(status_code=409, detail="当前媒体版本不是 MovieMuse 托管版本，拒绝自动替换")
+
+    stat = source.stat()
+    registered = post.add_version(
+        av_id=av_id,
+        path=str(source),
+        source_type=str((active or {}).get("source_type") or (acquisition_task or {}).get("task_type") or "jellyfin"),
+        codec=str((active or {}).get("codec") or ""),
+        has_chinese_subtitle=bool((active or {}).get("has_chinese_subtitle")),
+        status="active",
+        generated_by="moviemuse",
+        file_size=int((active or {}).get("file_size") or stat.st_size),
+        file_hash=str((active or {}).get("file_hash") or ""),
+        mtime=float((active or {}).get("mtime") or stat.st_mtime),
+        metadata={
+            "registered_from": "wash_request",
+            "legacy_version_id": str((active or {}).get("id") or ""),
+            "jellyfin_item_id": str(av.get("jellyfin_item_id") or ""),
+            "acquisition_task_id": str((acquisition_task or {}).get("id") or ""),
+        },
+    )
+    app_log("info", "postprocess", "洗版旧文件已登记到版本链", {
+        "stage": "wash_supersede_registered",
+        "av_id": av_id,
+        "version_id": registered.get("id", ""),
+        "path": str(source),
+        "legacy_version_id": str((active or {}).get("id") or ""),
+    })
+    return registered
 
 
 def ensure_wash_postprocess_task(av: dict[str, Any], mode: str) -> dict[str, Any]:
@@ -6517,9 +8247,32 @@ def ensure_wash_postprocess_task(av: dict[str, Any], mode: str) -> dict[str, Any
     wash = av.get("wash") if isinstance(av.get("wash"), dict) else {}
     task_id = str(wash.get("task_id") or "")
     existing = post.get_task(task_id) if task_id else None
+    if existing and str(existing.get("task_type") or "") != wash_task_type(mode):
+        if not postprocess_task_is_terminal(existing):
+            post.update_task(
+                task_id,
+                status="ignored",
+                error_code="wash_mode_changed",
+                error_message="洗版目标已变更，旧任务停止跟踪",
+            )
+        existing = None
     if existing and existing.get("status") not in {"completed", "expired", "ignored"}:
-        return existing
-    active = post.active_version(av_id)
+        if existing.get("supersede_version_id") and existing.get("supersede_path"):
+            return existing
+        active = ensure_wash_supersede_version(av)
+        updated = post.update_task(
+            task_id,
+            supersede_version_id=str(active.get("id") or ""),
+            supersede_path=str(active.get("path") or ""),
+        )
+        service.update_av_wash(av_id, {
+            "mode": mode,
+            "status": str(wash.get("status") or "requested"),
+            "task_id": task_id,
+            "old_path": str(active.get("path") or ""),
+        })
+        return updated or existing
+    active = ensure_wash_supersede_version(av)
     task = post.create_task(
         av_id=av_id,
         task_type=wash_task_type(mode),
@@ -6534,6 +8287,7 @@ def ensure_wash_postprocess_task(av: dict[str, Any], mode: str) -> dict[str, Any
         "mode": mode,
         "status": str(wash.get("status") or "requested"),
         "task_id": task["id"],
+        "old_path": str(active.get("path") or ""),
     })
     app_log("info", "postprocess", "洗版后处理任务已创建", {
         "stage": "postprocess_wash_task_created",
@@ -6558,20 +8312,132 @@ def scan_api_page() -> Response:
 
 def create_subscription_postprocess_task(av: dict[str, Any]) -> dict[str, Any]:
     post = get_postprocess_service()
-    task = post.create_task(
+    settings_payload = post.get_settings()
+    task, created = post.ensure_task(
         av_id=str(av.get("id") or ""),
         task_type="subscription",
         status="mteam_searching",
-        target_codec=str(post.get_settings().get("target_codec") or "av1"),
-        needs_subtitle=bool(post.get_settings().get("auto_subtitle_enabled")),
+        target_codec=str(settings_payload.get("target_codec") or "av1"),
+        needs_subtitle=bool(settings_payload.get("auto_subtitle_enabled")),
         data={"title": av.get("title", "")},
+        reusable_error_codes={"download_push_failed", "mteam_missing_id", "mteam_not_found"},
     )
-    app_log("info", "postprocess", "普通订阅后处理任务已创建", {
-        "stage": "postprocess_subscription_task_created",
+    app_log("info", "postprocess", "普通订阅后处理任务已准备", {
+        "stage": "postprocess_subscription_task_created" if created else "postprocess_subscription_task_reused",
         "task_id": task["id"],
         "av_id": av.get("id", ""),
+        "created": created,
     })
+    if not created:
+        post.add_event(str(task["id"]), "info", "task_reused", "复用番号现有后处理任务", {"av_id": av.get("id", "")})
     return task
+
+
+def subscription_download_lock(av_id: str) -> threading.RLock:
+    key = str(av_id or "").strip().upper()
+    with subscription_download_locks_guard:
+        lock = subscription_download_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            subscription_download_locks[key] = lock
+        return lock
+
+
+SUBSCRIPTION_TASK_DOWNLOAD_STATES = {
+    "mteam_searching": ("searching", "正在搜索 MTeam 资源"),
+    "torrent_pushed": ("downloading", "已推送 qBittorrent，等待下载"),
+    "downloading": ("downloading", "qBittorrent 正在下载"),
+    "waiting_worker": ("waiting_worker", "下载完成，等待算力端"),
+    "waiting_input": ("downloaded", "qBittorrent 已完成，等待确认输入文件"),
+    "ready_to_run": ("downloaded", "下载完成，等待后处理"),
+    "dispatching": ("processing", "正在派发后处理任务"),
+    "sent_to_worker": ("processing", "算力端正在处理"),
+    "transcoding": ("processing", "正在转码"),
+    "worker_done": ("processing", "算力端处理完成，正在校验"),
+    "transcode_validating": ("processing", "正在校验转码结果"),
+    "transcode_done": ("processing", "转码完成，正在处理字幕"),
+    "subtitle_processing": ("processing", "正在生成字幕"),
+    "subtitle_validating": ("processing", "正在校验字幕"),
+    "jellyfin_refreshing": ("processing", "正在刷新 Jellyfin"),
+    "completed": ("completed", "后处理完成"),
+}
+
+
+def subscription_task_download_state(task_status: str) -> tuple[str, str] | None:
+    return SUBSCRIPTION_TASK_DOWNLOAD_STATES.get(str(task_status or ""))
+
+
+def sync_subscription_task_state(task: dict[str, Any]) -> dict[str, Any] | None:
+    if str(task.get("task_type") or "") not in {"subscription", "external_qb"}:
+        return None
+    task_status = str(task.get("status") or "")
+    mapped = subscription_task_download_state(task_status)
+    if not mapped:
+        if task_status in {"failed", "conflict"}:
+            mapped = ("error", str(task.get("error_message") or "下载或后处理失败"))
+        else:
+            return None
+    download_status, message = mapped
+    av_id = str(task.get("av_id") or "")
+    service = get_subscription_service()
+    current = next((item for item in service.get_subscribed_av() if str(item.get("id") or "") == av_id), None)
+    if not current:
+        return None
+    payload: dict[str, Any] = {}
+    if str(current.get("download_status") or "") != download_status:
+        payload.update({"download_status": download_status, "download_message": message})
+    if task.get("torrent_hash"):
+        if str(current.get("qb_hash") or "") != str(task.get("torrent_hash") or ""):
+            payload["qb_hash"] = task.get("torrent_hash")
+    acquired_path = subscription_task_media_path(task)
+    if acquired_path:
+        if str(current.get("jellyfin_path") or "") != acquired_path:
+            payload["jellyfin_path"] = acquired_path
+        if not current.get("downloaded_at"):
+            payload["downloaded_at"] = time.time()
+    if task_status == "completed":
+        payload.update({
+            "download_status": "completed",
+            "download_message": "后处理完成，等待 Jellyfin 确认",
+            "downloaded_at": time.time(),
+        })
+        if task.get("output_path"):
+            payload["jellyfin_path"] = task.get("output_path")
+    if not payload:
+        return None
+    return service.update_av_download(av_id, payload)
+
+
+def sync_subscription_postprocess_states(limit: int = 500) -> int:
+    changed = 0
+    service = get_subscription_service()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for task in get_postprocess_service().list_tasks(limit=limit):
+        av_id = str(task.get("av_id") or "")
+        if av_id and str(task.get("task_type") or "") == "subscription":
+            grouped.setdefault(av_id, []).append(task)
+    terminal = {"completed", "failed", "ignored", "expired", "conflict"}
+    subscriptions = {str(item.get("id") or ""): item for item in service.get_subscribed_av()}
+    for av_id, tasks in grouped.items():
+        task = next((item for item in tasks if str(item.get("status") or "") not in terminal), tasks[0])
+        updated = sync_subscription_task_state(task)
+        if updated:
+            changed += 1
+        current = updated or subscriptions.get(av_id)
+        task_status = str(task.get("status") or "")
+        media_available = bool(subscription_task_media_path(task)) or (
+            task_status == "completed" and bool(task.get("output_path"))
+        )
+        if current and media_available and not subscription_is_in_library(current):
+            refreshed = refresh_subscription_library_status(
+                current,
+                include_existing=False,
+                transition_source="postprocess_poll",
+                notification_key=str(task.get("id") or task.get("output_path") or task.get("input_path") or ""),
+            )
+            if subscription_is_in_library(refreshed) and not subscription_is_in_library(current):
+                changed += 1
+    return changed
 
 
 def bind_qb_to_postprocess_task(task: dict[str, Any], qb_result: dict[str, Any], qb_config: dict[str, Any]) -> dict[str, Any]:
@@ -6582,6 +8448,30 @@ def bind_qb_to_postprocess_task(task: dict[str, Any], qb_result: dict[str, Any],
     task_id = str(task.get("id") or "")
     existing_qb = post.get_qb_torrent(torrent_hash)
     if existing_qb and str(existing_qb.get("task_id") or "") != task_id:
+        existing_task = post.get_task(str(existing_qb.get("task_id") or ""))
+        current_av_id = inferred_record_av_id(task)
+        existing_av_id = inferred_record_av_id(existing_task or existing_qb)
+        if current_av_id and current_av_id == existing_av_id:
+            message = "同番号种子已由现有后处理任务接管，复用现有任务状态"
+            post.update_task(
+                task_id,
+                status="ignored",
+                error_code="same_av_qb_reused",
+                error_message=message,
+            )
+            post.add_event(task_id, "info", "same_av_qb_reused", message, {
+                "torrent_hash": torrent_hash,
+                "existing_task_id": existing_qb.get("task_id", ""),
+                "existing_av_id": existing_av_id,
+                "current_task_id": task_id,
+                "current_av_id": current_av_id,
+            })
+            return {
+                "status": "reused",
+                "reason": "same_av_qb_reused",
+                "existing": existing_qb,
+                "existing_task": existing_task or {},
+            }
         post.update_task(
             task_id,
             status="conflict",
@@ -6659,17 +8549,49 @@ def postprocess_qb_config(qb_config: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = True) -> dict[str, Any]:
+def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = True, post_task: dict[str, Any] | None = None) -> dict[str, Any]:
+    av_id = str(av.get("id") or "").strip()
+    with subscription_download_lock(av_id):
+        return _download_av_from_mteam(av, save_to_subscription=save_to_subscription, post_task=post_task)
+
+
+def _download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = True, post_task: dict[str, Any] | None = None) -> dict[str, Any]:
     av_id = str(av.get("id") or "").strip()
     result: dict[str, Any] = {"av_id": av_id, "status": "skipped", "message": ""}
     if not av_id:
         result["message"] = "缺少番号"
         return result
     if save_to_subscription:
-        av = refresh_subscription_library_status(av)
-    if str(av.get("status") or "") == "in_library":
-        result.update({"status": "skipped", "message": "Jellyfin 已入库，跳过下载"})
-        app_log("info", "download", "跳过下载：Jellyfin 已入库", {"stage": "download_skip_library", "av_id": av_id})
+        av, existing_result = reconcile_subscription_existing_media(av)
+        if existing_result:
+            app_log("info", "download", "复用同番号现有媒体或后处理状态，跳过重复下载", {
+                "stage": "download_reuse_existing",
+                "av_id": av_id,
+                "status": existing_result.get("status", ""),
+                "task_id": existing_result.get("task_id", ""),
+                "version_id": existing_result.get("version_id", ""),
+            })
+            if existing_result.get("status") != "available":
+                return existing_result
+            transition_source = "poll" if av.get("library_checked_at") else "baseline"
+            av = refresh_subscription_library_status(
+                av,
+                include_existing=False,
+                transition_source=transition_source,
+                notification_key=str(existing_result.get("task_id") or existing_result.get("version_id") or existing_result.get("path") or ""),
+            )
+            if subscription_is_in_library(av):
+                return {**existing_result, "status": "in_library", "message": str(av.get("download_message") or "Jellyfin 已确认入库")}
+            return existing_result
+        transition_source = "poll" if av.get("library_checked_at") else "baseline"
+        av = refresh_subscription_library_status(av, include_existing=False, transition_source=transition_source)
+        if str(av.get("download_status") or "") == "dedupe_error":
+            message = str(av.get("download_message") or "Jellyfin 查重失败，已暂停下载")
+            result.update({"status": "dedupe_error", "message": message})
+            return result
+    if subscription_is_in_library(av):
+        result.update({"status": "in_library", "message": "Jellyfin 已入库，跳过下载"})
+        app_log("info", "download", "跳过下载：订阅已入库", {"stage": "download_skip_library", "av_id": av_id})
         return result
     verification = actor_limit_verification(av, context="mteam_download")
     if not verification["ok"]:
@@ -6688,7 +8610,17 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
 
     settings_data = get_system_settings_service().get()
     service = get_subscription_service()
-    post_task: dict[str, Any] | None = None
+    existing_task = post_task or get_postprocess_service().find_active_task(av_id, "subscription")
+    if existing_task and str(existing_task.get("status") or "") not in {"completed", "failed", "ignored", "expired", "conflict"}:
+        if str(existing_task.get("torrent_hash") or "") or str(existing_task.get("input_path") or ""):
+            sync_subscription_task_state(existing_task)
+            return {
+                "av_id": av_id,
+                "status": "active",
+                "message": "已有下载或后处理任务，跳过重复推送",
+                "task_id": existing_task.get("id", ""),
+            }
+    post_task = post_task if post_task and str(post_task.get("id") or "") else None
     app_log("info", "mteam", "开始搜索 MTeam 资源", {"stage": "mteam_search_start", "av_id": av_id})
     mteam_result = search_mteam(av_id, settings_data, limit=8)
     torrents_all = mteam_result.get("results") or []
@@ -6709,6 +8641,13 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         app_log("error", "mteam", "MTeam 未找到资源", {"stage": "mteam_search_empty", "av_id": av_id, "message": message, "raw_count": len(torrents_all)})
         if save_to_subscription:
             service.update_av_download(av_id, {"download_status": "not_found", "download_message": message})
+        if post_task:
+            get_postprocess_service().update_task(
+                str(post_task["id"]),
+                status="failed",
+                error_code="mteam_not_found",
+                error_message=message,
+            )
         return {"av_id": av_id, "status": "not_found", "message": message}
 
     torrent = choose_mteam_torrent(av_id, torrents)
@@ -6723,7 +8662,8 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         "torrent_title": torrent_title,
     })
     if save_to_subscription:
-        post_task = create_subscription_postprocess_task(av)
+        post_task = post_task or create_subscription_postprocess_task(av)
+        get_postprocess_service().update_task(post_task["id"], status="mteam_searching", error_code="", error_message="")
         get_postprocess_service().update_task(
             post_task["id"],
             data={
@@ -6777,6 +8717,22 @@ def download_av_from_mteam(av: dict[str, Any], *, save_to_subscription: bool = T
         if post_task:
             bind_result = bind_qb_to_postprocess_task(post_task, qb_result, qb_config)
         qb_status = str(qb_result.get("status") or "ok")
+        if bind_result.get("status") == "reused":
+            updated, existing_result = reconcile_subscription_existing_media(av)
+            existing_result = existing_result or {
+                "av_id": av_id,
+                "status": "active",
+                "message": "同番号种子已由现有后处理任务接管",
+            }
+            app_log("info", "download", "同番号 qB 种子已存在，复用现有后处理任务", {
+                "stage": "download_qb_same_av_reused",
+                "av_id": av_id,
+                "torrent_id": torrent_id,
+                "hash": qb_result.get("hash", ""),
+                "existing_task_id": bind_result.get("existing", {}).get("task_id", ""),
+                "status": existing_result.get("status", ""),
+            })
+            return {**existing_result, "subscription": updated, "torrent": torrent}
         if bind_result.get("status") == "conflict":
             message = "qB torrent_hash 已绑定到其他后处理任务"
             if save_to_subscription:
@@ -7011,6 +8967,32 @@ def download_wash_from_mteam(av: dict[str, Any], mode: str) -> dict[str, Any]:
         if post_task:
             bind_result = bind_qb_to_postprocess_task(post_task, qb_result, qb_config)
         qb_status = str(qb_result.get("status") or "ok")
+        if bind_result.get("status") == "reused":
+            message = "匹配到的洗版种子已由同番号现有任务使用，等待新的洗版资源"
+            saved = service.update_av_wash(av_id, {
+                "mode": mode,
+                "status": "requested",
+                "download_status": "waiting",
+                "download_message": message,
+                "mteam_torrent_id": torrent_id,
+                "mteam_torrent_title": torrent_title,
+                "qb_hash": qb_result.get("hash", ""),
+                "task_id": post_task["id"],
+                "last_checked_at": time.time(),
+            })
+            get_postprocess_service().update_task(
+                post_task["id"],
+                status="mteam_not_found",
+                error_code="same_av_qb_reused",
+                error_message=message,
+            )
+            return {
+                "av_id": av_id,
+                "status": "not_found",
+                "message": message,
+                "torrent": torrent,
+                "subscription": saved,
+            }
         if bind_result.get("status") == "conflict":
             message = "qB torrent_hash 已绑定到其他后处理任务"
             saved = service.update_av_wash(av_id, {
@@ -7837,11 +9819,78 @@ def worker_is_offline() -> bool:
         return True
 
 
+def compact_worker_status(worker_status: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    jobs = worker_status.get("jobs") if isinstance(worker_status.get("jobs"), dict) else {}
+    summary = {
+        "status": str(worker_status.get("status") or "offline"),
+        "online": bool(worker_status.get("online")),
+        "mode": str(worker_status.get("mode") or ""),
+        "backend_url": str(worker_status.get("backend_url") or ""),
+        "error": str(worker_status.get("error") or "")[:500],
+        "jobs": {
+            "total": int(jobs.get("total") or 0),
+            "active": int(jobs.get("active") or 0),
+            "cached": bool(jobs.get("cached")),
+        },
+    }
+    fingerprint_source = {
+        "status": summary["status"],
+        "online": summary["online"],
+        "mode": summary["mode"],
+        "backend_url": summary["backend_url"],
+        "error": summary["error"],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_source, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return summary, fingerprint
+
+
+def record_worker_offline(
+    post: PostprocessService,
+    task: dict[str, Any],
+    worker_status: dict[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    task_id = str(task.get("id") or "")
+    transitioned = (
+        str(task.get("status") or "") != "waiting_worker"
+        or bool(task.get("error_code"))
+        or bool(task.get("error_message"))
+    )
+    updated = task
+    if transitioned:
+        updated = post.update_task(
+            task_id,
+            status="waiting_worker",
+            error_code="",
+            error_message="",
+        ) or task
+    summary, fingerprint = compact_worker_status(worker_status)
+    heartbeat_seconds = max(
+        300,
+        int(os.getenv("WORKER_OFFLINE_EVENT_HEARTBEAT_SECONDS", str(6 * 60 * 60))),
+    )
+    post.add_event_if_due(
+        task_id,
+        "info",
+        "worker_offline",
+        message,
+        {
+            "event_kind": "transition" if transitioned else "heartbeat",
+            "worker": summary,
+        },
+        min_interval_seconds=0 if transitioned else heartbeat_seconds,
+        fingerprint=fingerprint,
+    )
+    return updated
+
+
 def build_postprocess_output_path(task: dict[str, Any], settings_payload: dict[str, Any]) -> str:
     input_path = Path(str(task.get("input_path") or ""))
     av_id = canonical_av_id(task.get("av_id")) or canonical_av_id(detect_catalog_number(input_path.stem)) or str(input_path.stem or "unknown").upper()
     filename = input_path.name if input_path.suffix.lower() in VIDEO_EXTENSIONS else f"{input_path.stem or av_id}.mkv"
-    output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
+    output_dir = Path(str(settings_payload.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR)) / av_id
     return str(output_dir / filename)
 
 
@@ -7849,8 +9898,40 @@ def build_postprocess_original_output_path(task: dict[str, Any], settings_payloa
     source = Path(str(source_path or task.get("input_path") or ""))
     av_id = canonical_av_id(task.get("av_id")) or canonical_av_id(detect_catalog_number(source.stem)) or str(source.stem or "unknown").upper()
     filename = source.name if source.suffix.lower() in VIDEO_EXTENSIONS else f"{source.stem or av_id}.mkv"
-    output_dir = Path(str(settings_payload.get("output_dir") or "/media/压制")) / av_id
+    output_dir = Path(str(settings_payload.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR)) / av_id
     return str(output_dir / filename)
+
+
+def prepare_remote_output_path(path: str) -> dict[str, object]:
+    """Prepare only the exact Worker output directory for group-writable SMB access."""
+    target = Path(path)
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    result: dict[str, object] = {
+        "path": str(target),
+        "directory": str(parent),
+        "directory_created": True,
+        "permissions_changed": False,
+    }
+    if os.name == "nt":
+        return result
+    try:
+        parent_mode = stat.S_IMODE(parent.stat().st_mode)
+        desired_parent_mode = parent_mode | stat.S_IWGRP | stat.S_IXGRP | stat.S_ISGID
+        if desired_parent_mode != parent_mode:
+            parent.chmod(desired_parent_mode)
+            result["permissions_changed"] = True
+        result["directory_mode"] = oct(stat.S_IMODE(parent.stat().st_mode))
+        if target.exists() and target.is_file() and target.stat().st_size == 0:
+            target_mode = stat.S_IMODE(target.stat().st_mode)
+            desired_target_mode = target_mode | stat.S_IWGRP
+            if desired_target_mode != target_mode:
+                target.chmod(desired_target_mode)
+                result["permissions_changed"] = True
+            result["empty_output_mode"] = oct(stat.S_IMODE(target.stat().st_mode))
+    except OSError as exc:
+        raise RuntimeError(f"无法为 Windows 算力端准备输出目录 {parent}: {exc}") from exc
+    return result
 
 
 def avoid_output_conflict(path: str, task_id: str) -> str:
@@ -7892,7 +9973,7 @@ def output_path_conflicts(path: str, task_id: str = "") -> bool:
 
 def ensure_managed_original_product(task: dict[str, Any], settings_payload: dict[str, Any], source_path: str) -> str:
     source = Path(source_path)
-    output_root = Path(str(settings_payload.get("output_dir") or "/media/压制"))
+    output_root = Path(str(settings_payload.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
     configured_output = str(task.get("output_path") or "").strip()
     if configured_output:
         target = Path(configured_output)
@@ -7911,12 +9992,17 @@ def ensure_managed_original_product(task: dict[str, Any], settings_payload: dict
     return str(target)
 
 
-def ensure_managed_subtitle_product(subtitle_path: str, product_path: str) -> str:
+def ensure_managed_subtitle_product(
+    subtitle_path: str,
+    product_path: str,
+    language_tag: str = "zh-CN",
+) -> str:
     subtitle = Path(subtitle_path)
     product = Path(product_path)
     if not subtitle.exists() or not product.exists():
         return subtitle_path
-    target = product.with_suffix(subtitle.suffix or ".srt")
+    suffix = subtitle.suffix.lower() or ".srt"
+    target = product.parent / f"{product.stem}.{language_tag}{suffix}"
     try:
         if subtitle.resolve() == target.resolve():
             return str(subtitle)
@@ -8026,7 +10112,7 @@ def insert_nfo_actor_nodes(path: Path, actors: list[str]) -> dict[str, Any]:
 
 def nfo_actor_repair_candidates(*, apply: bool = False) -> dict[str, Any]:
     post_settings = get_postprocess_service().get_settings()
-    output_root = Path(str(post_settings.get("output_dir") or "/media/压制"))
+    output_root = Path(str(post_settings.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
     payload: dict[str, Any] = {
         "status": "ok",
         "root": str(output_root),
@@ -8227,7 +10313,7 @@ def refresh_jellyfin_item_metadata(item_id: str, config: dict[str, Any]) -> dict
 
 def jellyfin_actor_refresh_candidates(*, apply: bool = False) -> dict[str, Any]:
     post_settings = get_postprocess_service().get_settings()
-    output_root = Path(str(post_settings.get("output_dir") or "/media/压制"))
+    output_root = Path(str(post_settings.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
     config = jellyfin_config()
     payload: dict[str, Any] = {
         "status": "ok",
@@ -8423,6 +10509,7 @@ def cleanup_postprocess_subtitle_artifacts(
             keep.add(str(Path(item)))
     candidates: list[Path] = []
     candidates.extend(subtitle_artifact_candidates(worker_result))
+    candidates.extend(product.parent.glob(f"{product.stem}.zh-CN.*"))
     candidates.extend(product.parent.glob(f"{product.stem}.zh.*"))
     candidates.extend(product.parent.glob(f"{product.stem}.bilingual.*"))
     unique_candidates = list(dict.fromkeys(candidates))
@@ -8484,6 +10571,8 @@ def dispatch_postprocess_task(task: dict[str, Any]) -> dict[str, Any]:
             "callback_token": frontend_api_token() if remote_worker else "",
         }
         if remote_worker:
+            output_preparation = prepare_remote_output_path(output_path)
+            payload["output_preparation"] = output_preparation
             result = remote_post_json("/api/transcode/jobs", payload, timeout=60)
         else:
             payload["job_id"] = uuid.uuid4().hex
@@ -8602,6 +10691,7 @@ def run_ffprobe(path: Path) -> dict[str, Any]:
         errors="replace",
         timeout=30,
         check=True,
+        creationflags=WINDOWS_CREATE_NO_WINDOW,
     )
     return json.loads(result.stdout or "{}")
 
@@ -8833,7 +10923,7 @@ def try_unraid_postprocess_fast_move(
 
 def validate_managed_version_trashable(version: dict[str, Any], settings_payload: dict[str, Any]) -> dict[str, Any]:
     source = Path(str(version.get("path") or ""))
-    output_root = Path(str(settings_payload.get("output_dir") or "/media/压制"))
+    output_root = Path(str(settings_payload.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
     if str(version.get("generated_by") or "") != "moviemuse":
         raise RuntimeError("旧版本不是 MovieMuse 托管版本，拒绝移动")
     if not path_under(source, output_root):
@@ -8899,7 +10989,7 @@ def move_postprocess_source_to_trash(task: dict[str, Any], product_path: str, se
             return None
     except OSError:
         return None
-    download_root = Path(str(settings_payload.get("download_dir") or "/media/study3"))
+    download_root = Path(str(settings_payload.get("download_dir") or DEFAULT_POSTPROCESS_DOWNLOAD_DIR))
     if not path_under(source, download_root):
         raise RuntimeError("源文件不在后处理下载目录内，拒绝自动清理")
     if not source.exists() or not source.is_file():
@@ -8977,7 +11067,7 @@ def validate_and_activate_postprocess_task(
         source_product = chosen_output or input_source
         if chosen_output and not Path(chosen_output).exists() and input_source and Path(input_source).exists():
             source_product = input_source
-        output_root = Path(str(settings_payload.get("output_dir") or "/media/压制"))
+        output_root = Path(str(settings_payload.get("output_dir") or DEFAULT_POSTPROCESS_OUTPUT_DIR))
         if path_under(Path(source_product), output_root):
             product_path = source_product
         else:
@@ -9199,7 +11289,7 @@ def validate_and_activate_postprocess_task(
         user_message = "后处理完成"
     if source_type.startswith("wash_"):
         mode = "4k" if source_type == "wash_4k" else "chinese"
-        get_subscription_service().update_av_wash(str(task.get("av_id") or ""), {
+        updated_subscription = get_subscription_service().update_av_wash(str(task.get("av_id") or ""), {
             "mode": mode,
             "status": "completed",
             "download_status": "completed",
@@ -9207,29 +11297,22 @@ def validate_and_activate_postprocess_task(
             "new_path": product_path,
             "task_id": task_id,
         })
+        if updated_subscription:
+            notify_wash_completed(updated_subscription, task_id=task_id, path=product_path)
     elif source_type == "subscription":
-        get_subscription_service().update_av_download(str(task.get("av_id") or ""), {
-            "status": "done",
+        updated_subscription = get_subscription_service().update_av_download(str(task.get("av_id") or ""), {
             "download_status": "completed",
-            "download_message": user_message,
+            "download_message": f"{user_message}，等待 Jellyfin 确认",
+            "jellyfin_path": product_path,
             "downloaded_at": time.time(),
         })
-    av_id_for_notice = str(task.get("av_id") or "")
-    subscription_for_notice = next(
-        (item for item in get_subscription_service().get_subscribed_av() if str(item.get("id") or "") == av_id_for_notice),
-        {},
-    )
-    send_notification_event("jellyfin_in_library", {
-        "status": "completed",
-        "title": str(subscription_for_notice.get("title") or av_id_for_notice or task_id),
-        "detail": f"{av_id_for_notice or task_id} 已完成后处理并刷新 Jellyfin",
-        "av_id": av_id_for_notice,
-        "task_id": task_id,
-        "path": product_path,
-        "file_name": notification_filename(product_path, av_id_for_notice or task_id),
-        "save_path": notification_parent_path(product_path, ""),
-        "cover": subscription_for_notice.get("cover") or subscription_for_notice.get("cover_url") or "",
-    })
+        if updated_subscription:
+            refresh_subscription_library_status(
+                updated_subscription,
+                include_existing=False,
+                transition_source="postprocess",
+                notification_key=task_id,
+            )
     if bool(task.get("needs_subtitle")):
         if subtitle_failure:
             send_notification_event("subtitle_failed", {
@@ -9408,6 +11491,7 @@ def poll_postprocess_once() -> dict[str, Any]:
                 "status": queue_result.get("status"),
                 "updated": queue_result.get("updated"),
             })
+    subscription_states_synced = sync_subscription_postprocess_states()
     return {
         "qb": qb_result,
         "subtitle": subtitle_result,
@@ -9416,6 +11500,7 @@ def poll_postprocess_once() -> dict[str, Any]:
         "worker_missing_recovery": recovered_missing,
         "worker_queue": worker_queue,
         "queue_auto_run": queue_result,
+        "subscription_states_synced": subscription_states_synced,
     }
 
 
@@ -9491,8 +11576,14 @@ def normalized_media_path_is_under(path_value: str, root_value: str) -> bool:
     return path_norm == root_norm or path_norm.startswith(root_norm + "/")
 
 
-def find_jellyfin_match(av_id: str, title: str, config: dict[str, Any]) -> dict[str, str] | None:
-    matches = find_jellyfin_matches(av_id, title, config)
+def find_jellyfin_match(
+    av_id: str,
+    title: str,
+    config: dict[str, Any],
+    *,
+    raise_errors: bool = False,
+) -> dict[str, str] | None:
+    matches = find_jellyfin_matches(av_id, title, config, raise_errors=raise_errors)
     return matches[0] if matches else None
 
 
@@ -9511,7 +11602,23 @@ def refresh_jellyfin_library(config: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
-def find_jellyfin_matches(av_id: str, title: str, config: dict[str, Any]) -> list[dict[str, str]]:
+def jellyfin_lookup_error_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"Jellyfin API 返回 HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "Jellyfin API 请求超时"
+    if isinstance(exc, httpx.HTTPError):
+        return f"Jellyfin API 连接失败：{type(exc).__name__}"
+    return f"Jellyfin API 响应异常：{type(exc).__name__}"
+
+
+def find_jellyfin_matches(
+    av_id: str,
+    title: str,
+    config: dict[str, Any],
+    *,
+    raise_errors: bool = False,
+) -> list[dict[str, str]]:
     base_url = str(config.get("url") or "").strip().rstrip("/")
     api_key = str(config.get("api_key") or "").strip()
     if not base_url or not api_key or not av_id:
@@ -9553,7 +11660,9 @@ def find_jellyfin_matches(av_id: str, title: str, config: dict[str, Any]) -> lis
                         if key and key not in seen:
                             seen.add(key)
                             matches.append({"id": item_id, "name": name, "path": path_value})
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as exc:
+        if raise_errors:
+            raise RuntimeError(jellyfin_lookup_error_message(exc)) from exc
         return []
     return matches
 
@@ -9828,14 +11937,51 @@ def submit_jellyfin_transcode_job(resolved: dict[str, Any], target_codec: str | 
 def start_subscription_polling() -> None:
     global subscription_poll_thread
     apply_system_proxy_settings()
-    if subscription_poll_thread is None:
+    migrate_compute_config_ownership()
+    if compute_node_only():
+        get_subtitle_service()
+        return
+    javdb.start()
+    if subscription_poll_thread is None or not subscription_poll_thread.is_alive():
+        subscription_poll_stop.clear()
         subscription_poll_thread = threading.Thread(target=subscription_poll_loop, name="subscription-poll", daemon=True)
         subscription_poll_thread.start()
 
 
 @app.on_event("shutdown")
 def stop_subscription_polling() -> None:
+    global subscription_poll_thread, subtitle_service
+    started_at = time.monotonic()
+    timeout = max(3.0, float(os.getenv("MOVIEMUSE_SHUTDOWN_TIMEOUT_SECONDS", "12")))
     subscription_poll_stop.set()
+    poll_stopped = True
+    if subscription_poll_thread and subscription_poll_thread.is_alive():
+        subscription_poll_thread.join(timeout=min(5.0, timeout))
+        poll_stopped = not subscription_poll_thread.is_alive()
+    if poll_stopped:
+        subscription_poll_thread = None
+
+    javlibrary_closed = True
+    javdb_closed = True
+    if not compute_node_only():
+        remaining = max(0.1, timeout - (time.monotonic() - started_at))
+        javlibrary_closed = javlibrary.close(timeout_ms=max(1000, min(3000, int(remaining * 1000))))
+        remaining = max(0.1, timeout - (time.monotonic() - started_at))
+        javdb_closed = javdb.close(timeout=min(5.0, remaining))
+    subtitle_closed = True
+    if subtitle_service is not None:
+        remaining = max(0.1, timeout - (time.monotonic() - started_at))
+        subtitle_closed = subtitle_service.close(timeout=min(5.0, remaining))
+        if subtitle_closed:
+            subtitle_service = None
+    app_log("info", "lifecycle", "MovieMuse shutdown cleanup completed", {
+        "stage": "application_shutdown_cleanup",
+        "elapsed": round(time.monotonic() - started_at, 3),
+        "poll_stopped": poll_stopped,
+        "javlibrary_closed": javlibrary_closed,
+        "javdb_closed": javdb_closed,
+        "subtitle_closed": subtitle_closed,
+    })
 
 
 @app.get("/subscriptions", response_class=HTMLResponse)
@@ -9937,6 +12083,155 @@ def postprocess_page_payload() -> dict[str, Any]:
     }
 
 
+TASK_CENTER_RUNNING_STATUS_KEYS = {"running", "translating"}
+TASK_CENTER_WAITING_STATUS_KEYS = {"queued", "translation_queued"}
+TASK_CENTER_CURRENT_STATUS_KEYS = TASK_CENTER_RUNNING_STATUS_KEYS | TASK_CENTER_WAITING_STATUS_KEYS | {"detached", "failed"}
+TASK_CENTER_HISTORY_STATUS_KEYS = {"completed", "detached", "failed"}
+
+
+def task_center_postprocess_status_key(task: dict[str, Any]) -> str:
+    data = task.get("data") if isinstance(task.get("data"), dict) else {}
+    if str(data.get("qb_state") or "") == "missingFiles":
+        source_trash = data.get("source_trash") if isinstance(data.get("source_trash"), dict) else {}
+        expected_missing = (
+            str(task.get("status") or "") == "completed"
+            or str(source_trash.get("status") or "") in {"moved", "skipped"}
+            or bool(source_trash.get("target"))
+            or bool(data.get("version_id"))
+            or bool(data.get("activation"))
+        )
+        return "detached" if expected_missing else "failed"
+    status = str(task.get("status") or "")
+    if status in {"waiting_worker", "waiting_input", "ready_to_run", "created"}:
+        return "queued"
+    if status in {"dispatching", "sent_to_worker", "transcoding", "worker_done", "transcode_validating"}:
+        return "running"
+    if status in {"subtitle_processing", "subtitle_validating", "transcode_done"}:
+        return "translating"
+    if status == "completed":
+        return "completed"
+    if status in {"failed", "ignored", "conflict", "expired"}:
+        return "failed"
+    return "queued"
+
+
+def task_center_subtitle_status_key(job: dict[str, Any]) -> str:
+    status = str(job.get("status") or "queued")
+    if status == "translating" and "等待翻译字幕" in str(job.get("message") or ""):
+        return "translation_queued"
+    return status
+
+
+def task_center_subtitle_job_time(job: dict[str, Any]) -> float:
+    try:
+        return float(job.get("updated_at") or job.get("finished_at") or job.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def task_center_subtitle_status_rank(job: dict[str, Any]) -> tuple[int, float]:
+    status = str(job.get("status") or "queued")
+    rank = 3 if status in {"queued", "running", "translating"} else 2 if status == "completed" else 1 if status == "failed" else 0
+    return rank, task_center_subtitle_job_time(job)
+
+
+def coalesce_task_center_subtitle_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        path = str(job.get("video_path") or "").strip().replace("\\", "/").lower()
+        key = path or f"id:{job.get('id') or ''}"
+        current = grouped.get(key)
+        if current is None or task_center_subtitle_status_rank(job) > task_center_subtitle_status_rank(current):
+            grouped[key] = job
+    return list(grouped.values())
+
+
+def task_center_item(source_type: str, raw: dict[str, Any]) -> dict[str, Any]:
+    if source_type == "subtitle":
+        status_key = task_center_subtitle_status_key(raw)
+        sort_time = task_center_subtitle_job_time(raw)
+    else:
+        status_key = task_center_postprocess_status_key(raw)
+        try:
+            sort_time = float(raw.get("updated_at") or raw.get("created_at") or 0)
+        except (TypeError, ValueError):
+            sort_time = 0.0
+    return {
+        "source_type": source_type,
+        "status_key": status_key,
+        "sort_time": sort_time,
+        "raw": raw,
+    }
+
+
+@app.get("/api/task-center")
+def api_task_center(
+    scope: str = "current",
+    category: str = "all",
+    page: int = 1,
+    page_size: int = 20,
+) -> dict[str, object]:
+    normalized_scope = "history" if str(scope or "").lower() == "history" else "current"
+    normalized_category = str(category or "all").lower()
+    if normalized_category not in {"all", "running", "waiting", "detached", "failed", "completed"}:
+        raise HTTPException(status_code=400, detail="不支持的任务状态筛选")
+    safe_page_size = max(1, min(100, int(page_size or 20)))
+
+    post = get_postprocess_service()
+    postprocess_items = [task_center_item("postprocess", task) for task in post.list_tasks(limit=None)]
+    if backend_url():
+        subtitle_payload = subtitle_jobs_payload_from_remote_or_cache(limit=0)
+        subtitle_jobs = normalize_subtitle_job_items(subtitle_payload.get("jobs"))
+    else:
+        subtitle_jobs = [job_payload(job) for job in get_subtitle_service().list_jobs()]
+    subtitle_items = [
+        task_center_item("subtitle", job)
+        for job in coalesce_task_center_subtitle_jobs(subtitle_jobs)
+    ]
+    all_items = sorted(postprocess_items + subtitle_items, key=lambda item: float(item["sort_time"]), reverse=True)
+
+    counts = {
+        "current": sum(1 for item in all_items if item["status_key"] in TASK_CENTER_CURRENT_STATUS_KEYS),
+        "history": sum(1 for item in all_items if item["status_key"] in TASK_CENTER_HISTORY_STATUS_KEYS),
+        "running": sum(1 for item in all_items if item["status_key"] in TASK_CENTER_RUNNING_STATUS_KEYS),
+        "waiting": sum(1 for item in all_items if item["status_key"] in TASK_CENTER_WAITING_STATUS_KEYS),
+        "detached": sum(1 for item in all_items if item["status_key"] == "detached"),
+        "failed": sum(1 for item in all_items if item["status_key"] == "failed"),
+        "completed": sum(1 for item in all_items if item["status_key"] == "completed"),
+        "total": len(all_items),
+    }
+
+    if normalized_scope == "history":
+        filtered = [item for item in all_items if item["status_key"] in TASK_CENTER_HISTORY_STATUS_KEYS]
+    elif normalized_category == "all":
+        filtered = [item for item in all_items if item["status_key"] in TASK_CENTER_CURRENT_STATUS_KEYS]
+    elif normalized_category == "running":
+        filtered = [item for item in all_items if item["status_key"] in TASK_CENTER_RUNNING_STATUS_KEYS]
+    elif normalized_category == "waiting":
+        filtered = [item for item in all_items if item["status_key"] in TASK_CENTER_WAITING_STATUS_KEYS]
+    else:
+        filtered = [item for item in all_items if item["status_key"] == normalized_category]
+
+    total = len(filtered)
+    page_count = max(1, (total + safe_page_size - 1) // safe_page_size)
+    safe_page = max(1, min(page_count, int(page or 1)))
+    start = (safe_page - 1) * safe_page_size
+    return {
+        "items": filtered[start : start + safe_page_size],
+        "counts": counts,
+        "pagination": {
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "page_count": page_count,
+            "total": total,
+            "start": start + 1 if total else 0,
+            "end": min(start + safe_page_size, total),
+        },
+        "settings": post.get_settings(),
+        "worker_status": subtitle_backend_status(),
+    }
+
+
 @app.get("/transcode", response_class=HTMLResponse)
 def transcode_page(request: Request) -> Response:
     if compute_node_only():
@@ -9983,6 +12278,26 @@ def api_postprocess_task_events(task_id: str, limit: int = 200) -> dict[str, obj
     return {"task": task, "events": post.list_events(task_id, limit=limit)}
 
 
+def rollback_postprocess_dispatch(task_id: str, exc: Exception, message_prefix: str = "算力端派发失败") -> dict[str, object]:
+    post = get_postprocess_service()
+    detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+    message = f"{message_prefix}: {detail}" if detail else message_prefix
+    task = post.update_task(
+        task_id,
+        status="ready_to_run",
+        error_code="worker_dispatch_failed",
+        error_message=message,
+    )
+    post.add_event(
+        task_id,
+        "error",
+        "worker_dispatch_failed",
+        "算力端派发失败，任务已退回可执行队列",
+        {"error": message},
+    )
+    return {"task_id": task_id, "status": "ready_to_run", "error": message, "task": task}
+
+
 @app.post("/api/postprocess/tasks/{task_id}/run")
 def api_run_postprocess_task(task_id: str) -> dict[str, object]:
     post = get_postprocess_service()
@@ -9993,14 +12308,22 @@ def api_run_postprocess_task(task_id: str) -> dict[str, object]:
     if status not in RUNNABLE_POSTPROCESS_STATUSES:
         return {"status": "skipped", "reason": "not_runnable", "task": task}
     settings_payload = post.get_settings()
-    if postprocess_task_needs_worker(task, settings_payload) and worker_is_offline():
-        updated = post.update_task(task_id, status="waiting_worker", error_code="", error_message="")
-        post.add_event(task_id, "info", "worker_offline", "算力端离线，单任务执行已保留在等待队列")
+    worker_status = subtitle_backend_status() if postprocess_task_needs_worker(task, settings_payload) else {}
+    if worker_status and not bool(worker_status.get("online") or worker_status.get("status") == "ok"):
+        updated = record_worker_offline(
+            post,
+            task,
+            worker_status,
+            "算力端离线，单任务执行已保留在等待队列",
+        )
         return {"status": "waiting_worker", "task": updated}
     claimed = claim_postprocess_task_for_dispatch(task)
     if not claimed:
         return {"status": "skipped", "reason": "status_changed", "task": post.get_task(task_id)}
-    return dispatch_postprocess_task(claimed)
+    try:
+        return dispatch_postprocess_task(claimed)
+    except Exception as exc:
+        return rollback_postprocess_dispatch(task_id, exc)
 
 
 def reset_postprocess_task_for_retry(task: dict[str, Any]) -> str:
@@ -10033,6 +12356,27 @@ def api_retry_postprocess_task(task_id: str) -> dict[str, object]:
     task = post.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="后处理任务不存在")
+    acquisition_errors = {"download_push_failed", "mteam_missing_id", "mteam_not_found"}
+    if (
+        str(task.get("task_type") or "") == "subscription"
+        and str(task.get("error_code") or "") in acquisition_errors
+        and not str(task.get("torrent_hash") or "").strip()
+        and not str(task.get("input_path") or "").strip()
+    ):
+        av_id = str(task.get("av_id") or "")
+        av = next((item for item in get_subscription_service().get_subscribed_av() if str(item.get("id") or "") == av_id), None)
+        if not av:
+            raise HTTPException(status_code=404, detail="订阅番号不存在，无法重新获取 MTeam 资源")
+        post.update_task(task_id, status="mteam_searching", error_code="", error_message="")
+        post.add_event(task_id, "info", "task_retry_acquisition", "用户手动重试 MTeam 获取和 qB 推送", {
+            "previous_status": task.get("status", ""),
+            "previous_error_code": task.get("error_code", ""),
+        })
+        result = download_av_from_mteam(av, post_task=post.get_task(task_id) or task)
+        updated = post.get_task(task_id)
+        if updated:
+            sync_subscription_task_state(updated)
+        return {"status": result.get("status", "error"), "task": updated, "download_result": result}
     next_status = reset_postprocess_task_for_retry(task)
     updated = post.get_task(task_id) or post.update_task(task_id, status=next_status, error_code="", error_message="")
     post.add_event(task_id, "info", "task_retry", "用户手动重试后处理任务", {
@@ -10412,6 +12756,17 @@ def active_postprocess_worker_count() -> int:
     return len(get_postprocess_service().list_tasks(statuses=sorted(WORKER_ACTIVE_TASK_STATUSES), limit=500))
 
 
+def effective_postprocess_worker_limit(settings_payload: dict[str, Any], worker_status: dict[str, Any]) -> int:
+    requested = max(1, min(8, int(settings_payload.get("max_concurrency") or 1)))
+    effective = worker_status.get("effective_config") if isinstance(worker_status, dict) else {}
+    limits = effective.get("safe_limits") if isinstance(effective, dict) else {}
+    try:
+        worker_limit = max(1, int((limits or {}).get("transcode") or requested))
+    except (TypeError, ValueError):
+        worker_limit = requested
+    return min(requested, worker_limit)
+
+
 def postprocess_task_needs_worker(task: dict[str, Any], settings_payload: dict[str, Any]) -> bool:
     if bool(settings_payload.get("auto_transcode_enabled")):
         return True
@@ -10510,8 +12865,12 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
 
     if not online:
         for task in worker_candidates:
-            post.update_task(str(task["id"]), status="waiting_worker", error_code="", error_message="")
-            post.add_event(str(task["id"]), "info", "worker_offline", "算力端离线，批量运行已保留在等待队列", {"worker_status": worker_status})
+            record_worker_offline(
+                post,
+                task,
+                worker_status,
+                "算力端离线，批量运行已保留在等待队列",
+            )
         return {
             "status": "waiting_worker" if worker_candidates else "dispatched",
             "selected": len(unique_ids),
@@ -10526,7 +12885,7 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
             "tasks": updated,
         }
 
-    max_concurrency = max(1, min(8, int(settings_payload.get("max_concurrency") or 1)))
+    max_concurrency = effective_postprocess_worker_limit(settings_payload, worker_status)
     active_count = active_postprocess_worker_count()
     available_slots = max(0, max_concurrency - active_count)
     if available_slots <= 0:
@@ -10561,17 +12920,8 @@ def run_selected_postprocess_tasks(task_ids: list[str]) -> dict[str, object]:
             continue
         try:
             updated.append(dispatch_postprocess_task(claimed))
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else 0
-            message = f"算力端接口返回 {status_code}: {exc.response.text[:200] if exc.response is not None else exc}"
-            post.update_task(str(task["id"]), status="ready_to_run", error_code="worker_dispatch_failed", error_message=message)
-            post.add_event(str(task["id"]), "error", "worker_dispatch_failed", "批量运行派发失败，任务保留可重试", {"error": message})
-            updated.append({"task_id": task["id"], "status": "ready_to_run", "error": message})
         except Exception as exc:
-            message = str(exc)
-            post.update_task(str(task["id"]), status="waiting_worker", error_code="worker_dispatch_failed", error_message=message)
-            post.add_event(str(task["id"]), "error", "worker_dispatch_failed", "批量运行派发失败，任务退回等待队列", {"error": message})
-            updated.append({"task_id": task["id"], "status": "waiting_worker", "error": message})
+            updated.append(rollback_postprocess_dispatch(str(task["id"]), exc, "批量运行派发失败"))
     for task in worker_candidates[available_slots:]:
         if task.get("status") == "waiting_worker":
             post.update_task(str(task["id"]), status="ready_to_run", error_code="", error_message="")
@@ -10647,8 +12997,12 @@ def run_postprocess_queue() -> dict[str, object]:
             updated.append({"task_id": task["id"], "status": "ready_to_run", "error": message})
     if not online:
         for task in worker_candidates:
-            post.update_task(task["id"], status="waiting_worker")
-            post.add_event(task["id"], "info", "worker_offline", "算力端离线，任务保留在等待队列", {"worker_status": worker_status})
+            record_worker_offline(
+                post,
+                task,
+                worker_status,
+                "算力端离线，任务保留在等待队列",
+            )
         return {
             "status": "waiting_worker" if worker_candidates else "dispatched",
             "updated": len(updated),
@@ -10661,7 +13015,7 @@ def run_postprocess_queue() -> dict[str, object]:
             "tasks": updated,
         }
 
-    max_concurrency = max(1, min(8, int(settings_payload.get("max_concurrency") or 1)))
+    max_concurrency = effective_postprocess_worker_limit(settings_payload, worker_status)
     active_count = active_postprocess_worker_count()
     available_slots = max(0, max_concurrency - active_count)
     if available_slots <= 0:
@@ -10695,17 +13049,8 @@ def run_postprocess_queue() -> dict[str, object]:
         try:
             result = dispatch_postprocess_task(claimed)
             updated.append(result)
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else 0
-            message = f"算力端接口返回 {status_code}: {exc.response.text[:200] if exc.response is not None else exc}"
-            post.update_task(task["id"], status="ready_to_run", error_code="worker_dispatch_failed", error_message=message)
-            post.add_event(task["id"], "error", "worker_dispatch_failed", "算力端派发失败，任务保留可重试", {"error": message})
-            updated.append({"task_id": task["id"], "status": "ready_to_run", "error": message})
         except Exception as exc:
-            message = str(exc)
-            post.update_task(task["id"], status="waiting_worker", error_code="worker_dispatch_failed", error_message=message)
-            post.add_event(task["id"], "error", "worker_dispatch_failed", "算力端派发失败，任务退回等待队列", {"error": message})
-            updated.append({"task_id": task["id"], "status": "waiting_worker", "error": message})
+            updated.append(rollback_postprocess_dispatch(str(task["id"]), exc))
     for task in worker_candidates[available_slots:]:
         if task.get("status") == "waiting_worker":
             post.update_task(task["id"], status="ready_to_run")
@@ -10749,16 +13094,12 @@ def ui_preview_page() -> Response:
 
 NOTIFICATION_EVENTS: tuple[dict[str, str], ...] = (
     {"key": "av_subscribed", "name": "番号已加入订阅", "description": "手动或自动新增番号订阅后发送。"},
-    {"key": "mteam_found", "name": "MTeam 命中资源", "description": "订阅番号搜索到可下载资源时发送。"},
-    {"key": "torrent_sent", "name": "种子已推送下载器", "description": "种子成功发送到 qBittorrent 后发送。"},
-    {"key": "jellyfin_in_library", "name": "Jellyfin 已入库", "description": "订阅番号确认已经在媒体库中时发送。"},
+    {"key": "subscription_in_library", "name": "订阅已入库", "description": "订阅番号从未入库变为 Jellyfin 已确认可播放时发送一次。"},
+    {"key": "wash_completed", "name": "洗版已完成", "description": "洗版的新媒体版本完成校验并激活后发送一次。"},
     {"key": "task_failed", "name": "任务失败告警", "description": "订阅轮询、下载、集成测试等链路失败时发送。"},
     {"key": "scan_completed", "name": "重复视频扫描完成", "description": "重复视频扫描结束后发送摘要。"},
     {"key": "subtitle_completed", "name": "字幕任务完成", "description": "字幕生成或翻译完成后发送。"},
     {"key": "subtitle_failed", "name": "字幕任务失败", "description": "字幕生成、翻译失败后发送。"},
-    {"key": "automation_actress_poll", "name": "女优订阅轮询完成", "description": "自动任务：女优订阅轮询执行完成后发送摘要。"},
-    {"key": "automation_av_download", "name": "番号订阅下载完成", "description": "自动任务：订阅番号下载检查执行完成后发送摘要。"},
-    {"key": "automation_wash_download", "name": "洗版轮询完成", "description": "自动任务：洗版资源轮询执行完成后发送摘要。"},
 )
 
 
@@ -10917,7 +13258,7 @@ async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) 
     service = get_subscription_service()
     result = service.subscribe_av(payload)
     download_result = {"status": "queued", "message": "后台检查 Jellyfin 与 MTeam"}
-    if result.get("status") != "in_library":
+    if not subscription_is_in_library(result):
         background_tasks.add_task(background_download_subscription_av, str(result.get("id") or ""))
     send_notification_event("av_subscribed", {
         "status": result.get("status") or "subscribed",
@@ -10927,19 +13268,8 @@ async def api_subscribe_av(request: Request, background_tasks: BackgroundTasks) 
         "cover": result.get("cover") or result.get("cover_url") or "",
         "release_date": result.get("date") or result.get("release_date") or "",
     })
-    if result.get("status") == "in_library":
-        send_notification_event("jellyfin_in_library", {
-            "status": "in_library",
-            "title": str(result.get("title") or result.get("id") or ""),
-            "detail": f"{result.get('id', '')} 已在 Jellyfin 媒体库中",
-            "av_id": result.get("id", ""),
-            "path": result.get("jellyfin_path", ""),
-            "file_name": notification_filename(result.get("jellyfin_path"), str(result.get("id") or "")),
-            "save_path": notification_parent_path(result.get("jellyfin_path"), ""),
-            "cover": result.get("cover") or result.get("cover_url") or "",
-        })
     app_log("info", "subscription", "订阅番号已写入，后台检查已入队", {"stage": "subscribe_queued", "av_id": result.get("id"), "status": result.get("status"), "download_status": download_result.get("status")})
-    return {"status": "ok", "subscription": result, "download": download_result}
+    return {"status": "ok", "subscription": subscription_api_record(result), "download": download_result}
 
 
 @app.delete("/api/subscriptions/av/{av_id}")
@@ -10954,9 +13284,9 @@ def api_unsubscribe_av(av_id: str) -> dict[str, object]:
 @app.get("/api/subscriptions/av")
 def api_get_subscribed_av() -> dict[str, object]:
     """获取已订阅番号列表"""
-    service = get_subscription_service()
     expire_wash_requests_with_postprocess()
-    return {"subscriptions": subscribed_avs_with_global_filter("subscription_list")}
+    reconcile_local_subscription_states()
+    return {"subscriptions": [subscription_api_record(item) for item in subscribed_avs_with_global_filter("subscription_list")]}
 
 
 @app.post("/api/subscriptions/av/{av_id}/download")
@@ -10967,7 +13297,7 @@ def api_download_subscription_av(av_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="番号未订阅")
     result = download_av_from_mteam(av)
     latest = next((item for item in service.get_subscribed_av() if item.get("id") == av_id), av)
-    return {"status": "ok", "result": result, "subscription": latest}
+    return {"status": "ok", "result": result, "subscription": subscription_api_record(latest)}
 
 
 @app.post("/api/subscriptions/av/download-pending")
@@ -10989,15 +13319,29 @@ async def api_cleanup_dirty_subscriptions(request: Request) -> dict[str, object]
 
 @app.post("/api/subscriptions/av/{av_id}/status")
 async def api_update_av_status(av_id: str, request: Request) -> dict[str, object]:
-    """更新番号状态（pending/done）"""
+    """重新打开订阅；完成状态只允许由 Jellyfin 自动确认。"""
     payload = await request.json()
     status = payload.get("status", "pending")
-    if status not in ("pending", "done", "in_library"):
-        raise HTTPException(status_code=400, detail="status 必须是 pending、done 或 in_library")
+    if status != "pending":
+        raise HTTPException(status_code=400, detail="完成状态由 Jellyfin 自动确认，不能手动标记")
     service = get_subscription_service()
-    if not service.update_av_status(av_id, status):
+    updated = service.update_av_download(av_id, {
+        "status": "pending",
+        "library_status": "not_in_library",
+        "library_checked_at": 0,
+        "library_confirmed_at": 0,
+        "library_confirmation_source": "",
+        "library_notification_armed": True,
+        "library_notification_key": "",
+        "library_notified_at": 0,
+        "jellyfin_item_id": "",
+        "jellyfin_item_name": "",
+        "download_status": "queued",
+        "download_message": "已重新加入订阅，等待 Jellyfin 与下载检查",
+    })
+    if not updated:
         raise HTTPException(status_code=404, detail="番号未订阅")
-    return {"status": "ok"}
+    return {"status": "ok", "subscription": subscription_api_record(updated)}
 
 
 @app.post("/api/subscriptions/av/{av_id}/wash")
@@ -11039,6 +13383,8 @@ async def api_update_av_wash(av_id: str, request: Request) -> dict[str, object]:
             "mteam_torrent_id": "",
             "mteam_torrent_title": "",
             "qb_hash": "",
+            "completion_notification_key": "",
+            "completion_notified_at": 0,
         })
     elif status in {"cancelled", "expired"}:
         wash_payload.update({
@@ -11590,6 +13936,7 @@ def api_get_javdb_status() -> dict[str, object]:
         "javlibrary": javlibrary.stats(),
         "metadata_cache": get_subscription_service().metadata_cache_stats(),
         "asset_cache": get_subscription_service().asset_cache_stats(),
+        "runtime_memory": runtime_memory_summary(),
     }
 
 
@@ -12149,7 +14496,7 @@ def wechat_notification_article_url(config: dict[str, Any], payload: dict[str, A
 
 
 def wechat_force_news_event(event_key: str) -> bool:
-    return event_key in {"av_subscribed", "torrent_sent", "jellyfin_in_library"}
+    return event_key in {"av_subscribed", "subscription_in_library", "wash_completed"}
 
 
 def wechat_text_only_event(event_key: str) -> bool:
@@ -12182,8 +14529,9 @@ def wechat_notification_text(event_key: str, title: str, message: str, payload: 
             f"下载器：{downloader}",
         ])
         return heading, body, f"{heading}\n\n{body}"
-    if event_key == "jellyfin_in_library":
-        heading = f"番号{av_id}入库成功" if av_id else "入库成功"
+    if event_key in {"subscription_in_library", "wash_completed"}:
+        action = "洗版完成" if event_key == "wash_completed" else "已入库"
+        heading = f"番号{av_id}{action}" if av_id else action
         path = payload.get("path") or payload.get("output_path") or payload.get("jellyfin_path") or ""
         file_name = notification_short_text(payload.get("file_name") or notification_filename(path, ""), "-")
         save_path = notification_short_text(payload.get("save_path") or notification_parent_path(path, ""), "-")
@@ -12385,7 +14733,7 @@ def wechat_download_stats(download_result: dict[str, Any] | None, subscription: 
     subscription = subscription if isinstance(subscription, dict) else {}
     status = str(result.get("status") or "")
     pushed = 1 if status in {"ok", "exists", "sent"} else 0
-    completed = 1 if str(subscription.get("status") or "") in {"done", "in_library"} else 0
+    completed = 1 if subscription_is_in_library(subscription) else 0
     predownload = 1 if str(subscription.get("subscription_mode") or "") == "predownload" and pushed else 0
     return {"pushed": pushed, "completed": completed, "predownload": predownload}
 
@@ -12394,7 +14742,7 @@ def format_wechat_subscription_stats(stats: dict[str, int], *, prefix: str = "�
     return (
         f"{prefix}\n"
         f"推送番号下载：{int(stats.get('pushed') or 0)} 个\n"
-        f"完成订阅：{int(stats.get('completed') or 0)} 个\n"
+        f"已入库订阅：{int(stats.get('completed') or 0)} 个\n"
         f"完成预下载：{int(stats.get('predownload') or 0)} 个"
     )
 
@@ -12628,10 +14976,10 @@ def wechat_subscribe_av_result(query: str) -> dict[str, Any]:
     if not verification["ok"]:
         return {"status": "skipped", "message": f"{av.get('id') or query} {verification['reason'] or '超过共演人数限制'}，已跳过。", "stats": {"pushed": 0, "completed": 0, "predownload": 0}}
     av = verification["payload"]
-    apply_jellyfin_status(av)
+    apply_jellyfin_status(av, arm_library_notification=True, confirmation_source="baseline")
     saved = get_subscription_service().subscribe_av(av)
     download_result = {"status": "skipped", "message": ""}
-    if saved.get("status") != "in_library":
+    if not subscription_is_in_library(saved):
         download_result = download_av_from_mteam(saved)
     stats = wechat_download_stats(download_result, saved)
     return {
@@ -12675,7 +15023,7 @@ def wechat_refresh_actress_result(query: str) -> dict[str, Any]:
         av_id = str(item.get("id") or "")
         latest = next((row for row in service.get_subscribed_av() if row.get("id") == av_id), item)
         download_result = {
-            "status": latest.get("download_status") or ("skipped" if latest.get("status") == "in_library" else ""),
+            "status": latest.get("download_status") or ("skipped" if subscription_is_in_library(latest) else ""),
             "message": latest.get("download_message") or "",
         }
         stats_items.append(wechat_download_stats(download_result, latest))
@@ -12749,7 +15097,7 @@ def wechat_refresh_all_actresses_result() -> dict[str, Any]:
                 av_id = str(item.get("id") or "")
                 latest = next((row for row in service.get_subscribed_av() if row.get("id") == av_id), item)
                 download_result = {
-                    "status": latest.get("download_status") or ("skipped" if latest.get("status") == "in_library" else ""),
+                    "status": latest.get("download_status") or ("skipped" if subscription_is_in_library(latest) else ""),
                     "message": latest.get("download_message") or "",
                 }
                 stats_items.append(wechat_download_stats(download_result, latest))
@@ -12908,7 +15256,8 @@ def send_notification_event(event_key: str, data: dict[str, Any] | None = None) 
     settings_data = get_system_settings_service().get()
     notifications = settings_data.get("notifications", {}) if isinstance(settings_data.get("notifications"), dict) else {}
     events = notifications.get("events") if isinstance(notifications.get("events"), dict) else {}
-    if events.get(event_key) is False:
+    supported_events = {str(item.get("key") or "") for item in NOTIFICATION_EVENTS}
+    if event_key not in supported_events or not bool(events.get(event_key, False)):
         return {"status": "skipped", "reason": "event_disabled", "event": event_key}
     channels = [item for item in notifications.get("channels", []) if isinstance(item, dict) and item.get("enabled")]
     if not channels:
@@ -12998,44 +15347,29 @@ def wechat_work_test_suite_samples() -> list[dict[str, Any]]:
             },
         },
         {
-            "event_key": "mteam_found",
+            "event_key": "subscription_in_library",
             "payload": {
-                "status": "found",
+                "status": "in_library",
                 "title": sample_title,
-                "detail": "MTeam 命中 3 个候选资源，已按做种数排序。",
+                "detail": "IPZZ-828 已入库，可在 Jellyfin 播放",
                 "av_id": "IPZZ-828",
-                "site": "馒头",
-                "size": "5993.0MB",
-                "seeders": "90",
+                "path": "/media/downloads/IPZZ-828.mp4",
+                "file_name": "IPZZ-828.mp4",
+                "save_path": "/media/downloads",
                 "cover": cover,
                 "time": now_text,
             },
         },
         {
-            "event_key": "torrent_sent",
-            "payload": {
-                "status": "sent",
-                "title": sample_title,
-                "detail": "测试种子已推送到 qBittorrent",
-                "av_id": "IPZZ-828",
-                "site": "馒头",
-                "size": "5993.0MB",
-                "seeders": "90",
-                "downloader": "qbittorrent",
-                "cover": cover,
-                "time": now_text,
-            },
-        },
-        {
-            "event_key": "jellyfin_in_library",
+            "event_key": "wash_completed",
             "payload": {
                 "status": "completed",
                 "title": sample_title,
-                "detail": "IPZZ-828 已完成后处理并刷新 Jellyfin",
+                "detail": "IPZZ-828 洗版完成，新版本已激活",
                 "av_id": "IPZZ-828",
-                "path": "/media/study3/IPZZ-828.mp4",
-                "file_name": "IPZZ-828.mp4",
-                "save_path": "/media/study3",
+                "path": "/media/processed/IPZZ-828/IPZZ-828.chinese.mp4",
+                "file_name": "IPZZ-828.chinese.mp4",
+                "save_path": "/media/processed/IPZZ-828",
                 "cover": cover,
                 "time": now_text,
             },
@@ -13066,7 +15400,7 @@ def wechat_work_test_suite_samples() -> list[dict[str, Any]]:
                 "title": "字幕任务完成",
                 "detail": "IPZZ-828 字幕生成完成，已保存到媒体目录。",
                 "av_id": "IPZZ-828",
-                "path": "/media/study3/IPZZ-828.srt",
+                "path": "/media/downloads/IPZZ-828.srt",
                 "time": now_text,
             },
         },
@@ -13077,49 +15411,7 @@ def wechat_work_test_suite_samples() -> list[dict[str, Any]]:
                 "title": "字幕任务失败",
                 "detail": "IPZZ-828 字幕生成失败：测试错误消息。",
                 "av_id": "IPZZ-828",
-                "path": "/media/study3/IPZZ-828.mp4",
-                "time": now_text,
-            },
-        },
-        {
-            "event_key": "automation_actress_poll",
-            "payload": {
-                "status": "completed",
-                "title": "女优订阅轮询完成",
-                "detail": "检查女优：7 个\n新增番号：1 个\n错误：0 个",
-                "task": "actress_poll",
-                "task_name": "女优订阅轮询",
-                "checked": 7,
-                "added": 1,
-                "errors": 0,
-                "time": now_text,
-            },
-        },
-        {
-            "event_key": "automation_av_download",
-            "payload": {
-                "status": "completed",
-                "title": "番号订阅下载完成",
-                "detail": "检查订阅番号：12 个\n推送下载：2 个\n未找到资源：3 个\n错误：0 个",
-                "task": "av_download",
-                "task_name": "番号订阅下载",
-                "checked": 12,
-                "sent": 2,
-                "errors": 0,
-                "time": now_text,
-            },
-        },
-        {
-            "event_key": "automation_wash_download",
-            "payload": {
-                "status": "completed",
-                "title": "洗版轮询完成",
-                "detail": "检查洗版番号：5 个\n推送下载：1 个\n未匹配：2 个\n过期：0 个\n错误：0 个",
-                "task": "wash_download",
-                "task_name": "洗版轮询",
-                "checked": 5,
-                "sent": 1,
-                "errors": 0,
+                "path": "/media/downloads/IPZZ-828.mp4",
                 "time": now_text,
             },
         },
@@ -13352,24 +15644,46 @@ def dmm_cover_url_is_placeholder(url: str) -> bool:
         return False
 
 
-def fetch_media_bytes(url: str) -> tuple[bytes, str]:
-    with httpx.Client(timeout=45, follow_redirects=True) as client:
-        with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            resp.raise_for_status()
-            media_type = resp.headers.get("content-type", "video/mp4").split(";")[0].strip() or "video/mp4"
-            suffix = Path(urlparse(url).path).suffix.lower()
-            if not media_type.lower().startswith("video/") and suffix not in {".mp4", ".webm", ".ogg", ".mov"}:
-                raise HTTPException(status_code=415, detail="远端资源不是可持久化视频")
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in resp.iter_bytes():
+def validate_media_response(resp: httpx.Response, url: str) -> str:
+    resp.raise_for_status()
+    media_type = resp.headers.get("content-type", "video/mp4").split(";")[0].strip() or "video/mp4"
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if not media_type.lower().startswith("video/") and suffix not in {".mp4", ".webm", ".ogg", ".mov"}:
+        raise HTTPException(status_code=415, detail="远端资源不是可持久化视频")
+    content_length = int(resp.headers.get("content-length") or 0)
+    if content_length > ASSET_MEDIA_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
+    return media_type
+
+
+def stream_media_response(url: str) -> StreamingResponse:
+    client = httpx.Client(timeout=45, follow_redirects=True)
+    response = client.send(
+        client.build_request("GET", url, headers={"User-Agent": "Mozilla/5.0"}),
+        stream=True,
+    )
+    try:
+        media_type = validate_media_response(response, url)
+    except Exception:
+        response.close()
+        client.close()
+        raise
+
+    def iterator() -> Any:
+        total = 0
+        try:
+            for chunk in response.iter_bytes():
                 if not chunk:
                     continue
                 total += len(chunk)
                 if total > ASSET_MEDIA_MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
-                chunks.append(chunk)
-    return b"".join(chunks), media_type
+                    raise RuntimeError("预告超过本地缓存大小限制")
+                yield chunk
+        finally:
+            response.close()
+            client.close()
+
+    return StreamingResponse(iterator(), media_type=media_type, headers=asset_cache_headers(False))
 
 
 def serve_asset_record(data_dir: Path, asset: dict[str, Any]) -> FileResponse | None:
@@ -13436,14 +15750,29 @@ def persist_media_asset(url: str, entity_id: str, immutable: bool) -> FileRespon
     entity_id = canonical_av_id(entity_id) or safe_asset_stem(entity_id)
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id 参数不能为空")
-    content, media_type = fetch_media_bytes(url)
-    digest = hashlib.sha256(content).hexdigest()
     target_dir = data_dir / "subscription-assets" / asset_kind_dir("trailer")
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / f"{safe_asset_stem(entity_id)}{asset_file_extension(media_type, url)}"
-    tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
-    tmp_path.write_bytes(content)
-    tmp_path.replace(target_path)
+    with httpx.Client(timeout=45, follow_redirects=True) as client:
+        with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+            media_type = validate_media_response(response, url)
+            target_path = target_dir / f"{safe_asset_stem(entity_id)}{asset_file_extension(media_type, url)}"
+            tmp_path = target_path.with_suffix(f"{target_path.suffix}.{uuid.uuid4().hex}.tmp")
+            digest_builder = hashlib.sha256()
+            total = 0
+            try:
+                with tmp_path.open("wb") as handle:
+                    for chunk in response.iter_bytes():
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > ASSET_MEDIA_MAX_BYTES:
+                            raise HTTPException(status_code=413, detail="预告超过本地缓存大小限制")
+                        digest_builder.update(chunk)
+                        handle.write(chunk)
+                tmp_path.replace(target_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+    digest = digest_builder.hexdigest()
     relative_path = str(target_path.relative_to(data_dir))
     asset = get_subscription_service().set_asset_cache(
         entity_id,
@@ -13452,14 +15781,14 @@ def persist_media_asset(url: str, entity_id: str, immutable: bool) -> FileRespon
         relative_path,
         media_type,
         digest,
-        len(content),
+        total,
         immutable=immutable,
     )
     app_log("info", "asset-cache", "预告资产已写入本地", {
         "stage": "asset_cache_store",
         "entity_id": entity_id,
         "kind": "trailer",
-        "bytes": len(content),
+        "bytes": total,
         "immutable": immutable,
     })
     return FileResponse(
@@ -13545,8 +15874,7 @@ def proxy_media(url: str = "", av_id: str = "", entity_id: str = "", immutable: 
     try:
         if normalized_entity_id:
             return persist_media_asset(url, normalized_entity_id, immutable)
-        content, media_type = fetch_media_bytes(url)
-        return Response(content=content, media_type=media_type, headers=asset_cache_headers(False))
+        return stream_media_response(url)
     except httpx.HTTPStatusError as exc:
         stale_asset = get_subscription_service().get_asset_cache(normalized_entity_id, "trailer") if normalized_entity_id else None
         if stale_asset:

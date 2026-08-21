@@ -283,8 +283,8 @@ const subscriptionBars = computed(() => {
   const total = Math.max(Number(sub.total || 0), 1)
   return [
     { label: '订阅中', value: Number(sub.pending || 0) },
-    { label: '已完成', value: Number(sub.done || 0) },
-    { label: '已入库', value: Number(sub.in_library || 0) },
+    { label: '已入库', value: Number(sub.in_library ?? sub.completed ?? sub.done ?? 0) },
+    { label: '洗版中', value: Number(sub.washing || 0) },
     { label: 'MTeam 已命中 / 已推送', value: Number(sub.downloaded || 0) }
   ].map((item) => ({ ...item, percent: Math.min(100, Math.round(item.value / total * 100)) }))
 })

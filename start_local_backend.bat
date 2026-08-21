@@ -33,6 +33,9 @@ if "%PYTHON_EXE%"=="" (
 if exist ".venv\Lib\site-packages\nvidia\cublas\bin" set "PATH=%CD%\.venv\Lib\site-packages\nvidia\cublas\bin;%PATH%"
 if exist ".venv\Lib\site-packages\nvidia\cudnn\bin" set "PATH=%CD%\.venv\Lib\site-packages\nvidia\cudnn\bin;%PATH%"
 if exist ".venv\Lib\site-packages\nvidia\cuda_nvrtc\bin" set "PATH=%CD%\.venv\Lib\site-packages\nvidia\cuda_nvrtc\bin;%PATH%"
+if exist "%APP_DATA_DIR%\gpu-runtime\nvidia\cublas\bin" set "PATH=%APP_DATA_DIR%\gpu-runtime\nvidia\cublas\bin;%PATH%"
+if exist "%APP_DATA_DIR%\gpu-runtime\nvidia\cudnn\bin" set "PATH=%APP_DATA_DIR%\gpu-runtime\nvidia\cudnn\bin;%PATH%"
+if exist "%APP_DATA_DIR%\gpu-runtime\nvidia\cuda_nvrtc\bin" set "PATH=%APP_DATA_DIR%\gpu-runtime\nvidia\cuda_nvrtc\bin;%PATH%"
 set "PORTABLE_DEPS_REL="
 if exist "python\current-deps-path.txt" set /p PORTABLE_DEPS_REL=<"python\current-deps-path.txt"
 if not "%PORTABLE_DEPS_REL%"=="" (
@@ -45,10 +48,10 @@ if exist "python\Lib\site-packages\nvidia\cudnn\bin" set "PATH=%CD%\python\Lib\s
 if exist "python\Lib\site-packages\nvidia\cuda_nvrtc\bin" set "PATH=%CD%\python\Lib\site-packages\nvidia\cuda_nvrtc\bin;%PATH%"
 
 echo.
-echo Media Toolbox local compute backend
+echo MovieMuse local compute backend
 echo URL: http://%HOST%:%PORT%
-echo Web UI: disabled on compute worker
-echo Manage settings from the Unraid subtitle console.
+echo Worker UI: http://127.0.0.1:%PORT%/worker
+echo Compute settings remain managed by the MovieMuse console.
 echo WHISPER: %WHISPER_MODEL% / %WHISPER_DEVICE% / %WHISPER_COMPUTE_TYPE%
 echo MODELS: %WHISPER_MODEL_DIR%
 echo DATA: %APP_DATA_DIR%

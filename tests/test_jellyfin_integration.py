@@ -61,7 +61,7 @@ class JellyfinIntegrationTest(unittest.TestCase):
             "status": "in_library",
             "jellyfin_item_id": "jf-known",
             "jellyfin_item_name": "SNOS-250",
-            "jellyfin_path": "/media/study3/SNOS-250.mp4",
+            "jellyfin_path": "/media/downloads/SNOS-250.mp4",
         })
         request = self.main.JellyfinIntegrationRequest(item_id="jf-known", title="SNOS-250")
 
@@ -70,7 +70,7 @@ class JellyfinIntegrationTest(unittest.TestCase):
 
         self.assertEqual(media["source"], "subscription_db")
         self.assertEqual(media["matched_by"], "item_id")
-        self.assertEqual(media["path"], "/media/study3/SNOS-250.mp4")
+        self.assertEqual(media["path"], "/media/downloads/SNOS-250.mp4")
         self.assertEqual(media["av_id"], "SNOS-250")
 
     def test_transcode_integration_uses_postprocess_output_settings(self) -> None:

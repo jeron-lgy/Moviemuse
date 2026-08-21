@@ -1,6 +1,6 @@
 ﻿<template>
   <section class="subscriptions-view" @click="closeActionMenu">
-    <PageHeader kicker="订阅管理" title="订阅" description="管理番号和女优订阅，按状态跟踪下载、完成、入库和洗版。">
+    <PageHeader kicker="订阅管理" title="订阅" description="查看正在订阅、Jellyfin 已可播放和正在洗版的番号。">
       <template #actions>
         <BaseButton type="button" @click="refetchAll">刷新</BaseButton>
         <BaseButton type="button" :disabled="cleanupBusy" @click="cleanupDirtySubscriptions">
@@ -50,17 +50,19 @@
                 <span></span><span></span><span></span>
               </button>
               <div v-if="actionMenuId === item.id" class="more-panel" @click.stop>
-                <button v-if="item.status !== 'pending'" type="button" @click="setAvStatus(item, 'pending')">移回订阅中</button>
-                <button v-if="item.status !== 'done'" type="button" @click="setAvStatus(item, 'done')">标记完成</button>
-                <button v-if="item.status !== 'in_library'" type="button" @click="setAvStatus(item, 'in_library')">标记已入库</button>
+                <button type="button" @click="setAvStatus(item, 'pending')">重新订阅</button>
               </div>
             </div>
           </template>
 
           <template #actions>
-            <template v-if="item.status === 'in_library'">
+            <template v-if="itemDisplayStatus(item) === 'in_library'">
               <BaseButton variant="primary" type="button" :disabled="busyId === item.id" @click.stop="openWashDialog(item)">洗版</BaseButton>
               <BaseButton variant="danger" type="button" :disabled="busyId === item.id" @click.stop="removeAv(item)">取消</BaseButton>
+            </template>
+            <template v-else-if="itemDisplayStatus(item) === 'washing'">
+              <BaseButton variant="primary" type="button" disabled>洗版中</BaseButton>
+              <BaseButton variant="danger" type="button" :disabled="busyId === item.id" @click.stop="cancelWash(item)">取消洗版</BaseButton>
             </template>
             <template v-else>
               <BaseButton variant="primary" type="button" :disabled="busyId === item.id" @click.stop="downloadAv(item)">下载</BaseButton>
@@ -173,7 +175,7 @@ import { imageProxyUrl } from '../lib/images'
 
 const mainTab = ref('av')
 const router = useRouter()
-const avState = ref('pending')
+const avState = ref('subscribing')
 const busyId = ref('')
 const notice = ref('')
 const downloadingPending = ref(false)
@@ -213,11 +215,9 @@ function sortBySubscribedAt(items) {
 }
 
 const avStates = computed(() => [
-  { key: 'pending', label: '订阅中', count: avItems.value.filter((item) => (item.status || 'pending') === 'pending').length },
-  { key: 'done', label: '已完成', count: avItems.value.filter((item) => item.status === 'done').length },
-  { key: 'in_library', label: '已入库', count: avItems.value.filter((item) => item.status === 'in_library').length },
-  { key: 'wash_active', label: '洗版中', count: avItems.value.filter((item) => washActive(item)).length },
-  { key: 'wash_completed', label: '洗版完成', count: avItems.value.filter((item) => washCompleted(item)).length }
+  { key: 'subscribing', label: '订阅中', count: avItems.value.filter((item) => itemDisplayStatus(item) === 'subscribing').length },
+  { key: 'in_library', label: '已入库', count: avItems.value.filter((item) => itemDisplayStatus(item) === 'in_library').length },
+  { key: 'washing', label: '洗版中', count: avItems.value.filter((item) => itemDisplayStatus(item) === 'washing').length }
 ])
 
 const filteredAvs = computed(() => avItems.value.filter((item) => itemMatchesState(item, avState.value)))
@@ -227,18 +227,15 @@ function washStatus(item) {
   return String(wash?.status || '').toLowerCase()
 }
 
-function washActive(item) {
-  return ['requested', 'downloading', 'error'].includes(washStatus(item))
-}
-
-function washCompleted(item) {
-  return washStatus(item) === 'completed'
+function itemDisplayStatus(item) {
+  if (item?.display_status) return item.display_status
+  if (['requested', 'downloading', 'error'].includes(washStatus(item))) return 'washing'
+  if (String(item?.library_status || '').toLowerCase() === 'in_library' && (item?.library_confirmed_at || item?.jellyfin_item_id)) return 'in_library'
+  return 'subscribing'
 }
 
 function itemMatchesState(item, state) {
-  if (state === 'wash_active') return washActive(item)
-  if (state === 'wash_completed') return washCompleted(item)
-  return (item.status || 'pending') === state
+  return itemDisplayStatus(item) === state
 }
 
 watch(
@@ -416,8 +413,12 @@ function downloadAv(item) {
 }
 
 function setAvStatus(item, status) {
-  const label = status === 'pending' ? '订阅中' : (status === 'done' ? '已完成' : '已入库')
-  runBusy(item.id, () => postJson(`/api/subscriptions/av/${encodeURIComponent(item.id)}/status`, { status }), `${item.id} 已标记为${label}`)
+  runBusy(item.id, () => postJson(`/api/subscriptions/av/${encodeURIComponent(item.id)}/status`, { status }), `${item.id} 已重新加入订阅`)
+}
+
+function cancelWash(item) {
+  const mode = washStatus(item) && item?.wash?.mode === '4k' ? '4k' : 'chinese'
+  runBusy(item.id, () => postJson(`/api/subscriptions/av/${encodeURIComponent(item.id)}/wash`, { mode, status: 'cancelled' }), `${item.id} 已取消洗版`)
 }
 
 function requestWash(item, mode = 'chinese') {

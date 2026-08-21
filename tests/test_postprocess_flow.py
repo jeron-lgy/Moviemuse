@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -962,6 +963,59 @@ class PostprocessFlowTest(unittest.TestCase):
 
         self.assertEqual(job["callback_token"], "secret")
 
+    def test_transcode_job_rejects_paths_outside_media_root(self) -> None:
+        outside = Path(tempfile.mkdtemp(prefix="moviemuse-transcode-outside-"))
+        try:
+            with self.assertRaisesRegex(Exception, "转码输入路径不在允许的媒体目录内"):
+                self.main.create_transcode_job(
+                    {
+                        "input_path": str(outside / "input.mp4"),
+                        "output_path": str(self.root / "output.mp4"),
+                    },
+                    start=False,
+                )
+            with self.assertRaisesRegex(Exception, "转码输出路径不在允许的媒体目录内"):
+                self.main.create_transcode_job(
+                    {
+                        "input_path": str(self.root / "input.mp4"),
+                        "output_path": str(outside / "output.mp4"),
+                    },
+                    start=False,
+                )
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_custom_ffmpeg_template_cannot_launch_another_executable(self) -> None:
+        job = self.main.create_transcode_job(
+            {
+                "input_path": str(self.root / "input.mp4"),
+                "output_path": str(self.root / "output.mp4"),
+                "ffmpeg_mode": "custom",
+                "ffmpeg_custom_enabled": True,
+                "ffmpeg_custom_template": 'powershell -File script.ps1 "{input}" "{output}"',
+            },
+            start=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "只能调用配置的 ffmpeg"):
+            self.main.transcode_ffmpeg_command(job)
+
+    def test_legacy_form_write_routes_require_console_auth(self) -> None:
+        for path in (
+            "/scan/run",
+            "/scan/subtitles",
+            "/terminal/settings",
+            "/subtitles/backend/settings",
+            "/subtitles/connection",
+            "/subtitles/jobs",
+            "/subtitles/batches/batch-id/submit",
+            "/preview",
+            "/move",
+            "/move/jobs",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self.main.console_auth_required_path(path))
+
     def test_subscription_postprocess_task_fails_when_mteam_result_has_no_id(self) -> None:
         service = self.main.get_subscription_service()
         post = self.main.get_postprocess_service()
@@ -979,6 +1033,397 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertTrue(tasks)
         self.assertEqual(tasks[0]["status"], "failed")
         self.assertEqual(tasks[0]["error_code"], "mteam_missing_id")
+
+    def test_subscription_postprocess_task_reuses_active_task(self) -> None:
+        av = {"id": "TEST-IDEMPOTENT", "title": "reuse"}
+
+        first = self.main.create_subscription_postprocess_task(av)
+        second = self.main.create_subscription_postprocess_task(av)
+
+        tasks = [task for task in self.main.get_postprocess_service().list_tasks(limit=20) if task["av_id"] == av["id"]]
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(tasks), 1)
+
+    def test_active_media_version_waits_for_jellyfin_without_mteam(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-390"
+        output_path = self.root / "out" / av_id / f"{av_id}.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"managed-media")
+        stat = output_path.stat()
+        service.subscribe_av({"id": av_id, "title": "existing", "status": "pending", "download_status": "error"})
+        post.add_version(
+            av_id=av_id,
+            path=str(output_path),
+            source_type="external_qb",
+            status="active",
+            generated_by="moviemuse",
+            file_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+
+        with patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "existing"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(subscription["status"], "pending")
+        self.assertNotEqual(subscription["library_status"], "in_library")
+        self.assertEqual(subscription["download_status"], "downloaded")
+        self.assertEqual(subscription["jellyfin_path"], str(output_path))
+        self.assertEqual(self.main.subscription_display_status(subscription), "subscribing")
+
+    def test_managed_output_file_waits_for_jellyfin_without_version_record(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-395"
+        output_root = self.root / "out"
+        output_path = output_root / av_id / f"{av_id}.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"legacy-output")
+        post.update_settings({"output_dir": str(output_root)})
+        service.subscribe_av({"id": av_id, "title": "legacy output", "status": "pending"})
+
+        with patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "legacy output"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(subscription["status"], "pending")
+        self.assertEqual(subscription["jellyfin_path"], str(output_path))
+
+    def test_local_subscription_reconciliation_counts_in_place_updates(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-396"
+        output_path = self.root / "out" / av_id / f"{av_id}.mp4"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_bytes(b"managed-media")
+        stat = output_path.stat()
+        service.subscribe_av({"id": av_id, "title": "existing", "status": "pending"})
+        post.add_version(
+            av_id=av_id,
+            path=str(output_path),
+            source_type="subscription",
+            status="active",
+            generated_by="moviemuse",
+            file_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+
+        changed = self.main.reconcile_local_subscription_states()
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(changed, 1)
+        self.assertEqual(subscription["status"], "pending")
+        self.assertEqual(subscription["download_status"], "downloaded")
+
+    def test_downloaded_media_stays_subscribing_while_worker_waits(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-397"
+        input_path = self.root / "downloads" / f"{av_id}.mp4"
+        input_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"downloaded-media")
+        service.subscribe_av({"id": av_id, "title": "downloaded", "status": "pending"})
+        task = post.create_task(av_id=av_id, task_type="subscription", status="waiting_worker")
+        post.update_task(task["id"], input_path=str(input_path), torrent_hash="downloaded-hash")
+
+        changed = self.main.reconcile_local_subscription_states()
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(changed, 1)
+        self.assertEqual(subscription["status"], "pending")
+        self.assertNotEqual(subscription["library_status"], "in_library")
+        self.assertEqual(subscription["download_status"], "waiting_worker")
+        self.assertEqual(subscription["jellyfin_path"], str(input_path))
+        self.assertEqual(post.get_task(task["id"])["status"], "waiting_worker")
+
+    def test_existing_failed_postprocess_task_blocks_duplicate_torrent_download(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "IPZZ-862"
+        input_path = self.root / "downloads" / f"{av_id}.mp4"
+        input_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"downloaded")
+        service.subscribe_av({"id": av_id, "title": "failed existing", "status": "pending"})
+        task = post.create_task(av_id=av_id, task_type="external_qb", status="failed")
+        post.update_task(
+            task["id"],
+            torrent_hash="existing-hash",
+            input_path=str(input_path),
+            error_code="transcode_validation_failed",
+            error_message="ffprobe timeout",
+        )
+
+        with patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "failed existing"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "existing_failed")
+        self.assertEqual(result["task_id"], task["id"])
+        self.assertEqual(subscription["status"], "pending")
+        self.assertIn("ffprobe timeout", subscription["download_message"])
+
+    def test_jellyfin_lookup_error_pauses_mteam_download(self) -> None:
+        service = self.main.get_subscription_service()
+        av_id = "ABF-391"
+        service.subscribe_av({"id": av_id, "title": "dedupe unavailable", "status": "pending"})
+
+        class Settings:
+            def get(self) -> dict[str, object]:
+                return {"jellyfin": {"dedupe_enabled": True, "url": "http://jellyfin", "api_key": "secret"}}
+
+        with patch.object(self.main, "get_system_settings_service", return_value=Settings()), \
+            patch.object(self.main, "find_jellyfin_match", side_effect=RuntimeError("Jellyfin API 返回 HTTP 404")), \
+            patch.object(self.main, "search_mteam", side_effect=AssertionError("MTeam should not be called")):
+            result = self.main.download_av_from_mteam({"id": av_id, "title": "dedupe unavailable"})
+
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(result["status"], "dedupe_error")
+        self.assertEqual(subscription["download_status"], "dedupe_error")
+        self.assertIn("HTTP 404", subscription["download_message"])
+
+    def test_jellyfin_match_marks_subscription_in_library(self) -> None:
+        service = self.main.get_subscription_service()
+        av_id = "ABF-394"
+        av = service.subscribe_av({"id": av_id, "title": "already in Jellyfin", "status": "pending"})
+
+        class Settings:
+            def get(self) -> dict[str, object]:
+                return {"jellyfin": {"dedupe_enabled": True, "url": "http://jellyfin", "api_key": "secret"}}
+
+        with patch.object(self.main, "get_system_settings_service", return_value=Settings()), \
+            patch.object(
+                self.main,
+                "find_jellyfin_match",
+                return_value={"id": "jf-item", "name": av_id, "path": f"/media/processed/{av_id}/{av_id}.mp4"},
+            ), \
+            patch.object(self.main, "send_notification_event") as sender:
+            updated = self.main.refresh_subscription_library_status(av, transition_source="baseline")
+
+        self.assertEqual(updated["status"], "in_library")
+        self.assertEqual(updated["library_status"], "in_library")
+        self.assertEqual(updated["download_status"], "completed")
+        self.assertEqual(updated["jellyfin_item_id"], "jf-item")
+        self.assertEqual(self.main.subscription_display_status(updated), "in_library")
+        sender.assert_not_called()
+
+    def test_jellyfin_transition_notifies_in_library_once(self) -> None:
+        service = self.main.get_subscription_service()
+        av_id = "ABF-399"
+        av = service.subscribe_av({"id": av_id, "title": "later in Jellyfin", "status": "pending"})
+        match = {"id": "jf-later", "name": av_id, "path": f"/media/processed/{av_id}/{av_id}.mp4"}
+
+        class Settings:
+            def get(self) -> dict[str, object]:
+                return {"jellyfin": {"dedupe_enabled": True, "url": "http://jellyfin", "api_key": "secret"}}
+
+        with patch.object(self.main, "get_system_settings_service", return_value=Settings()), \
+            patch.object(self.main, "find_jellyfin_match", side_effect=[None, match, match]), \
+            patch.object(self.main, "send_notification_event") as sender:
+            pending = self.main.refresh_subscription_library_status(av, include_existing=False, transition_source="baseline")
+            in_library = self.main.refresh_subscription_library_status(pending, include_existing=False, transition_source="poll")
+            repeated = self.main.refresh_subscription_library_status(in_library, include_existing=False, transition_source="poll")
+
+        self.assertTrue(pending["library_notification_armed"])
+        self.assertEqual(self.main.subscription_display_status(in_library), "in_library")
+        self.assertEqual(repeated["library_notification_key"], "jf-later")
+        sender.assert_called_once()
+        self.assertEqual(sender.call_args.args[0], "subscription_in_library")
+
+    def test_unconfirmed_legacy_done_status_is_not_complete(self) -> None:
+        legacy = {"id": "ABF-400", "status": "done", "library_status": "in_library"}
+
+        self.assertFalse(self.main.subscription_is_in_library(legacy))
+        self.assertEqual(self.main.subscription_display_status(legacy), "subscribing")
+
+    def test_legacy_library_notification_fields_are_migrated(self) -> None:
+        service = self.main.get_subscription_service()
+
+        saved = service.subscribe_av({
+            "id": "ABF-401",
+            "status": "done",
+            "jellyfin_item_id": "legacy-jf-item",
+            "completion_notification_armed": True,
+            "completion_notification_key": "legacy-key",
+            "completion_notified_at": 123.0,
+        })
+
+        self.assertEqual(saved["status"], "in_library")
+        self.assertTrue(saved["library_notification_armed"])
+        self.assertEqual(saved["library_notification_key"], "legacy-key")
+        self.assertEqual(saved["library_notified_at"], 123.0)
+
+    def test_same_av_qb_hash_reuses_existing_task(self) -> None:
+        post = self.main.get_postprocess_service()
+        first = post.create_task(av_id="ABF-392", task_type="external_qb", status="created")
+        second = post.create_task(av_id="ABF-392", task_type="subscription", status="created")
+        qb_config = {"category": "study3", "tags": "moviemuse", "save_path": "/study3"}
+
+        first_bind = self.main.bind_qb_to_postprocess_task(first, {"status": "ok", "hash": "same-av-hash"}, qb_config)
+        second_bind = self.main.bind_qb_to_postprocess_task(second, {"status": "exists", "hash": "same-av-hash"}, qb_config)
+
+        self.assertEqual(first_bind["status"], "bound")
+        self.assertEqual(second_bind["status"], "reused")
+        self.assertEqual(post.get_task(second["id"])["status"], "ignored")
+        self.assertEqual(post.get_qb_torrent("same-av-hash")["task_id"], first["id"])
+
+    def test_wash_task_registers_legacy_managed_version_and_binds_old_path(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-393"
+        output_root = self.root / "out"
+        old_path = output_root / av_id / f"{av_id}.mp4"
+        old_path.parent.mkdir(parents=True)
+        old_path.write_bytes(b"legacy-managed")
+        stat = old_path.stat()
+        post.update_settings({"output_dir": str(output_root)})
+        post.add_version(
+            av_id="",
+            path=str(old_path),
+            source_type="subscription",
+            status="active",
+            generated_by="moviemuse",
+            file_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+        av = service.subscribe_av({"id": av_id, "title": "legacy", "status": "done"})
+
+        task = self.main.ensure_wash_postprocess_task(av, "chinese")
+
+        registered = post.get_version(task["supersede_version_id"])
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(registered["av_id"], av_id)
+        self.assertEqual(task["supersede_path"], str(old_path))
+        self.assertEqual(subscription["wash"]["old_path"], str(old_path))
+
+    def test_wash_task_can_bind_subscription_owned_download(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "ABF-398"
+        input_path = self.root / "downloads" / f"{av_id}.mp4"
+        input_path.parent.mkdir(parents=True)
+        input_path.write_bytes(b"downloaded-media")
+        av = service.subscribe_av({
+            "id": av_id,
+            "title": "downloaded",
+            "status": "done",
+            "library_status": "in_library",
+            "jellyfin_path": str(input_path),
+        })
+        acquisition = post.create_task(av_id=av_id, task_type="subscription", status="waiting_worker")
+        post.update_task(acquisition["id"], input_path=str(input_path), torrent_hash="downloaded-hash")
+
+        task = self.main.ensure_wash_postprocess_task(av, "chinese")
+
+        registered = post.get_version(task["supersede_version_id"])
+        subscription = next(item for item in service.get_subscribed_av() if item["id"] == av_id)
+        self.assertEqual(registered["path"], str(input_path))
+        self.assertEqual(registered["source_type"], "subscription")
+        self.assertEqual(task["supersede_path"], str(input_path))
+        self.assertEqual(subscription["wash"]["old_path"], str(input_path))
+
+    def test_acquisition_failure_retry_runs_mteam_download_again(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "TEST-RETRY-MTEAM"
+        service.subscribe_av({"id": av_id, "title": "retry", "status": "pending"})
+        task = post.create_task(av_id=av_id, task_type="subscription", status="failed")
+        post.update_task(task["id"], error_code="download_push_failed", error_message="timeout")
+        calls: list[dict[str, object]] = []
+
+        def fake_download(av: dict[str, object], **kwargs: object) -> dict[str, object]:
+            calls.append({"av": av, **kwargs})
+            post.update_task(task["id"], status="torrent_pushed", torrent_hash="retry-hash", error_code="", error_message="")
+            return {"av_id": av_id, "status": "sent", "message": "ok"}
+
+        with patch.object(self.main, "download_av_from_mteam", side_effect=fake_download):
+            result = self.main.api_retry_postprocess_task(task["id"])
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["post_task"]["id"], task["id"])
+        self.assertEqual(post.get_task(task["id"])["torrent_hash"], "retry-hash")
+
+    def test_subscription_state_tracks_waiting_worker(self) -> None:
+        service = self.main.get_subscription_service()
+        post = self.main.get_postprocess_service()
+        av_id = "TEST-STATE-SYNC"
+        service.subscribe_av({"id": av_id, "title": "sync", "status": "pending", "download_status": "downloading"})
+        task = post.create_task(av_id=av_id, task_type="subscription", status="waiting_worker")
+        post.update_task(task["id"], torrent_hash="sync-hash", input_path=str(self.root / "sync.mp4"))
+
+        updated = self.main.sync_subscription_task_state(post.get_task(task["id"]))
+
+        self.assertEqual(updated["download_status"], "waiting_worker")
+        self.assertEqual(updated["qb_hash"], "sync-hash")
+        self.assertIn("等待算力端", updated["download_message"])
+
+    def test_bulk_download_returns_complete_summary(self) -> None:
+        items = [{"id": "A-1", "status": "pending"}, {"id": "A-2", "status": "pending"}, {"id": "A-3", "status": "pending"}]
+        results = iter([
+            {"av_id": "A-1", "status": "sent"},
+            {"av_id": "A-2", "status": "not_found"},
+            {"av_id": "A-3", "status": "error"},
+        ])
+        with patch.object(self.main, "subscribed_avs_with_global_filter", return_value=items), \
+            patch.object(self.main, "download_av_from_mteam", side_effect=lambda _item: next(results)):
+            payload = self.main.download_pending_subscriptions()
+
+        self.assertEqual(payload["sent"], 1)
+        self.assertEqual(payload["not_found"], 1)
+        self.assertEqual(payload["failed"], 1)
+
+    def test_task_event_retention_limits_rows(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="TEST-RETENTION", task_type="subscription", status="created")
+        for index in range(4):
+            post.add_event(task["id"], "info", f"stage-{index}", "event")
+        with patch.dict(os.environ, {"TASK_EVENT_MAX_ROWS": "2", "TASK_EVENT_RETENTION_DAYS": "30"}):
+            result = post.prune_events()
+
+        self.assertGreaterEqual(result["overflow"], 1)
+        self.assertEqual(len(post.list_events(task["id"], limit=20)), 2)
+
+    def test_task_event_heartbeat_is_deduplicated_until_state_changes(self) -> None:
+        post = self.main.get_postprocess_service()
+        task = post.create_task(av_id="TEST-EVENT-DEDUPE", task_type="subscription", status="waiting_worker")
+
+        first = post.add_event_if_due(
+            task["id"],
+            "info",
+            "worker_offline",
+            "worker offline",
+            {"worker": {"status": "offline"}},
+            min_interval_seconds=3600,
+            fingerprint="offline-a",
+        )
+        duplicate = post.add_event_if_due(
+            task["id"],
+            "info",
+            "worker_offline",
+            "worker offline",
+            {"worker": {"status": "offline"}},
+            min_interval_seconds=3600,
+            fingerprint="offline-a",
+        )
+        changed = post.add_event_if_due(
+            task["id"],
+            "info",
+            "worker_offline",
+            "worker offline",
+            {"worker": {"status": "offline", "error": "new"}},
+            min_interval_seconds=3600,
+            fingerprint="offline-b",
+        )
+
+        events = [event for event in post.list_events(task["id"], limit=20) if event["stage"] == "worker_offline"]
+        self.assertTrue(first)
+        self.assertFalse(duplicate)
+        self.assertTrue(changed)
+        self.assertEqual(len(events), 2)
 
     def test_qb_file_pick_failure_updates_qb_row_status(self) -> None:
         post = self.main.get_postprocess_service()
@@ -1220,8 +1665,8 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertTrue(active_path.exists())
         self.assertTrue(str(active_path).startswith(str(self.root / "out-subtitle")))
         self.assertTrue(active["has_chinese_subtitle"])
-        self.assertTrue(active_path.with_suffix(".srt").exists())
-        self.assertFalse(active_path.with_name(f"{active_path.stem}.zh.srt").exists())
+        self.assertTrue(active_path.with_name(f"{active_path.stem}.zh-CN.srt").exists())
+        self.assertFalse(active_path.with_suffix(".srt").exists())
 
     def test_subtitle_artifacts_cleanup_keeps_video_named_srt_and_vtt(self) -> None:
         product_path = self.root / "out-clean" / "ABF-359.av1.mp4"
@@ -1230,6 +1675,8 @@ class PostprocessFlowTest(unittest.TestCase):
         translated_srt = product_path.with_suffix(".srt")
         translated_vtt = product_path.with_suffix(".vtt")
         legacy_zh = product_path.with_name(f"{product_path.stem}.zh.srt")
+        managed_srt = product_path.with_name(f"{product_path.stem}.zh-CN.srt")
+        managed_vtt = product_path.with_name(f"{product_path.stem}.zh-CN.vtt")
         make_sample_video(product_path)
         for path, content in [
             (original_srt, "1\n00:00:00,000 --> 00:00:01,000\noriginal\n\n"),
@@ -1276,14 +1723,18 @@ class PostprocessFlowTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertTrue(product_path.exists())
-        self.assertTrue(translated_srt.exists())
-        self.assertTrue(translated_vtt.exists())
+        self.assertTrue(managed_srt.exists())
+        self.assertTrue(managed_vtt.exists())
+        self.assertFalse(translated_srt.exists())
+        self.assertFalse(translated_vtt.exists())
         self.assertFalse(original_srt.exists())
         self.assertFalse(original_vtt.exists())
         self.assertFalse(legacy_zh.exists())
         trash_files = [path.name for path in (self.root / "trash").rglob("*") if path.is_file()]
         self.assertIn("ABF-359.srt", trash_files)
         self.assertIn("ABF-359.vtt", trash_files)
+        self.assertIn("ABF-359.av1.srt", trash_files)
+        self.assertIn("ABF-359.av1.vtt", trash_files)
         self.assertIn("ABF-359.av1.zh.srt", trash_files)
 
     def test_subtitle_validation_failure_keeps_video_version_active(self) -> None:
@@ -1519,6 +1970,72 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertEqual(result["status"], "waiting_worker")
         self.assertEqual(updated["status"], "waiting_worker")
 
+    def test_single_worker_dispatch_failure_returns_task_to_ready_queue(self) -> None:
+        input_path = self.root / "dispatch-failure.mp4"
+        input_path.write_bytes(b"video")
+        post = self.main.get_postprocess_service()
+        post.update_settings({"auto_transcode_enabled": True})
+        task = post.create_task(av_id="TEST-DISPATCH-FAIL", task_type="subscription", status="ready_to_run")
+        post.update_task(task["id"], input_path=str(input_path))
+
+        with patch.object(self.main, "subtitle_backend_status", return_value={"status": "ok", "online": True}), \
+            patch.object(
+                self.main,
+                "dispatch_postprocess_task",
+                side_effect=self.main.HTTPException(status_code=400, detail="媒体目录未授权"),
+            ):
+            result = self.main.api_run_postprocess_task(task["id"])
+
+        updated = post.get_task(task["id"])
+        self.assertEqual(result["status"], "ready_to_run")
+        self.assertEqual(updated["status"], "ready_to_run")
+        self.assertEqual(updated["error_code"], "worker_dispatch_failed")
+        self.assertIn("媒体目录未授权", updated["error_message"])
+        self.assertTrue(any(event["stage"] == "worker_dispatch_failed" for event in post.list_events(task["id"])))
+
+    def test_prepare_remote_output_path_creates_only_target_directory(self) -> None:
+        target = self.root / "worker-output" / "TEST-PERM" / "movie.mkv"
+
+        result = self.main.prepare_remote_output_path(str(target))
+
+        self.assertTrue(target.parent.is_dir())
+        self.assertFalse(target.exists())
+        self.assertEqual(result["directory"], str(target.parent))
+        if os.name != "nt":
+            self.assertTrue(target.parent.stat().st_mode & 0o020)
+
+    def test_repeated_offline_run_keeps_one_compact_worker_event(self) -> None:
+        post = self.main.get_postprocess_service()
+        post.update_settings({"auto_transcode_enabled": True})
+        task = post.create_task(
+            av_id="TEST-OFFLINE-DEDUPE",
+            task_type="subscription",
+            status="ready_to_run",
+        )
+        worker_status = {
+            "status": "offline",
+            "online": False,
+            "mode": "remote",
+            "backend_url": "http://worker",
+            "error": "connection refused",
+            "settings": {"large": "x" * 5000},
+            "jobs": {"total": 20, "active": 3, "items": [{"large": "x" * 5000}]},
+        }
+        original_status = self.main.subtitle_backend_status
+        self.main.subtitle_backend_status = lambda: worker_status
+        try:
+            self.main.api_run_postprocess_task(task["id"])
+            self.main.api_run_postprocess_task(task["id"])
+        finally:
+            self.main.subtitle_backend_status = original_status
+
+        events = [event for event in post.list_events(task["id"], limit=20) if event["stage"] == "worker_offline"]
+        self.assertEqual(len(events), 1)
+        payload = events[0]["data"]
+        self.assertNotIn("settings", payload)
+        self.assertNotIn("items", payload["worker"]["jobs"])
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False)), 1024)
+
     def test_postprocess_task_claim_only_succeeds_once(self) -> None:
         post = self.main.get_postprocess_service()
         task = post.create_task(av_id="TEST-017", task_type="subscription", status="ready_to_run")
@@ -1549,6 +2066,53 @@ class PostprocessFlowTest(unittest.TestCase):
         self.assertTrue(any(item["id"] == task["id"] for item in payload["tasks"]))
         self.assertEqual(payload["recovered_finished"], [])
         self.assertEqual(post.get_task(task["id"])["status"], "transcoding")
+
+    def test_task_center_uses_full_counts_and_server_side_pagination(self) -> None:
+        post = self.main.get_postprocess_service()
+        for index in range(25):
+            post.create_task(av_id=f"COMPLETE-{index:02d}", task_type="subscription", status="completed")
+        for index in range(3):
+            post.create_task(av_id=f"FAILED-{index:02d}", task_type="subscription", status="failed")
+
+        with patch.object(self.main, "backend_url", return_value=True), patch.object(
+            self.main,
+            "subtitle_jobs_payload_from_remote_or_cache",
+            return_value={"jobs": []},
+        ), patch.object(self.main, "subtitle_backend_status", return_value={"online": True}):
+            completed = self.main.api_task_center(scope="current", category="completed", page=2, page_size=10)
+            current = self.main.api_task_center(scope="current", category="all", page=1, page_size=10)
+
+        self.assertEqual(completed["counts"]["total"], 28)
+        self.assertEqual(completed["counts"]["current"], 3)
+        self.assertEqual(completed["counts"]["history"], 28)
+        self.assertEqual(completed["counts"]["completed"], 25)
+        self.assertEqual(completed["counts"]["failed"], 3)
+        self.assertEqual(completed["pagination"], {
+            "page": 2,
+            "page_size": 10,
+            "page_count": 3,
+            "total": 25,
+            "start": 11,
+            "end": 20,
+        })
+        self.assertEqual(len(completed["items"]), 10)
+        self.assertTrue(all(item["status_key"] == "completed" for item in completed["items"]))
+        self.assertEqual(current["pagination"]["total"], 3)
+        self.assertEqual(len(current["items"]), 3)
+
+    def test_postprocess_task_listing_supports_offsets_and_unbounded_reads(self) -> None:
+        post = self.main.get_postprocess_service()
+        for index in range(12):
+            post.create_task(av_id=f"PAGE-{index:02d}", task_type="subscription", status="completed")
+
+        first = post.list_tasks(limit=5, offset=0)
+        second = post.list_tasks(limit=5, offset=5)
+        all_tasks = post.list_tasks(limit=None)
+
+        self.assertEqual(len(first), 5)
+        self.assertEqual(len(second), 5)
+        self.assertEqual(len(all_tasks), 12)
+        self.assertFalse({item["id"] for item in first} & {item["id"] for item in second})
 
     def test_task_events_are_visible_in_system_logs(self) -> None:
         post = self.main.get_postprocess_service()

@@ -117,7 +117,7 @@ class MetadataSourceAlgorithmTest(unittest.TestCase):
         with patch.object(self.main, "send_notification_event") as sender:
             self.main.notify_from_app_log("info", "jellyfin", "Jellyfin 查重命中，标记已入库", {
                 "av_id": "SNOS-093",
-                "path": "/media/study_h265/SNOS-093/SNOS-093.chinese.mp4",
+                "path": "/media/processed/SNOS-093/SNOS-093.chinese.mp4",
             })
 
             sender.assert_not_called()
